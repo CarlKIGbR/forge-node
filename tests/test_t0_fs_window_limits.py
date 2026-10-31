@@ -289,3 +289,17 @@ def test_bucket_is_thread_safe(tmp_path):
     [t.start() for t in ts]
     [t.join() for t in ts]
     assert got.count(True) == 1
+
+
+def test_the_walk_itself_never_follows_a_link_even_if_one_appears_after_resolution(tmp_path):
+    """Second layer: _resolve_for_read() resolves links, but the open that follows must still refuse any link (a swap between the two steps)."""
+    write_tree(tmp_path, {"/etc/shadow": "x", "/proc/meminfo": "MemTotal: 1 kB\n"})
+    (tmp_path / "proc" / "evil").mkdir()
+    os.symlink(str(tmp_path / "etc" / "shadow"), tmp_path / "proc" / "evil" / "file")
+    os.symlink(str(tmp_path / "etc"), tmp_path / "proc" / "evildir")
+    f = Fs(ProtectedSet.from_policy([]), str(tmp_path))
+    for path, want_dir in (("/proc/evil/file", False), ("/proc/evildir/shadow", False), ("/proc/evildir", True)):
+        with pytest.raises(FsError) as e:
+            os.close(f._walk_open(path, want_dir=want_dir))
+        assert e.value.code == "escape", path
+    os.close(f._walk_open("/proc/meminfo", want_dir=False))

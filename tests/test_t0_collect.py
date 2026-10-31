@@ -211,3 +211,13 @@ def test_der_cert_reports_hub_certificate_expiry(tmp_path):
     assert c["status"] == "ok" and c["days_left"] == 13 and c["subject"] == "CN=forge-nodehub" and seen["der"] == b"\x30\x82"
     assert collect.der_cert(env, None)["status"] == "unavailable"
     assert collect.der_cert(make_env(tmp_path, FakeRunner({})), b"x")["status"] == "unavailable"
+
+
+def test_an_empty_or_unparsable_file_gives_an_unavailable_section_never_an_empty_ok(tmp_path):
+    """Review/live-proof lesson: 'status ok' without data hid a broken read. Every host section must carry data or say why not."""
+    env = make_env(tmp_path, FakeRunner({"timedatectl": "Timezone=Europe/Berlin\nNTPSynchronized=yes\nNTP=yes\n"}), files={"/etc/os-release": "# nothing useful\n", "/proc/uptime": "garbage\n", "/proc/loadavg": "", "/proc/sys/kernel/hostname": "\n"})
+    h = collect.host(env)
+    for k in ("os", "uptime", "load", "hostname"):
+        assert h[k]["status"] == "unavailable" and "nothing parsable" in h[k]["reason"], k
+    for k, sec in collect.host(make_env(tmp_path / "ok", FakeRunner({"timedatectl": "Timezone=x\n"}))).items():
+        assert sec["status"] != "ok" or len(sec) > 1, k

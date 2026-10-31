@@ -303,3 +303,14 @@ def test_usage_skips_malformed_spool_records_and_streams(tmp_path):
     assert u["samples"] == 3 and u["skipped_records"] >= 1 and u["per_cgroup"]["d:aaa"]["cpu_seconds"] == 2
     import types
     assert isinstance(spool.iter_window("0"), types.GeneratorType)
+
+
+def test_usage_never_materialises_the_spool_window(tmp_path, monkeypatch):
+    env = menv(tmp_path)
+    spool, _ = mk(tmp_path, 1 << 20)
+    spool.append({"ts": protocol.fmt_ts(NOW - timedelta(minutes=5)), "cg": {"d:aaa": [1_000_000, 10, 0, 0]}})
+    monkeypatch.setattr(Spool, "window", lambda self, since: (_ for _ in ()).throw(AssertionError("the whole window was loaded into memory")))
+    from forge_node.t0.wire import ProbeUnavailable
+    u = usage_mod.usage(env, spool, FakeProbe(ProbeUnavailable("down")), {"window_h": 1})
+    assert u["window"]["samples"] == 1
+

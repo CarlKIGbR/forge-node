@@ -379,3 +379,19 @@ def test_the_agent_verifies_with_the_ssh_keygen_it_was_given_not_with_whatever_i
     a.holder.ssh_keygen = "/nonexistent/ssh-keygen"
     rig.set_policy(serial=2)
     assert a.poll_once(wait_s=0) == "no_policy"                          # nor can a policy be verified: silence
+
+
+def test_every_verification_goes_through_the_given_ssh_keygen(rig, tmp_path):
+    """A counting wrapper as the configured ssh-keygen: one call for the lease and one for the job - none may fall back to a PATH lookup."""
+    import shutil
+    log = tmp_path / "keygen.calls"
+    real = shutil.which("ssh-keygen")
+    wrapper = tmp_path / "keygen-wrapper"
+    wrapper.write_text(f'#!/bin/sh\necho call >> {log}\nexec {real} "$@"\n')
+    os.chmod(wrapper, 0o755)
+    a = rig.make_agent()
+    a.ssh_keygen = a.holder.ssh_keygen = str(wrapper)
+    rig.enqueue("inv.host")
+    assert a.poll_once(wait_s=0) == "job"
+    calls = log.read_text().count("call")
+    assert calls == 3, calls                                  # policy signature (load) + lease + job
