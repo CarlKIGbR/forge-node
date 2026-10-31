@@ -89,8 +89,8 @@ def test_apt_config_and_origin_classes():
             'Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";\nUnattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-updates";\n'
             'Unattended-Upgrade::Package-Blacklist:: "linux-image-*";\nDir "/";\n')
     c = parse.apt_config(dump)
-    assert c["APT::Periodic::Unattended-Upgrade"] == ["1"] and len(c["Unattended-Upgrade::Allowed-Origins"]) == 4 and c["Unattended-Upgrade::Package-Blacklist"] == ["linux-image-*"]
-    assert [parse.origin_class(x) for x in c["Unattended-Upgrade::Allowed-Origins"][1:]] == ["base", "security", "other"]
+    assert c["APT::Periodic::Unattended-Upgrade"] == ["1"] and len(c["Unattended-Upgrade::Allowed-Origins"]) == 3 and c["Unattended-Upgrade::Package-Blacklist"] == ["linux-image-*"]
+    assert [parse.origin_class(x) for x in c["Unattended-Upgrade::Allowed-Origins"]] == ["base", "security", "other"]
     assert parse.origin_class("${distro_id}ESM:${distro_codename}-infra-security") == "security" and parse.origin_class("o=Ubuntu,a=noble-proposed") == "other" and parse.origin_class("origin=Ubuntu,archive=noble") == "base"
 
 

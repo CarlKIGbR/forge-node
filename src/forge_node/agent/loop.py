@@ -36,6 +36,7 @@ class PolicyHolder:
     def __init__(self, cfg, clock, log):
         self.cfg, self.clock, self.log = cfg, clock, log
         self._sig = None
+        self._last_err = None
         self.view: PolicyView | None = None
 
     def _signature(self):
@@ -55,10 +56,12 @@ class PolicyHolder:
         try:
             view = load_installed(self.cfg.policy_dir, self.cfg.allowed_signers, self.cfg.node_id, self.clock(), owner_uid=self.cfg.owner_uid)
         except PolicyError as e:
-            if self.view is not None or sig is not None:
+            if e.detail != self._last_err and (self.view is not None or sig is not None):
                 self.log(f"policy: no usable policy ({e.detail})")
+            self._last_err = e.detail
             self.view = None
             return None, True
+        self._last_err = None
         changed = self.view is None or view.sha256 != self.view.sha256
         self.view = view
         if changed:
@@ -156,7 +159,11 @@ class Agent:
         if job["tier"] != 0:
             outcome = Outcome("denied", "DENY_TIER_DISABLED", "this release executes tier 0 only")
         else:
-            outcome = rt.engine.execute(job["op"], job["tier"], job["params"])
+            try:
+                outcome = rt.engine.execute(job["op"], job["tier"], job["params"])
+            except Exception as e:  # noqa: BLE001 - the engine reports its own failures as outcomes; this is the last line of defence for the loop
+                self.log(f"engine: unexpected {type(e).__name__}")
+                outcome = Outcome("failed", "FAIL_EXEC", type(e).__name__)
         status = outcome.status if outcome.status != "committed" or not job["dry_run"] else "dry_run"
         text = outcome.output if outcome.status == "committed" else redact_light(outcome.output)[:512]
         result = {"attempt": min(job["delivery_seq"], 1000), "status": status, "reason_code": outcome.reason_code, "output": text, "audit_seq_range": None, "plan_hash": None}
@@ -227,7 +234,12 @@ class Agent:
 
     def _poll_loop(self):
         while not self._stop.is_set():
-            st = self.poll_once()
+            try:
+                st = self.poll_once()
+            except Exception as e:  # noqa: BLE001 - one bad cycle must not end the agent; back off like for an unreachable hub
+                self.log(f"poll cycle failed: {type(e).__name__}")
+                self._fail += 1
+                st = "unreachable"
             if st in ("unreachable", "no_policy", "bad_response"):
                 delay = min(60.0, 2.0 ** min(self._fail, 6)) if st != "no_policy" else 30.0
                 self._stop.wait(delay * (0.5 + self.rng()))

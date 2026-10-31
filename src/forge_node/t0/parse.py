@@ -294,6 +294,8 @@ def apt_config(text: str) -> dict:
     for line in text.splitlines():
         m = re.match(r'^([A-Za-z0-9_:.+-]+?)(::)?\s+"(.*)";\s*$', line)
         if m and (m.group(1).startswith("Unattended-Upgrade") or m.group(1).startswith("APT::Periodic")):
+            if m.group(3) == "":
+                continue                # apt-config prints the empty list head `Key ""` before `Key:: "..."` entries; an empty value carries nothing
             out.setdefault(m.group(1).rstrip(":"), []).append(m.group(3))
     return out
 

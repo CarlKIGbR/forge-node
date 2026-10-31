@@ -93,6 +93,9 @@ UU_CONF = ('APT::Periodic::Unattended-Upgrade "1";\nUnattended-Upgrade::Allowed-
 DPKG = "docker-ce\t5:29.2.1-1\tii \nunattended-upgrades\t2.9.1\tii \nnvidia-driver-570\t570.1\tii \n"
 
 
+UNREADABLE = {"status": "unavailable", "reason": "no privileged probe in this test"}
+
+
 def pkgs_env(tmp_path, conf=UU_CONF, log=UU_LOG_OK, **extra):
     r = FakeRunner({"apt_config_dump": conf, "dpkg_versions": DPKG, "apt_simulate": APT, "apt_showhold": "linux-image-generic\nnvidia-driver-570\n", **extra})
     files = {"/var/log/unattended-upgrades/unattended-upgrades.log": log} if log is not None else {}
@@ -101,7 +104,7 @@ def pkgs_env(tmp_path, conf=UU_CONF, log=UU_LOG_OK, **extra):
 
 def test_inv_pkgs_reports_unattended_upgrades_status_and_last_run(tmp_path):
     env, _ = pkgs_env(tmp_path)
-    p = collect.pkgs(env)
+    p = collect.pkgs(env, UNREADABLE)
     uu = p["unattended_upgrades"]
     assert uu["installed"] and uu["enabled"] and uu["last_run"] == "2026-10-31 06:25:01" and uu["last_result"] == "installed" and not uu["drift"] and not uu["failed_last_run"]
     assert p["pending"]["total"] == 3 and p["pending"]["security"] == 1 and p["pending"]["security_packages"] == ["libssl3t64"]
@@ -112,20 +115,20 @@ def test_inv_pkgs_flags_origin_drift_and_failed_run(tmp_path):
     conf = UU_CONF + 'Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-updates";\nUnattended-Upgrade::Automatic-Reboot "true";\n'
     log = "2026-10-31 06:25:01,100 INFO Starting unattended upgrades script\n2026-10-31 06:25:01,200 INFO Allowed origins are: o=Ubuntu,a=noble-proposed\n2026-10-31 06:25:09,100 ERROR Installing the upgrades failed!\n"
     env, _ = pkgs_env(tmp_path, conf=conf, log=log)
-    uu = collect.pkgs(env)["unattended_upgrades"]
+    uu = collect.pkgs(env, UNREADABLE)["unattended_upgrades"]
     assert uu["drift"] is True and "${distro_id}:${distro_codename}-updates" in uu["origin_drift"] and "o=Ubuntu,a=noble-proposed" in uu["origin_drift"]
     assert uu["failed_last_run"] is True and uu["last_result"] == "failed" and uu["automatic_reboot"] is True
 
 
 def test_inv_pkgs_without_log_or_with_uu_disabled(tmp_path):
     env, _ = pkgs_env(tmp_path, conf='APT::Periodic::Unattended-Upgrade "0";\n', log=None)
-    uu = collect.pkgs(env)["unattended_upgrades"]
+    uu = collect.pkgs(env, UNREADABLE)["unattended_upgrades"]
     assert uu["enabled"] is False and uu["last_result"] == "log_unreadable"
 
 
 def test_forge_node_never_modifies_apt_config(tmp_path):
     env, r = pkgs_env(tmp_path)
-    collect.pkgs(env)
+    collect.pkgs(env, UNREADABLE)
     assert {c for c, _ in r.calls} <= {"apt_config_dump", "dpkg_versions", "apt_simulate", "apt_showhold"}
     for cid in ("apt_simulate", "apt_showhold", "apt_config_dump"):
         argv = runner.CMDS[cid].argv
@@ -180,3 +183,20 @@ def test_own_certs_days_left(tmp_path):
 def test_local_tls_reports_not_listening(tmp_path):
     t = collect.local_tls(make_env(tmp_path, FakeRunner({})))
     assert [r["port"] for r in t["listeners"]] == [443, 8443] and all(r.get("listening") is False for r in t["listeners"])
+
+
+def test_inv_pkgs_prefers_the_root_probe_answer_because_the_log_directory_is_root_adm_0750(tmp_path):
+    """Live proof: /var/log/unattended-upgrades is root:adm 0750, the agent uid cannot read it."""
+    env, _ = pkgs_env(tmp_path, log=None)
+    root = {"status": "ok", "last_run": "2026-10-31 06:25:01", "result": "failed", "origins": ["o=Ubuntu,a=noble-updates", ""]}
+    uu = collect.pkgs(env, root)["unattended_upgrades"]
+    assert uu["last_run"] == "2026-10-31 06:25:01" and uu["failed_last_run"] is True and uu["drift"] is True and uu["origin_drift"] == ["o=Ubuntu,a=noble-updates"]
+    assert collect.pkgs(env, UNREADABLE)["unattended_upgrades"]["last_result"] == "log_unreadable"
+    assert collect.pkgs(env, {"status": "ok"})["unattended_upgrades"]["last_result"] == "unknown"
+
+
+def test_empty_apt_config_values_are_not_origins(tmp_path):
+    conf = 'APT::Periodic::Unattended-Upgrade "1";\nUnattended-Upgrade::Allowed-Origins "";\nUnattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";\n'
+    env, _ = pkgs_env(tmp_path, conf=conf)
+    uu = collect.pkgs(env, UNREADABLE)["unattended_upgrades"]
+    assert uu["origins_configured"] == ["${distro_id}:${distro_codename}-security"] and uu["drift"] is False

@@ -38,7 +38,10 @@ def serve(pki, cert, key, verify_client=True, tls13_only=True):
     ctx.load_cert_chain(str(cert), str(key))
     ctx.load_verify_locations(str(pki.ca_crt))
     ctx.verify_mode = ssl.CERT_REQUIRED if verify_client else ssl.CERT_NONE
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    class Quiet(http.server.ThreadingHTTPServer):
+        def handle_error(self, request, client_address):          # failed handshakes are the point of several tests
+            pass
+    srv = Quiet(("127.0.0.1", 0), Handler)
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     Handler.seen = []
     threading.Thread(target=srv.serve_forever, daemon=True).start()

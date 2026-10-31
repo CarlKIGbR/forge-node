@@ -150,15 +150,20 @@ def units(env: Env) -> dict:
 _PKG_PATTERNS = ["docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin", "nvidia-driver-*", "nvidia-container-toolkit", "linux-image-generic*", "unattended-upgrades"]
 
 
-def pkgs(env: Env) -> dict:
+def pkgs(env: Env, root_log: dict) -> dict:
+    """`root_log` is the section answered by the privileged `uulog` probe (status ok with last_run/result/origins, or an unavailable/error section): the log directory is not readable by
+    the agent uid. If the probe is not available the agent still tries its own read before reporting `log_unreadable`."""
     out: dict = {}
     cfg = env.runner.run("apt_config_dump")
     conf = parse.apt_config(cfg.text) if cfg.ok else {}
     inst = env.runner.run("dpkg_versions", {"pkg": _PKG_PATTERNS})
     versions = parse.dpkg_versions(inst.text) if inst.ok else []
     installed_uu = any(v["package"] == "unattended-upgrades" for v in versions)
-    log = _rd(env, "/var/log/unattended-upgrades/unattended-upgrades.log", 256 * 1024)
-    last = parse.uu_log(log) if log is not None else {"last_run": None, "result": "log_unreadable", "origins": []}
+    if root_log.get("status") == "ok":
+        last = {"last_run": root_log.get("last_run"), "result": root_log.get("result") or "unknown", "origins": [o for o in (root_log.get("origins") or []) if isinstance(o, str) and o]}
+    else:
+        log = _rd(env, "/var/log/unattended-upgrades/unattended-upgrades.log", 256 * 1024)
+        last = parse.uu_log(log) if log is not None else {"last_run": None, "result": "log_unreadable", "origins": []}
     allowed = conf.get("Unattended-Upgrade::Allowed-Origins", []) + conf.get("Unattended-Upgrade::Origins-Pattern", [])
     classes = {e: parse.origin_class(e) for e in allowed}
     log_classes = {e: parse.origin_class(e) for e in last["origins"]}

@@ -81,7 +81,7 @@ def _cmds() -> dict[str, Cmd]:
     d["git_status_tracked"] = Cmd("git", ("--no-optional-locks", "-c", "safe.directory=<repo>", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "core.hooksPath=/dev/null",
                                           "-C", "<repo>", "status", "--porcelain=v1", "--untracked-files=no", "--no-renames"), slots=(("repo", "abs_path"),), timeout_s=60, max_out=512 * 1024, env=_git_env)
     d["sshd_effective"] = Cmd("sshd", ("-T",), timeout_s=10)
-    d["journal_unit"] = Cmd("journalctl", ("-u", "<unit>", "--since", "<since>", "-n", "<lines>", "--no-pager", "-o", "short-iso", "--no-hostname"),
+    d["journal_unit"] = Cmd("journalctl", ("-u", "<unit>", "--since=<since>", "-n", "<lines>", "--no-pager", "-o", "short-iso", "--no-hostname"),
                             slots=(("unit", "unit"), ("since", "seconds"), ("lines", "int")), max_out=256 * 1024, timeout_s=30)
     d["journal_last"] = Cmd("journalctl", ("-u", "<unit>", "-n", "1", "--no-pager", "-o", "short-unix", "--no-hostname"), slots=(("unit", "unit"),), max_out=32 * 1024, timeout_s=15)
     d["du_ionice"] = Cmd("ionice", ("-c3", "nice", "-n", "19", "du", "-s", "-b", "-x", "--", "<path>"), slots=(("path", "abs_path"),), timeout_s=120, max_out=4096)
@@ -146,7 +146,8 @@ def _expand(cmd: Cmd, slots: dict) -> list[str]:
         if many and (not isinstance(val, (list, tuple)) or not 1 <= len(val) <= cmd.max_list):
             raise RunnerError(f"slot {name}: 1..{cmd.max_list} values")
         for v in vals:
-            if not isinstance(v, str) or not pat.match(v) or v.startswith("-") or (declared[name] == "abs_path" and (".." in v.split("/") or "\x00" in v)):
+            # a value that IS a whole argv element may not look like an option; inside a larger element ("--since=-3600s") the prefix makes that impossible
+            if not isinstance(v, str) or not pat.match(v) or (v.startswith("-") and tok in (f"<{name}>", f"<{name}...>")) or (declared[name] == "abs_path" and (".." in v.split("/") or "\x00" in v)):
                 raise RunnerError(f"slot {name}: value rejected")
         out.extend(tok.replace("<" + name + ("..." if many else "") + ">", v) for v in vals)
     return out

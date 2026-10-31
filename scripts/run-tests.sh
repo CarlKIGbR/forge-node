@@ -32,5 +32,5 @@ docker run -d --name "$PGNAME" --network none -e POSTGRES_HOST_AUTH_METHOD=trust
 for _ in $(seq 1 60); do docker exec "$PGNAME" pg_isready -q -U postgres 2>/dev/null && break; sleep 0.5; done
 docker exec "$PGNAME" pg_isready -q -U postgres || { echo "Postgres kam nicht hoch" >&2; exit 1; }
 docker run --rm --network none --tmpfs /tmp:rw,exec,mode=1777 -v "$HERE:/w:ro" -v "$SOCK:/pgsock" -v "$SHIM:/shim:ro" -w /w \
-  -e PATH="/shim/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin" -e PYTHONDONTWRITEBYTECODE=1 -e FORGE_NODE_TEST_DSN="host=/pgsock user=postgres dbname=postgres" \
+  -e PATH="/shim/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin" -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/w/scripts -e FN_COV="${FN_COV:-}" -e FORGE_NODE_TEST_DSN="host=/pgsock user=postgres dbname=postgres" \
   --entrypoint python3 "$IMG" -m pytest "$@"

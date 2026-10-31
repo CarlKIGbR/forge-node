@@ -23,11 +23,12 @@ RO_PROBES = MappingProxyType({
     "containers": MappingProxyType({"caps": ("CAP_SYS_PTRACE", "CAP_DAC_READ_SEARCH"), "families": "AF_UNIX", "runtime_s": 120, "idle_io": False}),
     "vms": MappingProxyType({"caps": (), "families": "AF_UNIX", "runtime_s": 60, "idle_io": False}),
     "certs": MappingProxyType({"caps": ("CAP_DAC_READ_SEARCH",), "families": "AF_UNIX", "runtime_s": 120, "idle_io": False}),
-    "git": MappingProxyType({"caps": ("CAP_DAC_READ_SEARCH",), "families": "AF_UNIX", "runtime_s": 300, "idle_io": True}),
+    "git": MappingProxyType({"caps": ("CAP_DAC_READ_SEARCH",), "families": "AF_UNIX", "runtime_s": 240, "idle_io": True}),
     "access": MappingProxyType({"caps": ("CAP_DAC_READ_SEARCH",), "families": "AF_UNIX", "runtime_s": 60, "idle_io": False}),
-    "models": MappingProxyType({"caps": ("CAP_DAC_READ_SEARCH",), "families": "AF_UNIX", "runtime_s": 360, "idle_io": True}),
+    "models": MappingProxyType({"caps": ("CAP_DAC_READ_SEARCH",), "families": "AF_UNIX", "runtime_s": 240, "idle_io": True}),
     "journal": MappingProxyType({"caps": ("CAP_DAC_READ_SEARCH",), "families": "AF_UNIX", "runtime_s": 60, "idle_io": False}),
     "activity": MappingProxyType({"caps": ("CAP_DAC_READ_SEARCH",), "families": "AF_UNIX", "runtime_s": 60, "idle_io": False}),
+    "uulog": MappingProxyType({"caps": ("CAP_DAC_READ_SEARCH",), "families": "AF_UNIX", "runtime_s": 30, "idle_io": False}),
 })
 
 

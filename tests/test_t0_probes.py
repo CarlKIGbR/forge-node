@@ -382,3 +382,14 @@ def test_handle_request_rejects_malformed_requests_and_survives_probe_bugs(tmp_p
     monkeypatch.setitem(probes.__dict__, "_probe_net", lambda p, e: 1 / 0)
     r = json.loads(wire.handle_request(wire.encode_request("net", {}), env))
     assert r == {"ok": False, "code": "FAIL_EXEC", "detail": "ZeroDivisionError"}
+
+
+def test_uulog_probe_returns_only_the_parsed_outcome_never_log_lines(tmp_path):
+    log = "2026-10-31 06:25:01,100 INFO Starting unattended upgrades script\n2026-10-31 06:25:01,200 INFO Allowed origins are: o=Ubuntu,a=noble, o=Ubuntu,a=noble-security\n2026-10-31 06:25:02,000 INFO password=hunter2 All upgrades installed\n"
+    env = env_with(tmp_path, FakeRunner(), files={"/var/log/unattended-upgrades/unattended-upgrades.log": log})
+    r = run_probe("uulog", {}, env)["uulog"]
+    assert r == {"status": "ok", "last_run": "2026-10-31 06:25:01", "result": "installed", "origins": ["o=Ubuntu,a=noble", "o=Ubuntu,a=noble-security"]}
+    assert "hunter2" not in json.dumps(r)
+    assert run_probe("uulog", {}, env_with(tmp_path / "none", FakeRunner()))["uulog"]["status"] == "error"
+    with pytest.raises(ProbeError):
+        run_probe("uulog", {"x": 1}, env)

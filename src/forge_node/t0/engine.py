@@ -21,7 +21,7 @@ from .wire import ProbeDenied, ProbeUnavailable
 
 # section names each probe answers with (an unreachable or failing probe turns each of them into a status section)
 PROBE_SECTIONS = {"net": ("listeners", "docker_user"), "containers": ("containers",), "vms": ("domains", "pools"), "certs": ("certs",), "git": ("repos",),
-                  "access": ("sshd", "groups", "authorized_keys"), "models": ("models",), "journal": ("log",), "activity": ("activity",)}
+                  "access": ("sshd", "groups", "authorized_keys"), "models": ("models",), "journal": ("log",), "activity": ("activity",), "uulog": ("uulog",)}
 RETRYABLE_PROBE_CODES = frozenset({"DENY_WINDOW", "DENY_RATE", "DENY_STOP", "DENY_LOCAL_STOP", "DENY_STALE_LEASE", "DENY_CLOCK", "DENY_AUDIT_DOWN", "DENY_QUARANTINE"})
 
 
@@ -50,7 +50,7 @@ class T0Engine:
             "inv.units": (False, lambda p: (collect.units(env), "internal")),
             "inv.containers": (False, lambda p: (self._probe("containers", {}), "internal")),
             "inv.vms": (False, lambda p: (self._vms(), "internal")),
-            "inv.pkgs": (False, lambda p: (collect.pkgs(env), "internal")),
+            "inv.pkgs": (False, lambda p: (collect.pkgs(env, self._probe("uulog", {})["uulog"]), "internal")),
             "inv.certs": (False, lambda p: (self._certs(), "internal")),
             "inv.backups": (False, lambda p: (collect.backups(env), "internal")),
             "inv.git": (True, lambda p: (self._probe("git", {}), "internal")),

@@ -9,7 +9,7 @@ from . import probes
 from .env import Env
 
 MAX_LINE = 512 * 1024
-PROBE_TIMEOUT_S = 330          # models: du budget 300 s + overhead
+PROBE_TIMEOUT_S = 250          # longest probe (RuntimeMaxSec 240) plus a little; one agent job runs inline, so the heartbeat gap stays below the hub's 5-minute alert
 
 
 class ProbeUnavailable(Exception):

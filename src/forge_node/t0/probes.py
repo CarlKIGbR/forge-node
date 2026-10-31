@@ -9,7 +9,7 @@ from .env import Env, failed, ok, run_failure, unavailable
 from .fsread import FsError, norm_abs, under
 
 HEAVY_PROBES = frozenset({"models", "git"})
-PROBE_NAMES = ("net", "containers", "vms", "certs", "git", "access", "models", "journal", "activity")
+PROBE_NAMES = ("net", "containers", "vms", "certs", "git", "access", "models", "journal", "activity", "uulog")
 _SAFE_GIT_FILES = re.compile(r"^/.{1,4000}/\.git/(?:HEAD|packed-refs|config|refs/heads/[A-Za-z0-9._/-]{1,200}|refs/remotes/[A-Za-z0-9._/-]{1,200})\Z")
 _JOURNAL_BUDGET = 48 * 1024
 
@@ -266,9 +266,13 @@ def _git_rev(env: Env, real: str) -> dict:
     return {"rev": rev if rev and re.match(r"^[0-9a-f]{40}$", rev) else None, "branch": branch, "detached": False}
 
 
+GIT_BUDGET_S = 120
+
+
 def _probe_git(params: dict, env: Env) -> dict:
     _no_params(params)
     rows = []
+    t_end = env.now().timestamp() + GIT_BUDGET_S
     for configured in env.policy.t0.repos:
         row: dict = {"path": configured}
         try:
@@ -278,12 +282,18 @@ def _probe_git(params: dict, env: Env) -> dict:
                 rows.append(row)
                 continue
             row.update(_git_rev(env, real))
-            safe, why = git_config_is_safe(env.fs.read_exception(f"{real}/.git/config", _SAFE_GIT_FILES))
+            cfg_before = env.fs.read_exception(f"{real}/.git/config", _SAFE_GIT_FILES)
+            safe, why = git_config_is_safe(cfg_before)
             if not safe:
                 row["dirty_tracked"], row["dirty_status"], row["dirty_reason"] = None, "skipped_unsafe_config", why
+            elif env.now().timestamp() >= t_end:
+                row["dirty_tracked"], row["dirty_status"] = None, "skipped_budget"
             else:
                 r = env.runner.run("git_status_tracked", {"repo": real})
-                if r.ok:
+                # the config is writable by the repository's owner, who is not trusted: read it again AFTER the run and discard the result if it changed in between
+                if env.fs.read_exception(f"{real}/.git/config", _SAFE_GIT_FILES) != cfg_before:
+                    row["dirty_tracked"], row["dirty_status"] = None, "config_changed_during_read"
+                elif r.ok:
                     row["dirty_tracked"], row["dirty_status"] = len([l for l in r.text.splitlines() if l.strip()]), "ok"
                 else:
                     row["dirty_tracked"], row["dirty_status"] = None, "failed:" + r.reason
@@ -326,7 +336,7 @@ def _probe_access(params: dict, env: Env) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------------------------------------- models
-MODELS_DU_BUDGET_S = 300
+MODELS_DU_BUDGET_S = 150
 
 
 def _probe_models(params: dict, env: Env) -> dict:
@@ -406,3 +416,14 @@ def _probe_activity(params: dict, env: Env) -> dict:
         m = re.match(r"^(\d{9,11})(?:\.\d+)?\s", r.text) if r.ok else None
         rows.append({"unit": lu.unit, "last_log_age_s": max(0, int(now - int(m.group(1)))) if m else None})
     return {"activity": ok(units=rows)}
+
+
+def _probe_uulog(params: dict, env: Env) -> dict:
+    """`/var/log/unattended-upgrades` is root:adm 0750 on Ubuntu, so the agent uid cannot read it (found in the live proof): the root probe reads the tail and returns only the
+    parsed outcome of the last run - timestamp, result class, the origins the run reported - never log lines."""
+    _no_params(params)
+    try:
+        text = env.fs.read_text("/var/log/unattended-upgrades/unattended-upgrades.log", 256 * 1024)
+    except FsError as e:
+        return {"uulog": failed(e.code)}
+    return {"uulog": ok(**parse.uu_log(text))}
