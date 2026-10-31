@@ -14,7 +14,7 @@ def _mk(n, source_types=("t0",)):
     return recs
 
 
-def test_chain_verifies_and_detects_edit():           # test_chain_detects_edit
+def test_chain_detects_edit():           # test_chain_detects_edit
     recs = _mk(5)
     assert chain.verify_chain(recs) == []
     bad = copy.deepcopy(recs)

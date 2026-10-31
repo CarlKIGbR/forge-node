@@ -22,7 +22,7 @@ def _read_regular(dirfd: int, name: str, limit: int) -> bytes:
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > limit:
-            raise ProtoError("BAD_REQUEST", "not a servable file")
+            raise FileNotFoundError("not a servable file")
         chunks, left = [], st.st_size
         while left > 0:
             b = os.read(fd, min(left, 1 << 20))

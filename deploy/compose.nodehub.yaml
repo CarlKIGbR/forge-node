@@ -1,0 +1,79 @@
+# forge-nodehub als Compose-Dienst im forge-core-Verbund (Design 3.1, 5.1). Slice N1 LIEFERT diese Datei; sie wird in N1 nicht ausgefuehrt und nichts wird gebaut oder gestartet.
+# Einbindung (N4, Owner): `docker compose -p forge-core -f compose.yaml -f <pfad>/deploy/compose.nodehub.yaml up -d forge-nodehub` NACH Migration + Rollen/Secrets (scripts/sql/nodehub_*.sql),
+# TLS-Schluessel/Gate-Schluessel (vom Owner erzeugt, nie im Repo) und der DOCKER-USER-Regel (forge-ops: forge-docker-user.sh --hub).
+name: forge-core
+
+x-nodehub: &nodehub
+  image: ${IMG_FORGE_NODEHUB}                     # per Digest gepinnt (images.lock des Installs); kein Floating-Tag
+  user: "${FORGE_UID}:${FORGE_GID}"
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 128
+  networks: [forge_core]
+  logging: {driver: json-file, options: {max-size: "10m", max-file: "3"}}
+
+secrets:
+  nodehub_db_password: {file: ./secrets/nodehub_db_password}
+
+networks:
+  forge_core: {external: true, name: forge-core_forge_core}
+
+services:
+  nodehub-migrate:
+    <<: *nodehub
+    command: ["python", "-m", "forge_node.hub.migrate"]
+    environment:
+      FORGE_NODEHUB_MIGRATE_DSN: host=postgres port=5432 dbname=forge user=forge_core       # Eigentuemerin des Schemas; NICHT forge_nodehub
+      FORGE_NODEHUB_MIGRATE_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    restart: "no"
+    mem_limit: 128m
+    profiles: [nodehub-migrate]
+    labels: {app.kubernetes.io/part-of: forge, app.kubernetes.io/name: forge-nodehub-migrate}
+
+  forge-nodehub:
+    <<: *nodehub
+    command: ["python", "-m", "forge_node.hub"]
+    # Container-intern darf der Prozess auf der Wildcard lauschen (privates Netz); nach aussen erscheint der Port AUSSCHLIESSLICH auf der LAN-IP (Design 5.1). Nie 0.0.0.0 publizieren.
+    ports:
+      - {target: 8094, published: 8094, host_ip: 192.168.10.4, protocol: tcp}
+    environment:
+      FORGE_NODEHUB_CONTAINER: "1"
+      FORGE_NODEHUB_LISTEN_HOST: 0.0.0.0
+      FORGE_NODEHUB_PORT: "8094"
+      FORGE_NODEHUB_DB_DSN: host=postgres port=5432 dbname=forge user=forge_nodehub
+      FORGE_NODEHUB_DB_PASSWORD_FILE: /run/secrets/nodehub_db_password
+      FORGE_NODEHUB_TLS_CERT: /run/nodehub/hub.crt
+      FORGE_NODEHUB_TLS_KEY: /run/nodehub/hub.key
+      FORGE_NODEHUB_TLS_CA: /run/nodehub/ca.crt
+      FORGE_NODEHUB_GATE_KEY: /run/nodehub/gate_ed25519
+      FORGE_NODEHUB_GATE_KEY_ID: hub-gate-1
+      FORGE_NODEHUB_CONTROL_DIR: /post/control
+      FORGE_NODEHUB_POLICY_DIR: /var/lib/forge-nodehub/policy
+      FORGE_NODEHUB_RELEASE_DIR: /var/lib/forge-nodehub/release
+    secrets: [nodehub_db_password]
+    volumes:
+      - /srv/forge/post/control:/post/control:rw                                   # Kill-Switch-Verzeichnis: der Hub liest STOP und nimmt .dispatch.lock (schreibt/loescht STOP nie)
+      - ./secrets/nodehub/hub.crt:/run/nodehub/hub.crt:ro
+      - ./secrets/nodehub/hub.key:/run/nodehub/hub.key:ro                           # 0640, Hub-uid
+      - ./secrets/nodehub/ca.crt:/run/nodehub/ca.crt:ro
+      - ./secrets/nodehub/gate_ed25519:/run/nodehub/gate_ed25519:ro                 # 0400, Hub-uid; Public-Teil steht in jeder Node-Policy
+      - ./data/nodehub/policy:/var/lib/forge-nodehub/policy:ro                      # vom Owner abgelegte, signierte Policies (der Hub prueft/aendert nichts)
+      - ./data/nodehub/release:/var/lib/forge-nodehub/release:ro                    # vom Owner abgelegte, signierte Release-Artefakte
+    healthcheck:
+      test: ["CMD", "python", "-c", "import ssl,urllib.request as u;c=ssl.create_default_context(cafile='/run/nodehub/ca.crt');c.check_hostname=False;u.urlopen('https://127.0.0.1:8094/healthz',context=c,timeout=4)"]
+      interval: 15s
+      timeout: 6s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    mem_limit: 256m
+    stop_grace_period: 15s
+    labels:
+      app.kubernetes.io/part-of: forge
+      app.kubernetes.io/name: forge-nodehub
+      forge.managed: "true"
+      forge.critical: "true"                  # Design 4.2: der Hub ist kritisch und fuer T1 ausgeschlossen
+      forge.node: g2

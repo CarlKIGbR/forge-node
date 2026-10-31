@@ -143,9 +143,14 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
     def do_PUT(self):
+        self._drain()
         self._err(405, "method_not_allowed")
 
     do_DELETE = do_PATCH = do_PUT
+
+    def send_error(self, code, message=None, explain=None):
+        self.close_connection = True       # Parser-Fehler (unbekannte Methode, kaputte Request-Zeile): nie auf demselben Stream weiterlesen
+        super().send_error(code, message, explain)
 
     def _dispatch(self, method: str):
         path = self.path.split("?", 1)[0]

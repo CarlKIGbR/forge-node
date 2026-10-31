@@ -560,7 +560,7 @@ def test_stale_attempt_result_is_ignored(hub, gate_keys):
     assert r.get("stale") and hub.job_state(j)["state"] == "aborted_safe"
 
 
-def test_result_output_redacted_at_the_hub_canaries_never_stored(hub, gate_keys, adm):         # test_redaction_canaries_never_stored
+def test_redaction_canaries_never_stored(hub, gate_keys, adm):         # test_redaction_canaries_never_stored
     a, b = JID(), JID()
     hub.enqueue_job(JobRequest("g2", 0, "logs.unit", {"unit": "forge-edge.service"}, job_id=a))
     hub.enqueue_job(JobRequest("g2", 0, "inv.host", job_id=b))
@@ -598,3 +598,28 @@ def test_authenticate_requires_active_node_and_matching_fingerprint(hub, adm):
     adm.execute("UPDATE node.nodes SET status='revoked' WHERE node_id='g2'")
     with hub.db.tx() as c, pytest.raises(AuthError):
         hub.authenticate(c, "g2", "a" * 64)
+
+
+def test_too_many_project_stops_fail_closed(hub, hubcfg, gate_keys, clock):
+    d = hubcfg.control_dir / "stop.d"
+    d.mkdir()
+    for i in range(300):
+        (d / f"p{i:03d}").write_text("")
+    p = protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0)
+    assert p["stop"] is True and len(p["stopped_projects"]) == 256
+
+
+def test_pool_based_db_with_the_real_least_privilege_role(dsn, hubcfg, gate, clock, adm):
+    """Produktionspfad: Db (psycopg_pool), direkt als Rolle forge_nodehub verbunden (kein SET ROLE)."""
+    from forge_node.hub.db import Db
+
+    add_node(adm, "g2", "full", cert="a" * 64)
+    db = Db(dsn.replace("user=postgres", "").strip() + " user=forge_nodehub")
+    try:
+        h = Hub(hubcfg, db, Signer(gate["priv"], gate["id"]), clock=clock)
+        e = h.enqueue_job(JobRequest("g2", 0, "inv.host"))
+        r = h.poll("g2", _poll())
+        assert len(r["jobs"]) == 1 and h.job_state(e.job_id)["state"] == "issued"
+        assert h.verify_chains("g2") == []
+    finally:
+        db.close()

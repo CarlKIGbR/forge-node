@@ -53,3 +53,11 @@ def test_is_canonical_roundtrip():
 def test_lone_surrogate_rejected():
     with pytest.raises(canon.CanonError):
         canon.canonical({"a": "\ud800"})
+
+
+def test_nul_rejected_in_values_and_keys():
+    for bad in ({"a": "x\x00y"}, {"a\x00": 1}, ["\x00"]):
+        with pytest.raises(canon.CanonError):
+            canon.canonical(bad)
+    with pytest.raises(canon.CanonError):
+        canon.loads('{"a":"x\\u0000y"}')

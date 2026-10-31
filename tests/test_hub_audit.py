@@ -265,3 +265,36 @@ def test_hub_cannot_lift_quarantine(hub):
     hub.quarantine("g2", "chain_break", "k1", {})
     with hub.db.tx() as c, pytest.raises(psycopg.errors.InsufficientPrivilege):
         c.execute("UPDATE node.nodes SET quarantine=false WHERE node_id='g2'")
+
+
+def test_incremental_verification_resumes_and_still_catches_new_damage(hub, adm):
+    recs = _chain(n=6)
+    hub.ingest_audit("g2", {"source": "priv", "records": recs[:3]})
+    assert hub.verify_chains("g2") == [] and hub._cursor[("g2", "priv")][0] == 4
+    hub.ingest_audit("g2", {"source": "priv", "records": recs[3:]})
+    assert hub.verify_chains("g2", full=False) == [] and hub._cursor[("g2", "priv")][0] == 7
+    adm.execute("SET session_replication_role = replica")
+    adm.execute("UPDATE node.audit SET record = jsonb_set(record, '{note}', '\"x\"') WHERE seq=5 AND source='priv'")
+    adm.execute("SET session_replication_role = origin")
+    assert hub.verify_chains("g2", full=False) == []                          # inkrementell sieht Altes nicht ...
+    assert "seq 5" in hub.verify_chains("g2", full=True)[0]                   # ... der taegliche Vollauf schon
+
+
+def test_verification_pages(hub, monkeypatch):
+    from forge_node.hub import core
+
+    monkeypatch.setattr(core, "VERIFY_PAGE", 4)
+    hub.ingest_audit("g2", {"source": "priv", "records": _chain(n=11)})
+    assert hub.verify_chains("g2") == [] and hub._cursor[("g2", "priv")][0] == 12
+
+
+def test_open_job_cap_per_node(hub):
+    from forge_node.hub import core
+    from forge_node.hub.core import JobDenied
+
+    for _ in range(core.MAX_OPEN_JOBS_PER_NODE):
+        hub.enqueue_job(JobRequest("g2", 0, "inv.host"))
+    with pytest.raises(JobDenied) as e:
+        hub.enqueue_job(JobRequest("g2", 0, "inv.host"))
+    assert e.value.code == "DENY_RATE"
+    assert hub.enqueue_job(JobRequest("g1", 0, "inv.host")).created

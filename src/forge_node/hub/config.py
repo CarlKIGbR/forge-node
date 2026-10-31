@@ -16,14 +16,17 @@ def _path(env, name, default=None) -> Path | None:
     return Path(v) if v else None
 
 
-def check_bind_host(host: str) -> str:
-    """Der Hub lauscht nur auf der LAN-IP (Design 5.1) - nie auf 0.0.0.0, ::, einem Hostnamen oder leer."""
+def check_bind_host(host: str, in_container: bool = False) -> str:
+    """Der Hub lauscht nur auf einer konkreten Adresse (Design 5.1: LAN-IP 192.168.10.4) - nie auf einem Hostnamen oder leer, und Wildcards (0.0.0.0, ::) nur im Container
+    (FORGE_NODEHUB_CONTAINER=1): dort ist das Netz privat, die Erreichbarkeit regelt allein das Publish `192.168.10.4:8094` (deploy/compose.nodehub.yaml, per Test gesichert)."""
     try:
         ip = ipaddress.ip_address(host)
     except ValueError as e:
         raise ConfigError(f"listen host must be a literal IP address, got {host!r}") from e
-    if ip.is_unspecified or ip.is_multicast:
-        raise ConfigError("listen host must be a concrete interface address, never 0.0.0.0/::")
+    if ip.is_multicast:
+        raise ConfigError("listen host must not be a multicast address")
+    if ip.is_unspecified and not in_container:
+        raise ConfigError("listen host must be a concrete interface address; 0.0.0.0/:: only inside the container (FORGE_NODEHUB_CONTAINER=1)")
     return str(ip)
 
 
@@ -65,7 +68,7 @@ class HubConfig:
             raise ConfigError(f"lease validity must be 10..{LEASE_MAX_VALID_S} s")
         return cls(
             db_dsn=need("FORGE_NODEHUB_DB_DSN"), db_password_file=_path(env, "FORGE_NODEHUB_DB_PASSWORD_FILE"),
-            listen_host=check_bind_host(need("FORGE_NODEHUB_LISTEN_HOST")), listen_port=port,
+            listen_host=check_bind_host(need("FORGE_NODEHUB_LISTEN_HOST"), env.get("FORGE_NODEHUB_CONTAINER") == "1"), listen_port=port,
             tls_cert=Path(need("FORGE_NODEHUB_TLS_CERT")), tls_key=Path(need("FORGE_NODEHUB_TLS_KEY")), tls_ca=Path(need("FORGE_NODEHUB_TLS_CA")),
             gate_key=Path(need("FORGE_NODEHUB_GATE_KEY")), gate_key_id=need("FORGE_NODEHUB_GATE_KEY_ID"),
             control_dir=Path(need("FORGE_NODEHUB_CONTROL_DIR")), policy_dir=Path(need("FORGE_NODEHUB_POLICY_DIR")), release_dir=Path(need("FORGE_NODEHUB_RELEASE_DIR")),

@@ -13,6 +13,9 @@ from ..protocol import ProtoError
 from . import files, killswitch, params as params_mod
 
 JOB_TTL_S = protocol.JOB_MAX_TTL_S
+MAX_OPEN_JOBS_PER_NODE = 200
+VERIFY_PAGE = 5000
+FULL_VERIFY_EVERY = 1440          # Durchlaeufe (bei 60 s Takt: taeglich); dazwischen nur neue Records
 _ACTIVE_STATES = ("issued", "in_progress")
 TERMINAL = ("committed", "dry_run", "denied", "failed", "expired")
 
@@ -74,6 +77,8 @@ class Hub:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.gates = gate_set
         self.sleep = sleep
+        self._cursor: dict[tuple[str, str], tuple[int, str]] = {}
+        self._passes = 0
 
     # ------------------------------------------------------------------------------------------------------------- nodes
     def authenticate(self, conn, node_id: str, cert_sha256: str) -> dict:
@@ -127,7 +132,8 @@ class Hub:
         now = _floor(self.clock())
         row = conn.execute("UPDATE node.nodes SET lease_seq = lease_seq + 1 WHERE node_id = %s RETURNING lease_seq, quarantine", (node_id,)).fetchone()
         projects, ok = killswitch.stopped_projects(self.cfg.control_dir)
-        stop = killswitch.stop_active(self.cfg.control_dir) or not ok
+        stop = killswitch.stop_active(self.cfg.control_dir) or not ok or len(projects) > 256      # zu viele Projekt-Stopps passen nicht in die Lease: dann global stoppen (fail closed)
+        projects = projects[:256]
         payload = {"typ": "lease", "v": protocol.PROTOCOL_VERSION, "node": node_id, "seq": row["lease_seq"], "issued_at": protocol.fmt_ts(now),
                    "valid_until": protocol.fmt_ts(now + timedelta(seconds=self.cfg.lease_valid_s)), "stop": stop, "stopped_projects": projects, "quarantine": bool(row["quarantine"])}
         return self.signer.seal(payload)
@@ -193,6 +199,8 @@ class Hub:
                 if node["quarantine"]:
                     raise JobDenied("DENY_QUARANTINE", "node is quarantined")
             deadline = now + timedelta(seconds=self.cfg.queue_ttl_s)
+            if conn.execute("SELECT count(*) AS n FROM node.jobs WHERE node_id=%s AND state IN ('queued','issued','in_progress')", (req.node,)).fetchone()["n"] >= MAX_OPEN_JOBS_PER_NODE:
+                raise JobDenied("DENY_RATE", f"more than {MAX_OPEN_JOBS_PER_NODE} open jobs for this node")
             row = conn.execute(
                 "INSERT INTO node.jobs (job_id, node_id, tier, op, params, dry_run, plan_hash, requester, project, owner_sig, state, queued_at, queue_deadline) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'queued',%s,%s) ON CONFLICT (job_id) DO NOTHING RETURNING job_id, state",
@@ -416,28 +424,38 @@ class Hub:
         return out
 
     # -------------------------------------------------------------------------------------------------------- verification
-    def verify_chains(self, node_id: str) -> list[str]:
-        """Rechnet die gespeicherten Ketten neu (hash/prev/seq). Zeilen mit redacted=true koennen den Hash nicht mehr belegen: dort nur Verkettung."""
+    def verify_chains(self, node_id: str, full: bool = True) -> list[str]:
+        """Rechnet die gespeicherten Ketten neu (hash/prev/seq), seitenweise. full=False setzt hinter dem zuletzt geprueften Record fort (Cursor im Prozess).
+        Zeilen mit redacted=true koennen den Hash nicht mehr belegen: dort nur Verkettung."""
         problems: list[str] = []
-        with self.db.tx() as conn:
-            for source in ("agent", "priv", "hub"):
-                rows = conn.execute("SELECT seq, prev_hash, hash, redacted, record FROM node.audit WHERE node_id=%s AND source=%s ORDER BY seq", (node_id, source)).fetchall()
-                seq, prev = 1, chain.GENESIS_HASH
+        for source in ("agent", "priv", "hub"):
+            seq, prev = (1, chain.GENESIS_HASH) if full else self._cursor.get((node_id, source), (1, chain.GENESIS_HASH))
+            broken = False
+            while not broken:
+                with self.db.tx() as conn:
+                    rows = conn.execute("SELECT seq, prev_hash, hash, redacted, record FROM node.audit WHERE node_id=%s AND source=%s AND seq >= %s ORDER BY seq LIMIT %s",
+                                        (node_id, source, seq, VERIFY_PAGE)).fetchall()
                 for r in rows:
                     rec = r["record"]
                     if r["seq"] != seq:
                         problems.append(f"{source}: seq gap, expected {seq} got {r['seq']}")
-                        break
-                    if r["prev_hash"] != prev:
+                    elif r["prev_hash"] != prev:
                         problems.append(f"{source}: seq {seq} prev_hash broken")
-                        break
-                    if not r["redacted"] and chain.record_hash(rec) != r["hash"]:
+                    elif not r["redacted"] and chain.record_hash(rec) != r["hash"]:
                         problems.append(f"{source}: seq {seq} content does not match its hash")
-                        break
-                    if rec.get("seq") != r["seq"] or rec.get("hash") != r["hash"] or rec.get("prev_hash") != r["prev_hash"]:
+                    elif rec.get("seq") != r["seq"] or rec.get("hash") != r["hash"] or rec.get("prev_hash") != r["prev_hash"]:
                         problems.append(f"{source}: seq {seq} record/columns disagree")
-                        break
-                    prev, seq = r["hash"], seq + 1
+                    else:
+                        prev, seq = r["hash"], seq + 1
+                        continue
+                    broken = True
+                    break
+                if len(rows) < VERIFY_PAGE:
+                    break
+            if not broken:
+                self._cursor[(node_id, source)] = (seq, prev)
+            else:
+                self._cursor.pop((node_id, source), None)
         return problems
 
     def crosscheck(self, node_id: str) -> list[dict]:
@@ -475,8 +493,8 @@ class Hub:
             self.quarantine(node_id, a["kind"], a["key"], a["detail"])
         return anomalies
 
-    def verify_node(self, node_id: str) -> dict:
-        problems = self.verify_chains(node_id)
+    def verify_node(self, node_id: str, full: bool = True) -> dict:
+        problems = self.verify_chains(node_id, full)
         for p in problems:
             self.quarantine(node_id, "chain_break", "verify-" + p[:120], {"why": p})
         return {"chain_problems": problems, "crosscheck": self.crosscheck(node_id)}
@@ -492,6 +510,8 @@ class Hub:
             for i in range(0, 4):
                 m = (now.replace(day=1) + timedelta(days=32 * i)).replace(day=1).date()
                 conn.execute("SELECT node.audit_ensure_partition(%s)", (m,))
+        full = self._passes % FULL_VERIFY_EVERY == 0
+        self._passes += 1
         for n in nodes:
-            out[n] = self.verify_node(n)
+            out[n] = self.verify_node(n, full)
         return out

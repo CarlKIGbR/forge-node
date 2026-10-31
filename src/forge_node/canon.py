@@ -12,7 +12,11 @@ class CanonError(ValueError):
 def _check(o, depth=0):
     if depth > 32:
         raise CanonError("too deeply nested")
-    if o is None or isinstance(o, (bool, str)):
+    if isinstance(o, str):
+        if "\x00" in o:
+            raise CanonError("NUL is not allowed in strings")      # jsonb kann \u0000 nicht speichern; kein legitimer Inhalt
+        return
+    if o is None or isinstance(o, bool):
         return
     if isinstance(o, int):
         if abs(o) > MAX_INT:
@@ -28,6 +32,7 @@ def _check(o, depth=0):
         for k, v in o.items():
             if not isinstance(k, str):
                 raise CanonError("object keys must be strings")
+            _check(k, depth + 1)
             _check(v, depth + 1)
         return
     raise CanonError(f"unsupported type {type(o).__name__}")
