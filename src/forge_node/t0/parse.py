@@ -9,8 +9,11 @@ import re
 def milli(s) -> int | None:
     """'70.12' -> 70120; '[N/A]'/'' -> None."""
     try:
-        return int(round(float(str(s).strip()) * 1000))
-    except (ValueError, TypeError):
+        v = float(str(s).strip())
+        if v != v or v in (float("inf"), float("-inf")):
+            return None
+        return max(-(2**53 - 1), min(2**53 - 1, int(round(v * 1000))))
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
@@ -36,7 +39,7 @@ def cpuinfo(text: str) -> dict:
     for line in text.splitlines():
         if line.startswith("processor"):
             n += 1
-        elif line.lower().startswith("model name"):
+        elif line.lower().startswith("model name") and ":" in line:
             models.add(line.split(":", 1)[1].strip())
     return {"threads": n, "model": sorted(models)[0] if models else None}
 
@@ -96,7 +99,10 @@ def diskstats(text: str) -> dict:
         name = p[2]
         if re.match(r"^(loop|ram|zram|dm-|sr|fd)", name) or re.match(r"^(sd[a-z]+|vd[a-z]+|xvd[a-z]+)\d+$", name) or re.match(r"^nvme\d+n\d+p\d+$", name) or re.match(r"^md\d+p\d+$", name):
             continue
-        out[name] = {"rd_sectors": int(p[5]), "wr_sectors": int(p[9]), "io_ms": int(p[12]), "inflight": int(p[11]), "rd_ios": int(p[3]), "wr_ios": int(p[7])}
+        try:
+            out[name] = {"rd_sectors": int(p[5]), "wr_sectors": int(p[9]), "io_ms": int(p[12]), "inflight": int(p[11]), "rd_ios": int(p[3]), "wr_ios": int(p[7])}
+        except ValueError:
+            continue
     return out
 
 
@@ -108,14 +114,22 @@ def net_dev(text: str) -> dict:
         name, rest = line.split(":", 1)
         p = rest.split()
         if len(p) >= 9 and name.strip() != "lo":
-            out[name.strip()] = {"rx_bytes": int(p[0]), "tx_bytes": int(p[8])}
+            try:
+                out[name.strip()] = {"rx_bytes": int(p[0]), "tx_bytes": int(p[8])}
+            except ValueError:
+                continue
     return out
 
 
 def cpu_times(text: str) -> dict | None:
     for line in text.splitlines():
         if line.startswith("cpu "):
-            v = [int(x) for x in line.split()[1:]]
+            try:
+                v = [int(x) for x in line.split()[1:]]
+            except ValueError:
+                return None
+            if len(v) < 4:
+                return None
             idle = v[3] + (v[4] if len(v) > 4 else 0)
             return {"total": sum(v[:8]) if len(v) >= 8 else sum(v), "idle": idle}
     return None
@@ -132,7 +146,7 @@ def kv_file(text: str) -> dict:
     out = {}
     for line in text.splitlines():
         p = line.split()
-        if len(p) == 2 and p[1].isdigit():
+        if len(p) == 2 and re.fullmatch(r"[0-9]+", p[1]):
             out[p[0]] = int(p[1])
     return out
 

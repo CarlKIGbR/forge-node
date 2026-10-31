@@ -22,8 +22,11 @@ def test_there_are_parsers_to_fuzz():
     assert len(PARSERS) >= 25
 
 
-@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-@given(st.one_of(text, lines))
+structured = st.text(alphabet="0123456789.:-_ \t\n\"'[]{}(),=#$*/\\ABCDEFabcdef", max_size=120)           # token-ish soup finds the parsers' int()/split() assumptions
+
+
+@settings(max_examples=150, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(st.one_of(text, lines, structured))
 def test_property_no_parser_raises_on_arbitrary_text(s):
     for name, fn in PARSERS:
         try:
@@ -137,3 +140,15 @@ def test_property_json_consuming_parsers_survive_any_json_shape(doc):
     wrapped = json.dumps({"blockdevices": doc, "filesystems": doc})
     parse.lsblk(wrapped)
     parse.findmnt(wrapped)
+
+
+def test_inputs_the_fuzzer_found_are_pinned_as_regressions():
+    """Each of these once raised: float('INFINITY') in milli(), a bare 'cpu ' line, a superscript digit that str.isdigit() accepts but int() rejects, 'MODEL NAME' without a colon,
+    csv with a stray CR, JSON of the wrong shape."""
+    assert parse.uptime("INFINITY") is None and parse.milli("nan") is None and parse.milli("1e999") is None and parse.milli("1e30") == 2**53 - 1
+    assert parse.cpu_times("cpu \n") is None and parse.cpu_times("cpu a b c d\n") is None
+    assert parse.kv_file("0 \u00b2\n1 \u00b9\nok 7\n") == {"ok": 7}
+    assert parse.cpuinfo("MODEL NAME\nprocessor\n") == {"threads": 1, "model": None}
+    assert parse.nvidia_apps("a\r,b\n") == []
+    assert parse.diskstats("1 2 sda x y z w q r s t u v\n") == {} and parse.net_dev("h\nh\n e: a b c d e f g h i\n") == {}
+    assert parse.ip_routes("0") == {"routes": [], "default_gateways": []} and parse.lsblk('{"blockdevices": [null, 1, {"children": 5}]}')[0]["name"] is None
