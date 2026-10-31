@@ -468,7 +468,9 @@ class Hub:
             jobs = conn.execute("SELECT job_id, tier, op, state, result_status, result_attempt FROM node.jobs WHERE node_id=%s AND tier >= 1 AND result_at IS NOT NULL AND result_at < %s", (node_id, cutoff)).fetchall()
             for j in jobs:
                 recs = conn.execute("SELECT type, attempt FROM node.audit WHERE node_id=%s AND source='priv' AND job_id=%s", (node_id, j["job_id"])).fetchall()
-                types = {r["type"] for r in recs}
+                att = j["result_attempt"]
+                # Design 8.1: Zuordnung ueber job_id UND attempt. Records anderer Versuche zaehlen nicht; nur ein `denial` vor dem Claim darf ohne attempt sein.
+                types = {r["type"] for r in recs if r["attempt"] == att or (r["type"] == "denial" and r["attempt"] is None)}
                 st = j["result_status"]
                 if st in ("committed", "failed", "aborted_safe", "indeterminate"):
                     ok = "intent" in types and bool(types & {"result", "recovery"})
@@ -477,7 +479,7 @@ class Hub:
                 else:                                                                 # denied
                     ok = bool(types & {"denial", "result"})
                 if not ok:
-                    anomalies.append({"kind": "crosscheck_mismatch", "key": f"missing-{j['job_id']}", "detail": {"job_id": str(j["job_id"]), "hub_status": st, "priv_types": sorted(types)}})
+                    anomalies.append({"kind": "crosscheck_mismatch", "key": f"missing-{j['job_id']}", "detail": {"job_id": str(j["job_id"]), "hub_status": st, "hub_attempt": att, "priv_types": sorted(types), "priv_attempts": sorted({r["attempt"] for r in recs if r["attempt"] is not None})}})
             orphans = conn.execute(
                 "SELECT DISTINCT a.job_id FROM node.audit a LEFT JOIN node.jobs j ON j.job_id=a.job_id AND j.node_id=a.node_id "
                 "WHERE a.node_id=%s AND a.source='priv' AND a.job_id IS NOT NULL AND a.type IN ('intent','result','recovery','denial') AND j.job_id IS NULL AND a.ts < %s", (node_id, cutoff)).fetchall()

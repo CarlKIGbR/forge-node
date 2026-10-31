@@ -22,11 +22,16 @@ All four are **unmet and enforced as disabled** (`forge_node/gates.py`, `met` is
 MINORs: directory guard per registered volume (design "Gated features", MINOR 1); §14.1 split into T0 acceptance vs workload/mutation acceptance (MINOR 2).
 
 ## Tests
-forge-node: **296 passed** (`scripts/run-tests.sh`, real Postgres 17 + real ssh-keygen + real mTLS). Mutation spot checks (STOP check, dispatch lock, lease stop, prev_hash, hash, redaction, lease replay) each made a test fail. forge-ops: `tests/test_docker_user_hub.sh` 27/27; existing forge-edge firewall tests (12) still pass against the modified script; shellcheck clean.
+forge-node: **302 passed** (rework 1; 296 before) (`scripts/run-tests.sh`, real Postgres 17 + real ssh-keygen + real mTLS). Mutation spot checks (STOP check, dispatch lock, lease stop, prev_hash, hash, redaction, lease replay) each made a test fail. forge-ops: `tests/test_docker_user_hub.sh` 27/27; existing forge-edge firewall tests (12) still pass against the modified script; shellcheck clean.
 Real defects found by own tests and fixed: regex `$` accepting a trailing newline (allowed_signers injection), unread bodies desynchronising keep-alive, hardlinked policy file answered 400, NUL in JSON breaking jsonb.
 
+## Rework round 1 (REPORT_BRIEF_forge-n1verify…_20261031T163126Z, 1 MAJOR)
+Finding: `Hub.crosscheck()` matched priv evidence by `job_id` only, so intent/result of a different attempt satisfied the check (design §8.1 requires `job_id` + `attempt`).
+Fix (`hub/core.py`, crosscheck): only priv records whose `attempt` equals the hub job's `result_attempt` count (a `denial` before the claim may carry no attempt). Wrong-attempt or mixed-attempt evidence → `crosscheck_mismatch` anomaly + alert + quarantine; the anomaly detail now lists hub attempt and priv attempts.
+Tests added: `test_review_crosscheck_rejects_wrong_attempt`, `test_review_crosscheck_rejects_mixed_attempts` (4 cases: intent/result, result/intent, intent/recovery mixes), `test_crosscheck_matching_attempt_among_several_is_clean`. The Codex originals were not available to me, so these are written to the finding's description, not ported verbatim. With the fix reverted, all 5 new cases fail.
+
 ## Independent review
-A fresh reviewer agent was started but ended with the session before reporting; **no independent findings were received**. The G6 cross-model review of N1 is therefore still outstanding.
+A fresh reviewer agent was started but ended with the session before reporting; its findings were never received; the later G6 review (Codex) produced the MAJOR above, handled in rework round 1.
 
 ## Deviations / decisions
 - Authz matrix and per-identity rate mirror (§3.5/§11) deferred to N7 (needs MCP identities); `enqueue_job` is a library call without network surface, capped at 200 open jobs/node.

@@ -298,3 +298,31 @@ def test_open_job_cap_per_node(hub):
         hub.enqueue_job(JobRequest("g2", 0, "inv.host"))
     assert e.value.code == "DENY_RATE"
     assert hub.enqueue_job(JobRequest("g1", 0, "inv.host")).created
+
+
+def test_review_crosscheck_rejects_wrong_attempt(hub, adm):
+    """Hub: Versuch 2 committed; das priv-Log belegt nur Versuch 1 (intent+result) -> keine Spur fuer den gemeldeten Versuch."""
+    j = str(uuid.uuid4())
+    _job_row(adm, j, attempt=2)
+    _priv(hub, "g2", [("intent", j, 1, "2026-10-31T13:00:00Z"), ("result", j, 1, "2026-10-31T13:00:05Z")])
+    an = hub.crosscheck("g2")
+    assert [a["key"] for a in an] == [f"missing-{j}"] and an[0]["detail"]["hub_attempt"] == 2 and an[0]["detail"]["priv_attempts"] == [1]
+    assert _q(adm)["quarantine"] and ("crosscheck_mismatch", f"missing-{j}") in _alerts(adm)
+
+
+@pytest.mark.parametrize("hub_att,specs", [(2, [("intent", 1), ("result", 2)]), (2, [("intent", 2), ("result", 1)]), (1, [("intent", 2), ("recovery", 1)]), (2, [("intent", 1), ("recovery", 2)])])
+def test_review_crosscheck_rejects_mixed_attempts(hub, adm, hub_att, specs):
+    """intent aus einem Versuch, result/recovery aus einem anderen ergeben keinen vollstaendigen Versuch."""
+    j = str(uuid.uuid4())
+    _job_row(adm, j, attempt=hub_att)
+    _priv(hub, "g2", [(t, j, a, "2026-10-31T13:00:00Z") for t, a in specs])
+    an = hub.crosscheck("g2")
+    assert [a["key"] for a in an] == [f"missing-{j}"]
+    assert _q(adm)["quarantine"]
+
+
+def test_crosscheck_matching_attempt_among_several_is_clean(hub, adm):
+    j = str(uuid.uuid4())
+    _job_row(adm, j, attempt=2)
+    _priv(hub, "g2", [("intent", j, 1, "2026-10-31T13:00:00Z"), ("result", j, 1, "2026-10-31T13:00:05Z"), ("intent", j, 2, "2026-10-31T13:01:00Z"), ("result", j, 2, "2026-10-31T13:01:05Z")])
+    assert hub.crosscheck("g2") == []
