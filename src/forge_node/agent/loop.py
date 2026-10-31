@@ -209,6 +209,8 @@ class Agent:
         if t - self._fetched.get(serial, -POLICY_FETCH_RETRY_S) < POLICY_FETCH_RETRY_S:
             return
         self._fetched[serial] = t
+        while len(self._fetched) > 32:                          # the serial comes from an unsigned field of the hub's answer: do not let it grow state without bound
+            self._fetched.pop(next(iter(self._fetched)))
         try:
             doc = rt.client.get_policy(serial)
             if set(doc) != {"serial", "policy", "sig"} or doc["serial"] != serial:

@@ -50,7 +50,15 @@ def clean_tree(o, _depth: int = 0):
     if isinstance(o, (list, tuple)):
         return [clean_tree(x, _depth + 1) for x in o]
     if isinstance(o, dict):
-        return {redact.redact_light(clean_name(k, 96)): clean_tree(v, _depth + 1) for k, v in o.items()}
+        out: dict = {}
+        for k, v in o.items():
+            key = redact.redact_light(clean_name(k, 96))
+            n, base = 1, key
+            while key in out:                                          # two keys that filter/redact to the same text must not overwrite each other
+                n += 1
+                key = f"{base}#{n}"
+            out[key] = clean_tree(v, _depth + 1)
+        return out
     return clean_text(repr(o), 64)
 
 
@@ -66,6 +74,24 @@ def clamp_ints(o, _depth: int = 0):
         return [clamp_ints(x, _depth + 1) for x in o]
     if isinstance(o, dict):
         return {k: clamp_ints(v, _depth + 1) for k, v in o.items()}
+    return None
+
+
+def wire_safe(o, _depth: int = 0):
+    """For privileged probe answers on their way to the agent: whatever the host produced must survive canonical JSON (integers clamped, NUL and lone surrogates replaced, absurd
+    nesting cut) - one odd value must not turn a whole inventory into FAIL_EXEC. Content is NOT filtered here (the agent's finalize() does that)."""
+    if _depth > 24:
+        return None
+    if isinstance(o, str):
+        return o.replace("\x00", "?").encode("utf-8", "replace").decode("utf-8", "replace")
+    if o is None or isinstance(o, bool):
+        return o
+    if isinstance(o, int):
+        return max(-canon.MAX_INT, min(canon.MAX_INT, o))
+    if isinstance(o, (list, tuple)):
+        return [wire_safe(x, _depth + 1) for x in o]
+    if isinstance(o, dict):
+        return {wire_safe(str(k), _depth + 1): wire_safe(v, _depth + 1) for k, v in o.items()}
     return None
 
 

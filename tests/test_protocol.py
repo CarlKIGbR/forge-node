@@ -68,7 +68,7 @@ def test_malformed_signature_inputs(gate):
 # -------------------------------------------------------------------------------------------------------- lease verification
 def test_lease_roundtrip(gate, gate_keys):
     env = _seal(gate, lease_payload(seq=5))
-    p = protocol.verify_lease(env, gate_keys, "g2", NOW + timedelta(seconds=3), last_seq=4)
+    p = protocol.verify_lease(env, gate_keys, "g2", NOW + timedelta(seconds=3), last_seq=4, ssh_keygen="ssh-keygen")
     assert p["seq"] == 5 and p["stop"] is False and set(env) == {"payload", "sig", "key_id"}
     assert canon.is_canonical(env["payload"])
 
@@ -77,20 +77,20 @@ def test_lease_replay_and_old_seq_rejected(gate, gate_keys):
     env = _seal(gate, lease_payload(seq=5))
     for last in (5, 6, 100):
         with pytest.raises(ProtoError) as e:
-            protocol.verify_lease(env, gate_keys, "g2", NOW, last_seq=last)
+            protocol.verify_lease(env, gate_keys, "g2", NOW, last_seq=last, ssh_keygen="ssh-keygen")
         assert e.value.code == "DENY_STALE_LEASE"
 
 
 def test_lease_expired_wrong_node_and_skew(gate, gate_keys):
     env = _seal(gate, lease_payload())
     with pytest.raises(ProtoError) as e:
-        protocol.verify_lease(env, gate_keys, "g2", NOW + timedelta(seconds=61), 0)
+        protocol.verify_lease(env, gate_keys, "g2", NOW + timedelta(seconds=61), 0, ssh_keygen="ssh-keygen")
     assert e.value.code == "DENY_STALE_LEASE"
     with pytest.raises(ProtoError) as e:
-        protocol.verify_lease(env, gate_keys, "g3", NOW, 0)
+        protocol.verify_lease(env, gate_keys, "g3", NOW, 0, ssh_keygen="ssh-keygen")
     assert e.value.code == "DENY_STALE_LEASE"
     with pytest.raises(ProtoError) as e:
-        protocol.verify_lease(env, gate_keys, "g2", NOW - timedelta(seconds=90), 0)
+        protocol.verify_lease(env, gate_keys, "g2", NOW - timedelta(seconds=90), 0, ssh_keygen="ssh-keygen")
     assert e.value.code == "DENY_CLOCK"
 
 
@@ -102,12 +102,12 @@ def test_lease_validity_over_60s_cannot_even_be_sealed_or_verified(gate, gate_ke
     text = canon.canonical_text(p)
     sig = sshsig.sign(text.encode(), gate["priv"], sshsig.NS_HUB)
     with pytest.raises(ProtoError):
-        protocol.verify_lease({"payload": text, "sig": sig, "key_id": gate["id"]}, gate_keys, "g2", NOW, 0)
+        protocol.verify_lease({"payload": text, "sig": sig, "key_id": gate["id"]}, gate_keys, "g2", NOW, 0, ssh_keygen="ssh-keygen")
 
 
 def test_stop_flag_and_projects_carried(gate, gate_keys):
     env = _seal(gate, lease_payload(stop=True, projects=["b-proj", "a-proj"], quarantine=True))
-    p = protocol.verify_lease(env, gate_keys, "g2", NOW, 0)
+    p = protocol.verify_lease(env, gate_keys, "g2", NOW, 0, ssh_keygen="ssh-keygen")
     assert p["stop"] and p["quarantine"] and p["stopped_projects"] == ["a-proj", "b-proj"]
     with pytest.raises(ProtoError):
         protocol.seal(lease_payload(projects=["b", "a"]) | {"stopped_projects": ["b", "a"]}, gate["priv"], gate["id"])     # unsortiert => ungueltig
@@ -116,20 +116,20 @@ def test_stop_flag_and_projects_carried(gate, gate_keys):
 # ---------------------------------------------------------------------------------------------------------- job verification
 def test_job_roundtrip(gate, gate_keys):
     env = _seal(gate, job_payload(op="inv.host"))
-    p = protocol.verify_job(env, gate_keys, "g2", NOW + timedelta(seconds=10))
+    p = protocol.verify_job(env, gate_keys, "g2", NOW + timedelta(seconds=10), ssh_keygen="ssh-keygen")
     assert p["op"] == "inv.host" and p["delivery_seq"] == 1
 
 
 def test_expired_and_wrong_node_and_future_job(gate, gate_keys):
     env = _seal(gate, job_payload())
     with pytest.raises(ProtoError) as e:
-        protocol.verify_job(env, gate_keys, "g2", NOW + timedelta(seconds=121))
+        protocol.verify_job(env, gate_keys, "g2", NOW + timedelta(seconds=121), ssh_keygen="ssh-keygen")
     assert e.value.code == "DENY_JOB_EXPIRED"
     with pytest.raises(ProtoError) as e:
-        protocol.verify_job(env, gate_keys, "g3", NOW)
+        protocol.verify_job(env, gate_keys, "g3", NOW, ssh_keygen="ssh-keygen")
     assert e.value.code == "DENY_JOB_SIGNATURE"
     with pytest.raises(ProtoError) as e:
-        protocol.verify_job(env, gate_keys, "g2", NOW - timedelta(seconds=120))
+        protocol.verify_job(env, gate_keys, "g2", NOW - timedelta(seconds=120), ssh_keygen="ssh-keygen")
     assert e.value.code == "DENY_CLOCK"
 
 
@@ -158,30 +158,30 @@ def test_lease_is_not_valid_as_job_and_vice_versa(gate, gate_keys):
     lease = _seal(gate, lease_payload())
     job = _seal(gate, job_payload())
     with pytest.raises(ProtoError):
-        protocol.verify_job(lease, gate_keys, "g2", NOW)
+        protocol.verify_job(lease, gate_keys, "g2", NOW, ssh_keygen="ssh-keygen")
     with pytest.raises(ProtoError):
-        protocol.verify_lease(job, gate_keys, "g2", NOW, 0)
+        protocol.verify_lease(job, gate_keys, "g2", NOW, 0, ssh_keygen="ssh-keygen")
 
 
 def test_tampered_payload_signature_and_key_id(gate, gate_keys):
     env = _seal(gate, job_payload(op="inv.host"))
     bad = dict(env, payload=env["payload"].replace("inv.host", "inv.disks"))
     with pytest.raises(ProtoError) as e:
-        protocol.verify_job(bad, gate_keys, "g2", NOW)
+        protocol.verify_job(bad, gate_keys, "g2", NOW, ssh_keygen="ssh-keygen")
     assert e.value.code == "DENY_JOB_SIGNATURE"
     with pytest.raises(ProtoError):
-        protocol.verify_job(dict(env, key_id="hub-gate-9"), gate_keys, "g2", NOW)
+        protocol.verify_job(dict(env, key_id="hub-gate-9"), gate_keys, "g2", NOW, ssh_keygen="ssh-keygen")
     with pytest.raises(ProtoError):
-        protocol.verify_job({**env, "extra": 1}, gate_keys, "g2", NOW)
+        protocol.verify_job({**env, "extra": 1}, gate_keys, "g2", NOW, ssh_keygen="ssh-keygen")
     with pytest.raises(ProtoError):
-        protocol.verify_job("not-an-envelope", gate_keys, "g2", NOW)
+        protocol.verify_job("not-an-envelope", gate_keys, "g2", NOW, ssh_keygen="ssh-keygen")
 
 
 def test_non_canonical_payload_with_valid_signature_rejected(gate, gate_keys):
     text = json.dumps(job_payload(), indent=1)          # gueltige Signatur ueber nicht-kanonischen Text
     sig = sshsig.sign(text.encode(), gate["priv"], sshsig.NS_HUB)
     with pytest.raises(ProtoError):
-        protocol.verify_job({"payload": text, "sig": sig, "key_id": gate["id"]}, gate_keys, "g2", NOW)
+        protocol.verify_job({"payload": text, "sig": sig, "key_id": gate["id"]}, gate_keys, "g2", NOW, ssh_keygen="ssh-keygen")
 
 
 def test_signature_in_other_namespace_rejected(gate, gate_keys):
@@ -189,7 +189,7 @@ def test_signature_in_other_namespace_rejected(gate, gate_keys):
     for ns in (sshsig.NS_POLICY, sshsig.NS_APPROVAL, sshsig.NS_RELEASE):
         sig = sshsig.sign(text.encode(), gate["priv"], ns)
         with pytest.raises(ProtoError):
-            protocol.verify_job({"payload": text, "sig": sig, "key_id": gate["id"]}, gate_keys, "g2", NOW)
+            protocol.verify_job({"payload": text, "sig": sig, "key_id": gate["id"]}, gate_keys, "g2", NOW, ssh_keygen="ssh-keygen")
 
 
 # --------------------------------------------------------------------------------------------- revocation (T-REVOKE, Bibliothek)
@@ -197,15 +197,15 @@ def test_old_gate_key_signatures_rejected_after_policy_serial_plus_one(gate, gat
     old = protocol.parse_gate_keys(gate["keys"])
     new = protocol.parse_gate_keys(gate2["keys"])                     # Policy serial+1: alter Schluessel entfernt, neuer eingetragen
     env_old = _seal(gate, job_payload())
-    protocol.verify_job(env_old, old, "g2", NOW)
+    protocol.verify_job(env_old, old, "g2", NOW, ssh_keygen="ssh-keygen")
     with pytest.raises(ProtoError) as e:
-        protocol.verify_job(env_old, new, "g2", NOW)
+        protocol.verify_job(env_old, new, "g2", NOW, ssh_keygen="ssh-keygen")
     assert e.value.code == "DENY_JOB_SIGNATURE"
-    protocol.verify_job(_seal(gate2, job_payload()), new, "g2", NOW)
+    protocol.verify_job(_seal(gate2, job_payload()), new, "g2", NOW, ssh_keygen="ssh-keygen")
     both = protocol.parse_gate_keys(gate["keys"] + gate2["keys"])
-    protocol.verify_job(env_old, both, "g2", NOW)                     # Uebergangsphase: beide gelistet
+    protocol.verify_job(env_old, both, "g2", NOW, ssh_keygen="ssh-keygen")                     # Uebergangsphase: beide gelistet
     with pytest.raises(ProtoError):
-        protocol.verify_lease(_seal(gate, lease_payload()), new, "g2", NOW, 0)
+        protocol.verify_lease(_seal(gate, lease_payload()), new, "g2", NOW, 0, ssh_keygen="ssh-keygen")
 
 
 def test_key_signed_under_a_different_key_id_is_rejected(gate, gate2):
@@ -213,16 +213,16 @@ def test_key_signed_under_a_different_key_id_is_rejected(gate, gate2):
     keys = protocol.parse_gate_keys(gate["keys"] + gate2["keys"])
     env = protocol.seal(job_payload(), gate2["priv"], gate["id"])     # Signatur von gate2, behauptet hub-gate-1
     with pytest.raises(ProtoError):
-        protocol.verify_job(env, keys, "g2", NOW)
+        protocol.verify_job(env, keys, "g2", NOW, ssh_keygen="ssh-keygen")
 
 
 def test_gate_key_not_after_expiry(gate):
     keys = protocol.parse_gate_keys([{"id": gate["id"], "pub": gate["pub"], "not_after": "2026-10-30"}])
     env = _seal(gate, job_payload())
     with pytest.raises(ProtoError):
-        protocol.verify_job(env, keys, "g2", NOW)                      # NOW = 31.10.
+        protocol.verify_job(env, keys, "g2", NOW, ssh_keygen="ssh-keygen")                      # NOW = 31.10.
     keys_ok = protocol.parse_gate_keys([{"id": gate["id"], "pub": gate["pub"], "not_after": "2026-10-31"}])
-    protocol.verify_job(env, keys_ok, "g2", NOW)                      # not_after gilt bis Tagesende UTC
+    protocol.verify_job(env, keys_ok, "g2", NOW, ssh_keygen="ssh-keygen")                      # not_after gilt bis Tagesende UTC
 
 
 def test_parse_gate_keys_validation(gate):

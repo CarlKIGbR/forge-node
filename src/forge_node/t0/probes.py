@@ -91,18 +91,25 @@ def parse_inspect_line(line: str) -> dict | None:
 _LABEL_KEEP = re.compile(r"^(forge\.[a-z0-9._-]{1,48}|com\.docker\.compose\.(?:project|service|project\.working_dir|project\.config_files)|org\.opencontainers\.image\.(?:title|version|source|revision))\Z")
 
 
+DOCKER_BUDGET_S = 90            # all docker calls of one probe together; the unit's RuntimeMaxSec is 120
+
+
 def _containers(env: Env) -> tuple[list[dict], str | None, int]:
-    """(rows, error, skipped): `skipped` = containers docker listed that could not be parsed - reported, never silently dropped."""
-    ids = env.runner.run("docker_ps_ids")
+    """(rows, error, skipped): `skipped` = containers docker listed that could not be parsed or that did not fit the time budget - reported, never silently dropped."""
+    t_end = env.now().timestamp() + DOCKER_BUDGET_S
+    ids = env.runner.run("docker_ps_ids", None, None, 30)
     if not ids.ok:
         return [], ids.reason, 0
     all_ids = [x for x in ids.text.split() if re.match(r"^[0-9a-f]{64}$", x)]
     rows = []
     for i in range(0, min(len(all_ids), 400), 40):
-        r = env.runner.run("docker_inspect", {"id": all_ids[i:i + 40]})
+        left = t_end - env.now().timestamp()
+        if left < 5:
+            return rows, None, max(0, min(len(all_ids), 400) - len(rows))
+        r = env.runner.run("docker_inspect", {"id": all_ids[i:i + 40]}, None, min(30.0, left))
         if not r.ok:
             return rows, r.reason, 0
-        for line in r.text.splitlines():
+        for line in r.text.split("\n"):             # NOT splitlines(): U+0085/U+2028 in a label would split a row and hide the container
             row = parse_inspect_line(line)
             if row:
                 rows.append(row)
@@ -116,8 +123,11 @@ def _probe_containers(params: dict, env: Env) -> dict:
         return {"containers": unavailable("docker not installed") if err == "missing" else failed(err)}
     digests: dict = {}
     img_ids = sorted({r["image_id"] for r in rows if isinstance(r["image_id"], str) and re.match(r"^sha256:[0-9a-f]{64}$", r["image_id"])})
+    t_img = env.now().timestamp() + 20
     for i in range(0, min(len(img_ids), 200), 40):
-        d = env.runner.run("docker_image_inspect", {"id": img_ids[i:i + 40]})
+        if env.now().timestamp() >= t_img:
+            break
+        d = env.runner.run("docker_image_inspect", {"id": img_ids[i:i + 40]}, None, 10)
         for line in d.text.splitlines() if d.ok else []:
             p = line.split("\t")
             if len(p) == 2:
@@ -434,9 +444,13 @@ def _probe_journal(params: dict, env: Env) -> dict:
 def _probe_activity(params: dict, env: Env) -> dict:
     _no_params(params)
     now = env.now().timestamp()
+    t_end = now + 40                                                    # RuntimeMaxSec is 60
     rows = []
     for lu in env.policy.t0.units_for_logs[:30]:
-        r = env.runner.run("journal_last", {"unit": lu.unit})
+        if env.now().timestamp() >= t_end:
+            rows.append({"unit": lu.unit, "last_log_age_s": None, "skipped": "budget"})
+            continue
+        r = env.runner.run("journal_last", {"unit": lu.unit}, None, 10)
         m = re.match(r"^(\d{9,11})(?:\.\d+)?\s", r.text) if r.ok else None
         rows.append({"unit": lu.unit, "last_log_age_s": max(0, int(now - int(m.group(1)))) if m else None})
     return {"activity": ok(units=rows)}

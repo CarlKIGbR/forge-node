@@ -14,8 +14,11 @@ from dataclasses import dataclass
 
 DEFAULT_PROTECTED = ("/opt/kmu-ai", "/srv/models", "/srv/kmu-ai", "/srv/tradebot", "/etc/ssh", "/etc/sudoers", "/etc/sudoers.d", "/etc/forge-node", "/root")
 READ_ALLOW = (
-    re.compile(r"^/proc/(?:self/)?(?:meminfo|loadavg|uptime|stat|cpuinfo|diskstats|mdstat|swaps|mounts|net/dev|net/route|sys/kernel/(?:osrelease|hostname|random/boot_id))\Z"),
-    re.compile(r"^/proc/[0-9]{1,9}/(?:cgroup|net/dev|comm)\Z"),
+    re.compile(r"^/proc/(?:meminfo|loadavg|uptime|stat|cpuinfo|diskstats|mdstat|swaps|sys/kernel/(?:osrelease|hostname|random/boot_id))\Z"),
+    # /proc/mounts and /proc/net are links to self/...: after resolution they are /proc/<pid>/mounts and /proc/<pid>/net/dev (live proof / review: /proc/mounts was refused on a real host)
+    re.compile(r"^/proc/[0-9]{1,9}/(?:cgroup|net/dev|comm|mounts)\Z"),
+    re.compile(r"^/proc/mounts\Z"),
+    re.compile(r"^/proc/net/dev\Z"),
     re.compile(r"^/sys/fs/cgroup/(?:[A-Za-z0-9_.@:\\-]+/){0,4}(?:cpu\.stat|memory\.current|memory\.max|memory\.peak|io\.stat|pids\.current|cgroup\.procs)\Z"),
     re.compile(r"^/sys/class/(?:nvme|hwmon|thermal|net)/[A-Za-z0-9_.:-]+/(?:[A-Za-z0-9_.:-]+/)?(?:model|state|transport|temp[0-9]*_input|name|type|temp|operstate|speed|statistics/(?:rx|tx)_bytes)\Z"),
     re.compile(r"^/sys/block/[A-Za-z0-9]+/(?:queue/rotational|size|removable)\Z"),

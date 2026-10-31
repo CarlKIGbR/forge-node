@@ -236,3 +236,30 @@ def test_subprocess_is_imported_only_by_runner_and_sshsig():
         t = p.read_text()
         assert not re.search(r"\bos\.(system|popen|exec[lv]p?e?|spawn\w*)\(", t), p
         assert "shell=True" not in t, p
+
+
+def test_a_symlinked_command_is_trusted_only_if_every_link_and_its_directory_are(fakebin, tmp_path):
+    """Review finding: only the link TARGET's directory chain was checked. /usr/sbin/iptables -> /etc/alternatives/iptables -> xtables-nft-multi must pass; a link in a
+    group-writable directory (shadowing a command found later in PATH) must not."""
+    real = tmp_path / "real"
+    real.mkdir()
+    prog = real / "multi"
+    prog.write_text("#!/bin/sh\necho multi:$0\n")
+    os.chmod(prog, 0o755)
+    bindir = tmp_path / "bin"
+    alt = tmp_path / "alternatives"
+    alt.mkdir()
+    os.symlink(prog, alt / "lsblk")
+    os.symlink(alt / "lsblk", bindir / "lsblk")                        # bin/lsblk -> alternatives/lsblk -> real/multi
+    r = runner.run("lsblk")
+    assert r.ok and "multi:" in r.text and r.argv[0] == str(bindir / "lsblk")           # exec'd through the unresolved path: multi-call programs use argv[0]
+    os.chmod(alt, 0o775)                                              # the directory holding the intermediate link is group-writable
+    assert runner.run("lsblk").reason == "untrusted_binary"
+    os.chmod(alt, 0o755)
+    os.chmod(bindir, 0o775)                                           # the directory holding the PATH hit is group-writable
+    assert runner.run("lsblk").reason == "untrusted_binary"
+    os.chmod(bindir, 0o755)
+    assert runner.run("lsblk").ok
+    os.unlink(alt / "lsblk")
+    os.symlink(alt / "lsblk", alt / "lsblk")                          # a loop is refused, not an exception
+    assert runner.run("lsblk").reason in ("missing", "untrusted_binary")

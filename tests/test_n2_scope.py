@@ -74,12 +74,15 @@ def test_ro_probe_class_properties_come_from_a_fixed_table_not_from_parameters()
         assert p["KillMode"] == "control-group" and p["SendSIGKILL"] == "yes" and p["MemoryMax"] and p["TasksMax"] and p["RuntimeMaxSec"].isdigit()
         assert p["PrivateDevices"] == "yes" and p["MemoryDenyWriteExecute"] == "yes" and p["RestrictNamespaces"] == "yes" and p["LockPersonality"] == "yes" and p["UMask"] == "0077"
         assert "CAP_SYS_ADMIN" not in p["CapabilityBoundingSet"] and "CAP_SYS_RAWIO" not in p["CapabilityBoundingSet"] and "CAP_DAC_OVERRIDE" not in p["CapabilityBoundingSet"]
-        assert "/run/forge-node" in p["InaccessiblePaths"]                                     # no probe can reach privd's socket
-        assert ("/run/docker.sock" in p["InaccessiblePaths"]) == (not hardening.RO_PROBES[name]["docker"])
+        hidden = [h.lstrip("-") for h in p["InaccessiblePaths"].split()]
+        for sock in ("/run/forge-node", "/run/containerd", "/run/dbus", "/run/systemd/private"):
+            assert sock in hidden, (name, sock)                                                # no probe reaches privd, containerd, D-Bus or systemd's private socket
+        assert ("/run/docker.sock" in hidden) == (not hardening.RO_PROBES[name]["docker"])
+        assert ("/run/libvirt" in hidden) == (name != "vms")
     caps = {n: set(hardening.ro_probe_properties(n)["CapabilityBoundingSet"].split()) for n in hardening.RO_PROBES}
     assert "CAP_SYS_PTRACE" in caps["net"] and "CAP_NET_ADMIN" not in caps["net"] and caps["firewall"] == {"CAP_NET_ADMIN"}          # ss -p and iptables never share a unit
-    assert "CAP_SYS_PTRACE" not in caps["containers"] and "CAP_SYS_PTRACE" in caps["container_net"]
-    assert [n for n, c in caps.items() if "CAP_NET_ADMIN" in c] == ["firewall"] and [n for n, c in caps.items() if "CAP_SYS_PTRACE" in c] == ["net", "container_net"]
+    assert caps["containers"] == {"CAP_DAC_READ_SEARCH"} and caps["container_net"] == set()           # /proc/<pid>/net/dev is world-readable (hidepid=0)
+    assert [n for n, c in caps.items() if "CAP_NET_ADMIN" in c] == ["firewall"] and [n for n, c in caps.items() if "CAP_SYS_PTRACE" in c] == ["net"]
     assert hardening.ro_probe_properties("models")["IOSchedulingClass"] == "idle" and "IOSchedulingClass" not in hardening.ro_probe_properties("net")
     assert hardening.ro_probe_properties("access")["ProtectHome"] == "read-only"
     assert "AF_INET" in hardening.ro_probe_properties("firewall")["RestrictAddressFamilies"] and "AF_INET" not in hardening.ro_probe_properties("net")["RestrictAddressFamilies"]

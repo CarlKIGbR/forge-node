@@ -124,14 +124,10 @@ def _resolve(binary: str) -> str | None:
     return None
 
 
-def _trusted(path: str) -> bool:
-    """Re-observed on every call: the resolved binary (after symlinks) is root-owned and neither group- nor world-writable, and so is every directory above it (a root-owned sticky
-    directory such as /tmp is tolerated: others cannot rename or replace entries in it)."""
+def _dirs_trusted(d: str) -> bool:
+    """Every directory from `d` up to / is root-owned and not writable by group/others (a root-owned sticky directory such as /tmp is tolerated: others cannot rename or replace
+    entries in it)."""
     try:
-        s = os.stat(path)
-        if not (s.st_uid == 0 and stat.S_ISREG(s.st_mode) and not (s.st_mode & 0o022)):
-            return False
-        d = os.path.dirname(path)
         while True:
             ds = os.stat(d)
             if ds.st_uid != 0 or (ds.st_mode & 0o022 and not (ds.st_mode & stat.S_ISVTX)):
@@ -139,6 +135,25 @@ def _trusted(path: str) -> bool:
             if d == "/":
                 return True
             d = os.path.dirname(d)
+    except OSError:
+        return False
+
+
+def _trusted(path: str) -> bool:
+    """Re-observed on every call, for the path as found in PATH: every symbolic link on the way (e.g. /usr/sbin/iptables -> /etc/alternatives/iptables -> .../xtables-nft-multi) sits in a
+    trusted directory chain, and the final file is a regular, root-owned file nobody else can write, in a trusted chain. (We still exec the unresolved path: multi-call programs
+    choose their function from argv[0].)"""
+    try:
+        p, hops = path, 0
+        while os.path.islink(p):
+            if hops > 8 or not _dirs_trusted(os.path.dirname(os.path.abspath(p))):
+                return False
+            target = os.readlink(p)
+            p = target if os.path.isabs(target) else os.path.join(os.path.dirname(p), target)
+            hops += 1
+        p = os.path.realpath(p)
+        s = os.stat(p)
+        return s.st_uid == 0 and stat.S_ISREG(s.st_mode) and not (s.st_mode & 0o022) and _dirs_trusted(os.path.dirname(p)) and _dirs_trusted(os.path.dirname(os.path.abspath(path)))
     except OSError:
         return False
 
@@ -192,7 +207,7 @@ def run(cmd_id: str, slots: dict | None = None, stdin: bytes | None = None, max_
     path = _resolve(cmd.binary)
     if path is None:
         return Run(False, "missing", argv=(cmd.binary, *argv_tail))
-    if not all(_trusted(os.path.realpath(p)) for p in (path, *cmd.extra_binaries)):
+    if not all(_trusted(p) for p in (path, *cmd.extra_binaries)):
         return Run(False, "untrusted_binary", argv=(cmd.binary, *argv_tail))
     argv = [path, *argv_tail]
     try:
@@ -264,7 +279,7 @@ def trusted_binary(name: str) -> str:
     """Absolute path of a program in the fixed PATH whose file and directories are root-owned and not writable by others (used for ssh-keygen, which decides whether a policy or a
     hub job is genuine). Raises RunnerError when there is none."""
     path = _resolve(name)
-    if path is None or not _trusted(os.path.realpath(path)):
+    if path is None or not _trusted(path):
         raise RunnerError(f"no trusted {name} in {':'.join(FIXED_PATH)}")
     return path
 
@@ -278,4 +293,4 @@ class ReadOnlyRunner:
     def available(self, cmd_id: str) -> bool:
         cmd = CMDS[cmd_id]
         p = _resolve(cmd.binary)
-        return p is not None and all(_trusted(os.path.realpath(x)) for x in (p, *cmd.extra_binaries))
+        return p is not None and all(_trusted(x) for x in (p, *cmd.extra_binaries))

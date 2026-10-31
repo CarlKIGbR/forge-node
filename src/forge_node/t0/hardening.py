@@ -8,7 +8,8 @@ Deviations from the design text (reported):
   * agent `RestrictAddressFamilies` lists AF_NETLINK (`ss`, `ip route` of inv.net use netlink; revision 3 omitted it; harmless without capabilities);
   * the design's single `ro-probe` class is a base plus a per-probe row: `net` (ss -p) needs CAP_SYS_PTRACE, `firewall` (iptables -S) CAP_NET_ADMIN, so they are separate probes and no
     probe holds both; `container_net` (reads /proc/<pid>/net/dev of container processes) is separate from the plain `containers` inventory so that one has no PTRACE;
-  * probes that do not talk to Docker cannot reach the Docker socket or privd's socket (`InaccessiblePaths`), although they are root and have AF_UNIX."""
+  * probes cannot reach privd's socket, nor the sockets of daemons they have no business with (Docker, containerd, libvirt, D-Bus, systemd's private socket): `InaccessiblePaths`,
+    although they are root and have AF_UNIX."""
 from types import MappingProxyType
 
 _COMMON = {
@@ -33,7 +34,7 @@ RO_PROBES = MappingProxyType({
     "net": MappingProxyType({"caps": ("CAP_SYS_PTRACE", "CAP_DAC_READ_SEARCH"), "families": "AF_UNIX AF_NETLINK", "runtime_s": 60, "idle_io": False, "docker": False}),
     "firewall": MappingProxyType({"caps": ("CAP_NET_ADMIN",), "families": "AF_UNIX AF_NETLINK AF_INET", "runtime_s": 60, "idle_io": False, "docker": False}),
     "containers": MappingProxyType({"caps": ("CAP_DAC_READ_SEARCH",), "families": "AF_UNIX", "runtime_s": 120, "idle_io": False, "docker": True}),
-    "container_net": MappingProxyType({"caps": ("CAP_SYS_PTRACE", "CAP_DAC_READ_SEARCH"), "families": "AF_UNIX", "runtime_s": 120, "idle_io": False, "docker": True}),
+    "container_net": MappingProxyType({"caps": (), "families": "AF_UNIX", "runtime_s": 120, "idle_io": False, "docker": True}),            # /proc/<pid>/net/dev is world-readable (hidepid=0)
     "vms": MappingProxyType({"caps": (), "families": "AF_UNIX", "runtime_s": 60, "idle_io": False, "docker": False}),
     "certs": MappingProxyType({"caps": ("CAP_DAC_READ_SEARCH",), "families": "AF_UNIX", "runtime_s": 120, "idle_io": False, "docker": False}),
     "git": MappingProxyType({"caps": ("CAP_DAC_READ_SEARCH",), "families": "AF_UNIX", "runtime_s": 240, "idle_io": True, "docker": False}),
@@ -55,8 +56,13 @@ def ro_probe_properties(probe: str) -> dict:
     p["CapabilityBoundingSet"] = " ".join(spec["caps"])
     p["RestrictAddressFamilies"] = spec["families"]
     p["RuntimeMaxSec"] = str(spec["runtime_s"])
-    # privd's socket is never reachable from a probe; Docker's only for the probes that inventory containers ('-' = ignore if absent)
-    p["InaccessiblePaths"] = "-/run/forge-node" + ("" if spec["docker"] else " -/run/docker.sock")
+    # privd's socket is never reachable from a probe; Docker's only for the probes that inventory containers, libvirt's only for `vms` ('-' = ignore if absent)
+    hidden = ["/run/forge-node", "/run/containerd", "/run/dbus", "/run/systemd/private", "/run/systemd/io.systemd.ManagedOOM"]
+    if not spec["docker"]:
+        hidden.append("/run/docker.sock")
+    if probe != "vms":
+        hidden.append("/run/libvirt")
+    p["InaccessiblePaths"] = " ".join("-" + h for h in hidden)
     if spec["idle_io"]:
         p["IOSchedulingClass"] = "idle"
     return p

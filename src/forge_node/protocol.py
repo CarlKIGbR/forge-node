@@ -226,7 +226,7 @@ def seal(payload: dict, key_path, key_id: str, ssh_keygen: str = "ssh-keygen") -
     return {"payload": text, "sig": sig, "key_id": key_id}
 
 
-def open_envelope(env, gate_keys: dict[str, GateKey], expect_typ: str, now: datetime, ssh_keygen: str = "ssh-keygen") -> dict:
+def open_envelope(env, gate_keys: dict[str, GateKey], expect_typ: str, now: datetime, ssh_keygen: str) -> dict:
     """Prueft Schluessel-Liste (Revokation = Schluessel fehlt in der Policy), Ablauf des Schluessels, Signatur im Namespace forge-node-hub,
     Kanonizitaet des Textes, typ und Schema. Liefert den Payload."""
     code = "DENY_STALE_LEASE" if expect_typ == "lease" else "DENY_JOB_SIGNATURE"
@@ -260,7 +260,7 @@ def open_envelope(env, gate_keys: dict[str, GateKey], expect_typ: str, now: date
         raise
 
 
-def verify_lease(env, gate_keys: dict[str, GateKey], node: str, now: datetime, last_seq: int, ssh_keygen: str = "ssh-keygen") -> dict:
+def verify_lease(env, gate_keys: dict[str, GateKey], node: str, now: datetime, last_seq: int, ssh_keygen: str) -> dict:
     """privd-Seite (Pipeline Schritt 3 und 5): nur neuere seq, nur vor valid_until, Skew gegen issued_at <= 60 s."""
     p = open_envelope(env, gate_keys, "lease", now, ssh_keygen)
     if p["node"] != node:
@@ -274,7 +274,7 @@ def verify_lease(env, gate_keys: dict[str, GateKey], node: str, now: datetime, l
     return p
 
 
-def verify_job(env, gate_keys: dict[str, GateKey], node: str, now: datetime, ssh_keygen: str = "ssh-keygen") -> dict:
+def verify_job(env, gate_keys: dict[str, GateKey], node: str, now: datetime, ssh_keygen: str) -> dict:
     """privd-Seite (Schritt 2): Signatur, node, issued_at <= now <= expires_at. 'Noch nicht gueltig' toleriert denselben Skew (60 s), den Schritt 5 erlaubt; Ablauf ist strikt."""
     p = open_envelope(env, gate_keys, "job", now, ssh_keygen)
     if p["node"] != node:

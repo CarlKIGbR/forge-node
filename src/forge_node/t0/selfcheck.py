@@ -13,7 +13,7 @@ def selfcheck(env: Env) -> dict:
     paths = {}
     for p in PROBE_PATHS:
         try:
-            env.fs.read_text(p, 4096)
+            env.fs.read_text(p)
             paths[p] = True
         except FsError:
             paths[p] = False

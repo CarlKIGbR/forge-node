@@ -736,3 +736,16 @@ def test_statvfs_remembers_hung_mounts_and_df_has_a_time_budget(monkeypatch, tmp
     dfs = [m["df"] for m in collect.disks(env, statvfs=fake)["mounts"]["mounts"]]
     assert dfs.count({"skipped": "budget"}) >= 2 and t["n"] < 5
     collect._HUNG.clear()
+
+
+def test_keys_that_filter_to_the_same_text_do_not_overwrite_each_other():
+    out = sanitize.clean_tree({"hf_aaaaaaaa1.service": 1, "hf_bbbbbbbb2.service": 2, "a\nb": 3, "a\x00b": 4})
+    assert len(out) == 4 and sorted(out.values()) == [1, 2, 3, 4]
+
+
+def test_the_policy_serials_remembered_for_staging_are_bounded(tmp_path):
+    ag = stub_agent(tmp_path, StubClient())
+    rt = ag._runtime()
+    for serial in range(2, 120):
+        ag._maybe_stage_policy(rt, serial)
+    assert len(ag._fetched) <= 32 and max(ag._fetched) == 119

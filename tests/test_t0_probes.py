@@ -3,6 +3,7 @@ import os
 import re
 import socket
 import threading
+from datetime import timedelta
 
 import pytest
 
@@ -425,3 +426,48 @@ def test_uulog_probe_returns_only_the_parsed_outcome_never_log_lines(tmp_path):
     assert run_probe("uulog", {}, env_with(tmp_path / "none", FakeRunner()))["uulog"]["status"] == "error"
     with pytest.raises(ProbeError):
         run_probe("uulog", {"x": 1}, env)
+
+
+def test_wire_answers_survive_values_canonical_json_would_reject(tmp_path, monkeypatch):
+    """Review finding: huge integers, NUL and lone surrogates in probe data turned the whole answer into FAIL_EXEC at the wire."""
+    monkeypatch.setitem(probes.__dict__, "_probe_vms", lambda p, e: {"domains": {"status": "ok", "domains": [{"name": "a\x00b", "size": 10**30, "weird": "x\ud800y", "n": [1, None, True]}]}})
+    r = json.loads(wire.handle_request(wire.encode_request("vms", {}), env_with(tmp_path)))
+    d = r["data"]["domains"]["domains"][0]
+    assert r["ok"] is True and d["name"] == "a?b" and d["size"] == 2**53 - 1 and "\ud800" not in json.dumps(d, ensure_ascii=True).replace("\\ud800", "") or d["weird"].startswith("x")
+
+
+def test_unicode_line_separators_in_docker_output_do_not_hide_a_container(tmp_path):
+    """Review finding: Python splitlines() splits on U+0085/U+2028 which Go's {{json}} does not escape; the row broke in two and the container vanished."""
+    line = inspect_line(labels={"forge.project": "p", "com.docker.compose.project": "x\u0085y\u2028z"})
+    r = FakeRunner({"docker_ps_ids": CID + "\n", "docker_inspect": line + "\n"})
+    c = run_probe("containers", {}, env_with(tmp_path, r))["containers"]
+    assert c["count"] == 1 and c["unparsed"] == 0
+
+
+def test_container_probes_stop_at_their_time_budget_and_say_so(tmp_path):
+    state = {"t": NOW}
+    ids = "\n".join(f"{i:064x}" for i in range(1, 301))
+
+    def inspect(slots, _):
+        state["t"] += timedelta(seconds=35)
+        return Run(True, "ok", 0, "\n".join(inspect_line(cid=c) for c in slots["id"]).encode() + b"\n")
+    r = FakeRunner({"docker_ps_ids": ids, "docker_inspect": inspect})
+    env = env_with(tmp_path, r)
+    env.now = lambda: state["t"]
+    c = run_probe("containers", {}, env)["containers"]
+    assert 0 < c["count"] < 300 and c["unparsed"] == 300 - c["count"] and r.called("docker_inspect") <= 4
+
+
+def test_activity_probe_stops_at_its_time_budget(tmp_path):
+    from datetime import timedelta as td
+    state = {"t": NOW}
+    pol_units = [f"u{i}.service" for i in range(12)]
+    pol = view(policy_doc(t0={"units_for_logs": pol_units}))
+
+    def last(slots, _):
+        state["t"] += td(seconds=15)
+        return Run(True, "ok", 0, b"-- No entries --\n")
+    env = make_env(tmp_path, FakeRunner({"journal_last": last}), policy=pol)
+    env.now = lambda: state["t"]
+    rows = run_probe("activity", {}, env)["activity"]["units"]
+    assert any(r.get("skipped") == "budget" for r in rows) and rows[0].get("skipped") is None

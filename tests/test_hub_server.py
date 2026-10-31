@@ -144,9 +144,9 @@ def test_poll_delivers_signed_job_and_lease_end_to_end(server, pki, certs, hub, 
     ctx = ctx_for(pki, certs["g2"])
     st, _, body = call(server, ctx, "POST", "/v1/poll", poll_body())
     assert st == 200 and set(body) == {"v", "lease", "jobs", "reconcile", "policy_serial_latest", "server_time"}
-    job = protocol.verify_job(body["jobs"][0], gate_keys, "g2", clock())
+    job = protocol.verify_job(body["jobs"][0], gate_keys, "g2", clock(), ssh_keygen="ssh-keygen")
     assert job["job_id"] == e.job_id
-    assert protocol.verify_lease(body["lease"], gate_keys, "g2", clock(), 0)["node"] == "g2"
+    assert protocol.verify_lease(body["lease"], gate_keys, "g2", clock(), 0, ssh_keygen="ssh-keygen")["node"] == "g2"
     st, _, r = call(server, ctx, "POST", f"/v1/jobs/{e.job_id}/result", {"attempt": 1, "status": "committed", "reason_code": None, "output": "ok", "audit_seq_range": None, "plan_hash": None})
     assert st == 200 and r["state"] == "committed"
     assert hub.job_state(e.job_id)["state"] == "committed"
@@ -330,7 +330,7 @@ def test_poll_during_stop_reports_stop_in_lease_and_still_serves_t0(server, pki,
     (hubcfg.control_dir / "STOP").write_text("x")
     hub.enqueue_job(JobRequest("g2", 0, "inv.host"))
     st, _, body = call(server, ctx_for(pki, certs["g2"]), "POST", "/v1/poll", poll_body())
-    assert protocol.verify_lease(body["lease"], gate_keys, "g2", clock(), 0)["stop"] is True and len(body["jobs"]) == 1
+    assert protocol.verify_lease(body["lease"], gate_keys, "g2", clock(), 0, ssh_keygen="ssh-keygen")["stop"] is True and len(body["jobs"]) == 1
 
 
 # --------------------------------------------------------------------------------------------------------------------------- config

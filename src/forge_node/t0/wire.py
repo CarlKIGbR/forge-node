@@ -5,7 +5,7 @@ import socket
 import struct
 
 from .. import canon
-from . import probes
+from . import probes, sanitize
 from .env import Env
 
 MAX_LINE = 512 * 1024
@@ -42,7 +42,7 @@ def handle_request(line: bytes, env: Env) -> bytes:
         return canon.canonical({"ok": False, "code": "BAD_REQUEST", "detail": "malformed request"}) + b"\n"
     try:
         data = probes.run_probe(req["probe"], req["params"], env)
-        return canon.canonical({"ok": True, "data": data}) + b"\n"
+        return canon.canonical({"ok": True, "data": sanitize.wire_safe(data)}) + b"\n"
     except probes.ProbeError as e:
         return canon.canonical({"ok": False, "code": e.code, "detail": e.detail[:200]}) + b"\n"
     except Exception as e:  # noqa: BLE001 - a probe bug must not take privd down; the agent sees a generic failure

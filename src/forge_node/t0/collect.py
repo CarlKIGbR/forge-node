@@ -107,7 +107,8 @@ def disks(env: Env, statvfs=_statvfs) -> dict:
         out["mounts"] = run_failure(fm)
     md = _rd(env, "/proc/mdstat")
     out["md_raid"] = ok(arrays=parse.mdstat(md)) if md is not None else unavailable("/proc/mdstat not present")
-    out["nfs_mounts"] = ok(mounts=[m for m in parse.mounts(_rd(env, "/proc/mounts") or "") if m["fstype"] in NFS_TYPES])
+    mt = _rd(env, "/proc/mounts")
+    out["nfs_mounts"] = ok(mounts=[m for m in parse.mounts(mt) if m["fstype"] in NFS_TYPES]) if mt else unavailable("/proc/mounts unreadable")
     out["nvme"] = _nvme(env)
     # Design 4.1: SMART only where smartctl/nvme exist (absent on g2 today). Collecting it needs CAP_SYS_RAWIO/CAP_SYS_ADMIN, which the ro-probe class deliberately does not get
     out["smart"] = unavailable("smartctl/nvme not installed") if not _which_smartctl() else unavailable("SMART collection is not enabled in this release")

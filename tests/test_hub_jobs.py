@@ -36,7 +36,7 @@ def _result(**kw):
 def _deliver(hub, gate_keys, node="g2"):
     r = hub.poll(node, _poll())
     assert len(r["jobs"]) == 1
-    return protocol.verify_job(r["jobs"][0], gate_keys, node, hub.clock()), r
+    return protocol.verify_job(r["jobs"][0], gate_keys, node, hub.clock(), ssh_keygen="ssh-keygen"), r
 
 
 # ================================================================================================================== enqueue / gates
@@ -47,14 +47,14 @@ def test_t0_job_roundtrip_signed_for_node_and_verifiable(hub, gate_keys):
     assert job["job_id"] == e.job_id and job["op"] == "inv.host" and job["tier"] == 0 and job["delivery_seq"] == 1 and job["node"] == "g2"
     assert protocol.parse_ts(job["expires_at"]) - protocol.parse_ts(job["issued_at"]) == protocol.timedelta(seconds=120)
     assert hub.job_state(e.job_id)["state"] == "issued"
-    assert r["lease"] and protocol.verify_lease(r["lease"], gate_keys, "g2", hub.clock(), 0)["seq"] >= 1
+    assert r["lease"] and protocol.verify_lease(r["lease"], gate_keys, "g2", hub.clock(), 0, ssh_keygen="ssh-keygen")["seq"] >= 1
 
 
 def test_job_for_another_node_cannot_be_verified_by_this_node(hub, gate_keys):
     hub.enqueue_job(JobRequest("g2", 0, "inv.host"))
     r = hub.poll("g2", _poll())
     with pytest.raises(ProtoError):
-        protocol.verify_job(r["jobs"][0], gate_keys, "g1", hub.clock())
+        protocol.verify_job(r["jobs"][0], gate_keys, "g1", hub.clock(), ssh_keygen="ssh-keygen")
     assert hub.poll("g1", _poll())["jobs"] == []
 
 
@@ -220,21 +220,21 @@ def test_one_job_per_poll_in_queue_order(hub, gate_keys):
     for j in ids:
         hub.enqueue_job(JobRequest("g2", 0, "inv.host", job_id=j))
         hub.clock.advance(1)
-    got = [protocol.verify_job(hub.poll("g2", _poll())["jobs"][0], gate_keys, "g2", hub.clock())["job_id"] for _ in range(3)]
+    got = [protocol.verify_job(hub.poll("g2", _poll())["jobs"][0], gate_keys, "g2", hub.clock(), ssh_keygen="ssh-keygen")["job_id"] for _ in range(3)]
     assert got == ids
     assert hub.poll("g2", _poll())["jobs"] == []
 
 
 # ======================================================================================================================== lease
 def test_lease_seq_strictly_increases_and_survives_hub_restart(hub, hubcfg, hubdb, gate, clock, gate_keys):
-    seqs = [protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0)["seq"] for _ in range(3)]
+    seqs = [protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0, ssh_keygen="ssh-keygen")["seq"] for _ in range(3)]
     assert seqs == sorted(set(seqs)) and seqs[0] >= 1
     h2 = Hub(hubcfg, hubdb, Signer(gate["priv"], gate["id"]), clock=clock)
-    assert protocol.verify_lease(h2.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), seqs[-1])["seq"] == seqs[-1] + 1
+    assert protocol.verify_lease(h2.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), seqs[-1], ssh_keygen="ssh-keygen")["seq"] == seqs[-1] + 1
 
 
 def test_lease_validity_is_60s_and_signed_for_the_node(hub, gate_keys, clock):
-    p = protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0)
+    p = protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0, ssh_keygen="ssh-keygen")
     assert protocol.parse_ts(p["valid_until"]) - protocol.parse_ts(p["issued_at"]) == protocol.timedelta(seconds=60)
     assert p["node"] == "g2" and p["stop"] is False and p["quarantine"] is False and p["stopped_projects"] == []
 
@@ -246,29 +246,29 @@ def test_lease_carries_stop_projects_and_quarantine(hub, hubcfg, gate_keys, cloc
     (hubcfg.control_dir / "stop.d" / "proj-a").write_text("")
     (hubcfg.control_dir / "stop.d" / "Bad Name").write_text("")        # ungueltiger Slug wird ignoriert
     hub.quarantine("g2", "chain_break", "k", {"x": 1})
-    p = protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0)
+    p = protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0, ssh_keygen="ssh-keygen")
     assert p["stop"] and p["quarantine"] and p["stopped_projects"] == ["proj-a", "proj-b"]
 
 
 def test_lease_stop_fails_closed_when_control_dir_missing_or_unreadable(hub, hubcfg, gate_keys, clock):
     os.rmdir(hubcfg.control_dir) if not any(hubcfg.control_dir.iterdir()) else None
-    assert protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0)["stop"] is True
+    assert protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0, ssh_keygen="ssh-keygen")["stop"] is True
     hubcfg.control_dir.mkdir()
-    p = protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0)
+    p = protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0, ssh_keygen="ssh-keygen")
     assert p["stop"] is False
 
 
 def test_lease_stop_when_project_dir_unreadable(hub, hubcfg, gate_keys, clock):
     d = hubcfg.control_dir / "stop.d"
     d.write_text("not a directory")
-    assert protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0)["stop"] is True
+    assert protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0, ssh_keygen="ssh-keygen")["stop"] is True
 
 
 def test_t0_jobs_still_delivered_during_stop(hub, hubcfg, gate_keys):
     (hubcfg.control_dir / "STOP").write_text("STOP\n")
     hub.enqueue_job(JobRequest("g2", 0, "inv.host"))
     r = hub.poll("g2", _poll())
-    assert len(r["jobs"]) == 1 and protocol.verify_lease(r["lease"], gate_keys, "g2", hub.clock(), 0)["stop"]
+    assert len(r["jobs"]) == 1 and protocol.verify_lease(r["lease"], gate_keys, "g2", hub.clock(), 0, ssh_keygen="ssh-keygen")["stop"]
 
 
 # ===================================================================================== STOP and the dispatch lock (tier >= 1 pipeline)
@@ -497,7 +497,7 @@ def test_long_poll_returns_early_when_stop_flips(hub, hubcfg, gate_keys, clock):
 
     hub.sleep = sleeper
     r = hub.poll("g2", _poll(wait_s=30))
-    assert len(seen) == 1 and protocol.verify_lease(r["lease"], gate_keys, "g2", clock(), 0)["stop"]
+    assert len(seen) == 1 and protocol.verify_lease(r["lease"], gate_keys, "g2", clock(), 0, ssh_keygen="ssh-keygen")["stop"]
 
 
 def test_audit_head_behind_or_forked_quarantines(hub, adm):
@@ -605,7 +605,7 @@ def test_too_many_project_stops_fail_closed(hub, hubcfg, gate_keys, clock):
     d.mkdir()
     for i in range(300):
         (d / f"p{i:03d}").write_text("")
-    p = protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0)
+    p = protocol.verify_lease(hub.poll("g2", _poll())["lease"], gate_keys, "g2", clock(), 0, ssh_keygen="ssh-keygen")
     assert p["stop"] is True and len(p["stopped_projects"]) == 256
 
 

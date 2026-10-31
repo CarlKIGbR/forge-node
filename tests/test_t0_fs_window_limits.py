@@ -80,10 +80,12 @@ def test_directory_symlink_to_a_non_allowlisted_tree_is_refused(tmp_path):
 def test_real_world_symlinks_to_allowlisted_targets_are_followed(tmp_path):
     """Live proof (Ubuntu 24.04): /etc/os-release -> ../usr/lib/os-release, /proc/net -> self/net, /var/run -> /run. Refusing them made inv.host 'ok' but empty and net counters 0."""
     write_tree(tmp_path, {"/usr/lib/os-release": 'PRETTY_NAME="Ubuntu 24.04"\n', "/run/reboot-required": "x\n", "/run/reboot-required.pkgs": "linux-image\n",
-                          "/proc/self/net/dev": "Inter-|   Receive\n face |bytes\n  eth0: 5000 50 0 0 0 0 0 0 7000 70 0 0 0 0 0 0\n"})
+                          "/proc/4242/net/dev": "Inter-|   Receive\n face |bytes\n  eth0: 5000 50 0 0 0 0 0 0 7000 70 0 0 0 0 0 0\n", "/proc/4242/mounts": "srv:/e /mnt nfs4 rw 0 0\n"})
     (tmp_path / "etc").mkdir()
     os.symlink("../usr/lib/os-release", tmp_path / "etc" / "os-release")
-    os.symlink("self/net", tmp_path / "proc" / "net")
+    os.symlink("4242/net", tmp_path / "proc" / "net")                      # on a real host: -> self/net, i.e. /proc/<pid>/net
+    os.symlink("4242/mounts", tmp_path / "proc" / "mounts")
+    assert "nfs4" in Fs(ProtectedSet.from_policy([]), str(tmp_path)).read_text("/proc/mounts")
     (tmp_path / "var").mkdir()
     os.symlink("/run", tmp_path / "var" / "run")                  # absolute link: relative to the relocated root in this test via the realpath below
     f = Fs(ProtectedSet.from_policy([]), str(tmp_path))
@@ -98,6 +100,14 @@ def test_real_host_symlinks_are_followed_on_the_real_filesystem():
     f = Fs(ProtectedSet.from_policy([]))
     assert "ID=" in f.read_text("/etc/os-release")
     assert f.read_text("/proc/net/dev").count(":") >= 1
+    assert f.read_text("/proc/mounts").strip()                    # -> self/mounts: refused in the first review round
+    assert f.exists("/proc/mounts") and f.exists("/etc/passwd")
+    from forge_node.t0 import selfcheck as sc
+    from forge_node.t0.env import Env
+    from forge_node.t0.runner import ReadOnlyRunner
+    from n2_helpers import view as _view
+    r = sc.selfcheck(Env(f, ReadOnlyRunner(), lambda: __import__("datetime").datetime.now(__import__("datetime").timezone.utc), _view()))
+    assert all(r["paths"].values()), r["paths"]               # every probe path of the selfcheck is readable on a real filesystem
 
 
 def test_dot_dot_and_relative_paths_are_normalized_or_refused(fs):
