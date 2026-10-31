@@ -22,4 +22,4 @@ geschlossene Befehlstabelle `runner`, bewachter Dateizugriff `fsread`, Bereinigu
 
 ## Tests
 `scripts/run-tests.sh [pytest-Args]` startet ein Wegwerf-Postgres (`--network none`, nur Unix-Socket) und einen Test-Container mit dem Repo (read-only) und dem `ssh-keygen` des Hosts; beides wird danach entfernt.
-Ohne `FORGE_NODE_TEST_DSN` werden die DB-Tests uebersprungen. Zeilenabdeckung (ohne `coverage`, Python 3.12 `sys.monitoring`): `FN_COV=1 scripts/run-tests.sh -p linecov_plugin -q`. Die Schluessel und die Test-PKI entstehen fluechtig im Temp-Verzeichnis des Tests.
+Ohne `FORGE_NODE_TEST_DSN` werden die DB-Tests uebersprungen. Mutations-Stichproben (kritische Zweige, ~12 min): `python3 scripts/mutation_spotcheck.py [id ...]`. Zeilenabdeckung (ohne `coverage`, Python 3.12 `sys.monitoring`): `FN_COV=1 scripts/run-tests.sh -p linecov_plugin -q`. Die Schluessel und die Test-PKI entstehen fluechtig im Temp-Verzeichnis des Tests.
