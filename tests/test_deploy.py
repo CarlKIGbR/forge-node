@@ -96,7 +96,8 @@ def test_source_never_generates_keys_or_touches_the_system():
         calls = _strings_in_calls(tree, {"run", "Popen", "call", "check_call", "check_output", "system", "popen", "execv", "execvp", "chmod", "chown"})
         for bad in ("systemctl", "systemd-run", "sudo", "useradd", "chattr", "iptables", "docker", "openssl", "-genkey", "genpkey", "ecparam", "-t"):
             assert bad not in calls, (p.name, bad)
-    assert importers == ["sshsig.py"]                                      # der einzige Prozessaufruf im Code: ssh-keygen -Y sign/verify und -l
+    # ssh-keygen -Y sign/verify (sshsig) and the T0 read-only command table (N2: t0/runner.py, a closed argv table - see test_t0_runner.py)
+    assert sorted(importers) == ["runner.py", "sshsig.py"]
     sshsig = (ROOT / "src" / "forge_node" / "sshsig.py").read_text()
     assert sorted(set(re.findall(r'"(-Y|-lf|-q)"', sshsig))) == ["-Y", "-lf", "-q"] and '"sign"' in sshsig and '"verify"' in sshsig
     assert "-N" not in sshsig and "-t\"" not in sshsig and "keygen\", \"-" not in sshsig
@@ -121,10 +122,11 @@ def test_migration_touches_only_schema_node():
 
 
 def test_hub_package_has_no_policy_or_install_or_approval_surface():
-    """N1 liefert weder privd noch agent noch Policy-Anwendung noch T3-Vorschlaege."""
+    """Neither N1 nor N2 delivers privd, privctl, a ledger, the unit resolver, policy application or T3 proposals (N2 adds the agent and the T0 layer)."""
     pkg = ROOT / "src" / "forge_node"
-    assert sorted(p.name for p in pkg.iterdir() if p.is_dir() and p.name != "__pycache__") == ["hub"]
-    assert not any((pkg / n).exists() for n in ("privd.py", "agent.py", "privctl.py", "ledger.py", "resolver.py"))
+    assert sorted(p.name for p in pkg.iterdir() if p.is_dir() and p.name != "__pycache__") == ["agent", "hub", "t0"]
+    assert not any((pkg / n).exists() for n in ("privd.py", "agent.py", "privctl.py", "ledger.py", "resolver.py", "privd", "privctl"))
+    assert not [f for d in ("agent", "t0") for n in ("privd*.py", "ledger*.py", "resolver*.py", "approval*.py", "apply*.py") for f in (pkg / d).glob(n)]
     server = (pkg / "hub" / "server.py").read_text()
     for route in ("/v1/stop", "/v1/release/apply", "/v1/policy/apply", "/v1/t3", "/v1/exec"):
         assert route not in server

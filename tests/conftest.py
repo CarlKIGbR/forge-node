@@ -246,3 +246,13 @@ def open_gates():
     from forge_node import gates
 
     return {k: replace(v, met=True) for k, v in gates.GATES.items()}
+
+
+# ---------------------------------------------------------------------------------------------------------------------------- hypothesis
+try:
+    from hypothesis import settings as _hs
+
+    _hs.register_profile("forge-node", database=None, print_blob=True)
+    _hs.load_profile("forge-node")
+except ImportError:      # property tests are skipped by importorskip in their modules if hypothesis is missing
+    pass
