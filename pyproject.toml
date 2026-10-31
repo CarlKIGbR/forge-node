@@ -1,0 +1,18 @@
+[project]
+name = "forge-node"
+version = "0.1.0"
+requires-python = ">=3.12"
+# Agent und gemeinsame Bibliothek (forge_node.*) sind reine stdlib; nur der Hub (forge_node.hub) braucht psycopg (wie forge-core).
+dependencies = []
+
+[project.optional-dependencies]
+hub = ["psycopg[binary,pool]>=3.2"]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra -p no:cacheprovider"
+markers = [
+  "db: braucht ein Wegwerf-Postgres (FORGE_NODE_TEST_DSN); ohne wird uebersprungen",
+]
