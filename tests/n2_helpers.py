@@ -56,6 +56,7 @@ class FakeRunner:
 
     def run(self, cmd_id, slots=None, stdin=None, max_wait_s=None):
         assert cmd_id in runner_mod.CMDS, f"unknown command id {cmd_id}"
+        runner_mod._expand(runner_mod.CMDS[cmd_id], slots or {})            # same slot validation as the real runner (raises RunnerError for values the table refuses)
         self.calls.append((cmd_id, dict(slots or {})))
         r = self.script.get(cmd_id)
         if callable(r):

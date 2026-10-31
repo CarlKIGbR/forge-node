@@ -597,3 +597,142 @@ def test_fsread_exists_survives_odd_paths_and_sanitize_walks_nested_strings(tmp_
     body = {"l": [["a" * 400, ["b" * 400]], {"k": "c" * 400}]}
     out, tr = sanitize.fit(body, 300)
     assert len(canon.canonical(out)) <= 300 and tr
+
+
+# ===================================================================================================== review round (independent reviewer, 15 findings)
+def test_directory_listing_never_follows_a_symlink_swapped_in_after_resolution(tmp_path):
+    write_tree(tmp_path, {"/srv/models/a/w.bin": "x", "/etc/secret-dir/shadow": "root-only"})
+    f = Fs(ProtectedSet.from_policy([]), str(tmp_path))
+    os.rename(tmp_path / "srv/models/a", tmp_path / "srv/models/a.real")
+    os.symlink(str(tmp_path / "etc/secret-dir"), tmp_path / "srv/models/a")            # the swap
+    with pytest.raises(FsError) as e:
+        f.list_meta("/srv/models/a")
+    assert e.value.code in ("escape", "unreadable")
+    env = env_with(tmp_path, FakeRunner({}, available=set()), t0={"model_dirs": ["/srv/models"]})
+    ents = {x["name"]: x for x in probes.run_probe("models", {}, env)["models"]["dirs"][0]["entries"]}
+    assert "a" in ents and ents["a"].get("children", []) == [] and "shadow" not in json.dumps(ents)
+
+
+def test_certificate_links_are_followed_only_to_certificate_looking_unprotected_targets(tmp_path):
+    out = "notAfter=Nov 14 12:00:00 2026 GMT\nsubject=CN=x\nsha256 Fingerprint=" + ":".join(["AB"] * 32) + "\n"
+    files = {"/etc/letsencrypt/archive/d/fullchain1.pem": "c", "/etc/letsencrypt/archive/d/privkey1.pem": "KEY", "/root/.ssh/innocent.pem": "KEY?", "/etc/ssh/ssh_host.crt": "c"}
+    env = env_with(tmp_path, FakeRunner({"openssl_x509_file": out}), t0={"cert_paths": ["/etc/letsencrypt/live/d"]}, files=files)
+    live = tmp_path / "etc/letsencrypt/live/d"
+    live.mkdir(parents=True)
+    os.symlink("../../archive/d/fullchain1.pem", live / "fullchain.pem")                # the legitimate letsencrypt layout
+    os.symlink("../../archive/d/privkey1.pem", live / "privkey.pem")                    # name filter already drops it
+    os.symlink("../../archive/d/privkey1.pem", live / "cert.pem")                       # innocent link name, key-looking target
+    os.symlink(str(tmp_path / "root/.ssh/innocent.pem"), live / "root-link.pem")        # target in the protected set (/root)
+    os.symlink("../../../ssh/ssh_host.crt", live / "ssh-link.crt")                      # target in /etc/ssh (protected)
+    rows = {c["file"]: c for c in probes.run_probe("certs", {}, env)["certs"]["paths"][0]["certs"]}
+    assert rows["fullchain.pem"]["days_left"] == 13
+    assert set(rows) == {"fullchain.pem", "cert.pem", "root-link.pem", "ssh-link.crt"} and all(rows[k].get("error") == "target_not_a_certificate_name" for k in rows if k != "fullchain.pem")
+
+
+def test_odd_directory_names_are_per_item_results_not_probe_failures(tmp_path):
+    """Review finding: '(', ')', '&', non-ASCII names made the table refuse the path and killed the whole inv.models/certs/git. Printable names work; control characters degrade ONE item."""
+    seen = []
+    r = FakeRunner({"du_ionice": lambda slots, _: (seen.append(slots["path"]), Run(True, "ok", 0, b"7\t-\n"))[1]})
+    files = {"/srv/models/Qwen3 (Q4)/w": "1", "/srv/models/M\u00fcnchen/w": "1", "/srv/models/a&b;c/w": "1", "/srv/models/bad\nname/w": "1", "/srv/models/ok/w": "1"}
+    env = env_with(tmp_path, r, t0={"model_dirs": ["/srv/models"]}, files=files)
+    ents = {e["name"]: e for e in probes.run_probe("models", {}, env)["models"]["dirs"][0]["entries"]}
+    assert ents["Qwen3 (Q4)"]["size"] == 7 and ents["M\u00fcnchen"]["size"] == 7 and ents["a&b;c"]["size"] == 7 and ents["ok"]["size"] == 7
+    assert ents["bad\nname"]["size"] is None and ents["bad\nname"]["size_status"] == "unsupported_name"
+    # certs: a file whose real path the table refuses is an item error
+    env = env_with(tmp_path / "c", FakeRunner({"openssl_x509_file": "x"}), t0={"cert_paths": ["/etc/c"]}, files={"/etc/c/a\nb.crt": "c"})
+    assert probes._CERT_FILE.match("a\nb.crt") is None
+
+
+def test_du_gets_the_remaining_budget_as_its_deadline(tmp_path):
+    waits = []
+    state = {"t": NOW}
+
+    def du(slots, _):
+        return Run(True, "ok", 0, b"1\t-\n")
+    r = FakeRunner({"du_ionice": du})
+    orig = r.run
+
+    def run(cid, slots=None, stdin=None, max_wait_s=None):
+        waits.append(max_wait_s)
+        state["t"] += timedelta(seconds=60)
+        return orig(cid, slots, stdin, max_wait_s)
+    r.run = run
+    env = env_with(tmp_path, r, t0={"model_dirs": ["/srv/models"]}, files={f"/srv/models/m{i}/x": "1" for i in range(4)})
+    env.now = lambda: state["t"]
+    ents = probes.run_probe("models", {}, env)["models"]["dirs"][0]["entries"]
+    assert waits[0] == 120.0 and waits[1] == 90.0 and all(w <= 120 for w in waits)                    # min(120, what is left of the 150 s budget)
+    assert [e["size"] for e in ents][:2] == [1, 1] and ents[3]["size_status"] == "skipped_budget"
+
+
+def test_policy_holder_never_keeps_serving_the_old_policy_after_an_unexpected_error(tmp_path, owner, monkeypatch):
+    from forge_node.agent.config import AgentConfig
+    from n2_helpers import install_policy, signers_text
+    pol = tmp_path / "policy"
+    install_policy(pol, policy_doc(), owner["priv"])
+    signers = tmp_path / "as"
+    signers.write_text(signers_text(owner["pub"]))
+    os.chmod(signers, 0o644)
+    cfg = AgentConfig("g2", "127.0.0.1", 1, "/c", "/k", "/ca", str(pol), str(signers), str(tmp_path), "/s", os.getuid(), os.getuid(), "/")
+    logs = []
+    h = L.PolicyHolder(cfg, lambda: NOW, logs.append, "ssh-keygen")
+    assert h.refresh()[0].serial == 1
+    install_policy(pol, policy_doc(serial=2), owner["priv"])
+    monkeypatch.setattr(L, "load_installed", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert h.refresh() == (None, True) and h.view is None and any("unexpected RuntimeError" in m for m in logs)
+    # a changed owner key file alone (no policy change) forces a re-verification
+    monkeypatch.undo()
+    h2 = L.PolicyHolder(cfg, lambda: NOW, logs.append, "ssh-keygen")
+    assert h2.refresh()[0].serial == 2
+    signers.write_text("# rotated: no owner key any more\n")
+    os.chmod(signers, 0o644)
+    assert h2.refresh() == (None, True)
+
+
+def test_staging_survives_garbage_answers_and_untrusted_signer_files(tmp_path, monkeypatch):
+    class Client(StubClient):
+        def __init__(self, answer):
+            super().__init__()
+            self.answer = answer
+
+        def get_policy(self, serial):
+            return self.answer
+    for answer in ({"serial": 2, "policy": 5, "sig": "x"}, {"serial": 3, "policy": "{}", "sig": "x"}, {"serial": 2, "policy": "{}", "sig": ["x"]}, {"unexpected": 1}):
+        ag = stub_agent(tmp_path / str(abs(hash(str(answer)))), Client(answer))
+        rt = ag._runtime()
+        ag._maybe_stage_policy(rt, 2)
+        assert any("not staged" in m for m in ag.logs), answer
+        assert not (tmp_path / "staging").exists()
+
+
+def test_clamping_and_key_redaction(tmp_path):
+    body = {"disk": {"size": 10**30, "neg": -10**30, "ok": 5}, "label sk-CANARYabcdef123456": "v", "token=CANARYsecret123456": 1}
+    t = sanitize.finalize("g2", "inv.disks", "2026-10-31T13:40:10Z", "internal", body, full_redaction=False)
+    e = json.loads(t)["data"]
+    assert e["disk"] == {"size": 2**53 - 1, "neg": -(2**53 - 1), "ok": 5} and "CANARY" not in t
+
+
+def test_statvfs_remembers_hung_mounts_and_df_has_a_time_budget(monkeypatch, tmp_path):
+    import time
+    collect._HUNG.clear()
+    calls = []
+
+    def slow(path):
+        calls.append(path)
+        time.sleep(2)
+        raise OSError("late")
+    monkeypatch.setattr(os, "statvfs", slow)
+    assert collect._statvfs("/mnt/dead", timeout=0.1) == {"unresponsive": True}
+    assert collect._statvfs("/mnt/dead", timeout=0.1) == {"unresponsive": True, "remembered": True} and calls == ["/mnt/dead"]
+    collect._HUNG.clear()
+    mounts = json.dumps({"filesystems": [{"target": f"/mnt/n{i}", "source": "x:/e", "fstype": "nfs4", "options": "rw"} for i in range(5)]})
+    env = make_env(tmp_path, FakeRunner({"lsblk": "{}", "findmnt": mounts}))
+    monkeypatch.setattr(collect, "DF_BUDGET_S", 0.25)
+    t = {"n": 0}
+
+    def fake(path, timeout=3.0):
+        t["n"] += 1
+        time.sleep(0.2)
+        return {"size": 1, "avail": 1, "used": 0}
+    dfs = [m["df"] for m in collect.disks(env, statvfs=fake)["mounts"]["mounts"]]
+    assert dfs.count({"skipped": "budget"}) >= 2 and t["n"] < 5
+    collect._HUNG.clear()

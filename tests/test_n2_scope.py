@@ -55,9 +55,11 @@ def test_agent_unit_has_nonewprivileges_and_no_sudoers():
     assert p["NoNewPrivileges"] == "yes" and p["User"] == "forgenode" and p["CapabilityBoundingSet"] == "" and p["ProtectSystem"] == "strict"
     assert p["IPAddressDeny"] == "any" and p["IPAddressAllow"] == "192.168.10.4/32 127.0.0.0/8" and p["MemoryMax"] == "128M" and p["CPUQuota"] == "15%" and p["Nice"] == "19"
     assert hardening.agent_properties("g4")["MemoryMax"] == "96M" and hardening.agent_properties("g1")["MemoryMax"] == "128M"
-    assert "AF_NETLINK" in p["RestrictAddressFamilies"] and "AF_INET" in p["RestrictAddressFamilies"] and "SystemCallFilter" in p
+    assert "AF_NETLINK" in p["RestrictAddressFamilies"] and "AF_INET" in p["RestrictAddressFamilies"] and p["SystemCallFilter"] == "@system-service"
     assert p["ReadWritePaths"] == "/var/lib/forge-node /var/log/forge-node-agent"
-    # nothing in the repo names sudo for the agent; no sudoers file is shipped (also asserted for the whole tree in test_deploy)
+    for k in ("LockPersonality", "RestrictRealtime", "RestrictSUIDSGID", "RestrictNamespaces", "ProtectClock", "ProtectHostname", "ProtectKernelLogs", "ProtectKernelModules", "ProtectControlGroups"):
+        assert p[k] == "yes", k
+    assert "PrivateDevices" not in p and "MemoryDenyWriteExecute" not in p          # nvidia-smi needs the device nodes and writable+executable mappings
     for m in MODULES:
         assert not re.search(r"\bsudo\b", code_only(m)), m
     assert not [f for f in ROOT.rglob("*") if f.is_file() and "sudoers" in f.name and ".git" not in f.parts]
@@ -70,9 +72,17 @@ def test_ro_probe_class_properties_come_from_a_fixed_table_not_from_parameters()
         p = hardening.ro_probe_properties(name)
         assert p["NoNewPrivileges"] == "yes" and p["ProtectSystem"] == "strict" and p["IPAddressDeny"] == "any" and "ReadWritePaths" not in p and p["PrivateTmp"] == "yes"
         assert p["KillMode"] == "control-group" and p["SendSIGKILL"] == "yes" and p["MemoryMax"] and p["TasksMax"] and p["RuntimeMaxSec"].isdigit()
+        assert p["PrivateDevices"] == "yes" and p["MemoryDenyWriteExecute"] == "yes" and p["RestrictNamespaces"] == "yes" and p["LockPersonality"] == "yes" and p["UMask"] == "0077"
         assert "CAP_SYS_ADMIN" not in p["CapabilityBoundingSet"] and "CAP_SYS_RAWIO" not in p["CapabilityBoundingSet"] and "CAP_DAC_OVERRIDE" not in p["CapabilityBoundingSet"]
-    assert "CAP_SYS_PTRACE" in hardening.ro_probe_properties("net")["CapabilityBoundingSet"] and hardening.ro_probe_properties("models")["IOSchedulingClass"] == "idle"
-    assert "IOSchedulingClass" not in hardening.ro_probe_properties("net") and hardening.ro_probe_properties("access")["ProtectHome"] == "read-only"
+        assert "/run/forge-node" in p["InaccessiblePaths"]                                     # no probe can reach privd's socket
+        assert ("/run/docker.sock" in p["InaccessiblePaths"]) == (not hardening.RO_PROBES[name]["docker"])
+    caps = {n: set(hardening.ro_probe_properties(n)["CapabilityBoundingSet"].split()) for n in hardening.RO_PROBES}
+    assert "CAP_SYS_PTRACE" in caps["net"] and "CAP_NET_ADMIN" not in caps["net"] and caps["firewall"] == {"CAP_NET_ADMIN"}          # ss -p and iptables never share a unit
+    assert "CAP_SYS_PTRACE" not in caps["containers"] and "CAP_SYS_PTRACE" in caps["container_net"]
+    assert [n for n, c in caps.items() if "CAP_NET_ADMIN" in c] == ["firewall"] and [n for n, c in caps.items() if "CAP_SYS_PTRACE" in c] == ["net", "container_net"]
+    assert hardening.ro_probe_properties("models")["IOSchedulingClass"] == "idle" and "IOSchedulingClass" not in hardening.ro_probe_properties("net")
+    assert hardening.ro_probe_properties("access")["ProtectHome"] == "read-only"
+    assert "AF_INET" in hardening.ro_probe_properties("firewall")["RestrictAddressFamilies"] and "AF_INET" not in hardening.ro_probe_properties("net")["RestrictAddressFamilies"]
 
 
 def test_every_probe_has_a_hardening_entry_and_vice_versa():
@@ -189,7 +199,7 @@ def test_probe_main_loads_the_policy_itself_and_answers_one_json_line(tmp_path, 
     out = io.StringIO()
     rc = probe_main.main(["vms"], io.StringIO("{}\n"), out, node_id="g2", policy_dir=str(pol), allowed_signers=str(signers), fs_root=str(tmp_path), owner_uid=os.getuid(), now=lambda: NOW, ssh_keygen="ssh-keygen")
     r = json.loads(out.getvalue())
-    assert rc == 0 and r["ok"] is True and r["data"]["domains"]["status"] in ("unavailable", "ok", "error")
+    assert rc == 0 and r["ok"] is True and r["data"]["domains"] == {"status": "unavailable", "reason": "virsh not installed"}
     out = io.StringIO()
     assert probe_main.main(["journal"], io.StringIO('{"unit":"sshd.service"}\n'), out, node_id="g2", policy_dir=str(pol), allowed_signers=str(signers), fs_root=str(tmp_path), owner_uid=os.getuid(), now=lambda: NOW, ssh_keygen="ssh-keygen") == 0
     assert json.loads(out.getvalue())["code"] == "DENY_NOT_ALLOWLISTED"

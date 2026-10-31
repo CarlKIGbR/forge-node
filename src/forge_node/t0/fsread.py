@@ -192,11 +192,13 @@ class Fs:
         return {"kind": kind, "size": s.st_size, "mtime": int(s.st_mtime), "uid": s.st_uid, "gid": s.st_gid, "mode": st_mod.S_IMODE(s.st_mode), "dev": s.st_dev}
 
     def list_meta(self, logical_real: str, max_entries: int = 2000) -> tuple[list[dict], bool]:
-        """Names + metadata of a directory's entries (depth 1). Returns (entries, truncated). Never opens a file."""
+        """Names + metadata of a directory's entries (depth 1). Returns (entries, truncated). Never opens a file. The directory is reached with an O_NOFOLLOW walk and listed through
+        its descriptor: a component swapped for a symlink after resolve_dir() is refused instead of followed (and cannot lead the listing outside the protected set)."""
         base = norm_abs(logical_real)
         out: list[dict] = []
+        dfd = self._walk_open(base, want_dir=True)
         try:
-            with os.scandir(self._actual(base)) as it:
+            with os.scandir(dfd) as it:
                 for e in it:
                     if len(out) >= max_entries:
                         return sorted(out, key=lambda x: x["name"]), True
@@ -208,6 +210,8 @@ class Fs:
                     out.append({"name": e.name, "kind": kind, "size": s.st_size, "mtime": int(s.st_mtime), "dev": s.st_dev})
         except OSError as e:
             raise FsError("unreadable", type(e).__name__) from e
+        finally:
+            os.close(dfd)
         return sorted(out, key=lambda x: x["name"]), False
 
     def read_exception(self, logical: str, allowed_names: re.Pattern, limit: int = 64 * 1024) -> str:

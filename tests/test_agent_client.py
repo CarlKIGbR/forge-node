@@ -126,13 +126,21 @@ def test_empty_pin_list_is_a_programming_error_not_an_unpinned_mode(pki, certs):
 
 
 def test_client_certificate_is_presented(pki, certs):
+    seen = []
+
+    class Peer(Handler):
+        def do_POST(self):
+            cert = self.connection.getpeercert()
+            seen.append(dict(x[0] for x in cert["subject"]).get("commonName") if cert else None)
+            super().do_POST()
+        do_GET = do_POST
     srv = serve(pki, certs["hub"][1], certs["hub"][0], verify_client=True)
-    # a client without the node certificate cannot even finish the handshake against a server that demands one: covered by using the node cert above; here: wrong CA client cert
+    srv.RequestHandlerClass = Peer
     assert client_for(pki, srv, certs, [pin_of(pki, certs["hub"])]).poll({}) == {"ok": True}
+    assert seen == ["forge-node-g2"]
     srv.shutdown()
 
 
-def test_client_is_tls13_only_and_verifies_hostnames():
-    import inspect
-    src = inspect.getsource(C.make_context)
-    assert "TLSv1_3" in src and "CERT_REQUIRED" in src and "check_hostname = True" in src
+def test_client_context_is_tls13_only_verifies_the_chain_and_the_name(pki, certs):
+    ctx = C.make_context(str(certs["node"][1]), str(certs["node"][0]), str(pki.ca_crt))
+    assert ctx.minimum_version == ctx.maximum_version == ssl.TLSVersion.TLSv1_3 and ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname is True
