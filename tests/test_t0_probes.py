@@ -439,6 +439,8 @@ def test_wire_answers_survive_values_canonical_json_would_reject(tmp_path, monke
 def test_unicode_line_separators_in_docker_output_do_not_hide_a_container(tmp_path):
     """Review finding: Python splitlines() splits on U+0085/U+2028 which Go's {{json}} does not escape; the row broke in two and the container vanished."""
     line = inspect_line(labels={"forge.project": "p", "com.docker.compose.project": "x\u0085y\u2028z"})
+    line = line.replace("\\u0085", "\u0085").replace("\\u2028", "\u2028")                  # Go's {{json}} emits these raw; Python's json.dumps escapes them
+    assert "\u0085" in line and len(line.splitlines()) == 3 and len(line.split("\n")) == 1
     r = FakeRunner({"docker_ps_ids": CID + "\n", "docker_inspect": line + "\n"})
     c = run_probe("containers", {}, env_with(tmp_path, r))["containers"]
     assert c["count"] == 1 and c["unparsed"] == 0
