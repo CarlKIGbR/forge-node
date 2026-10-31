@@ -41,15 +41,32 @@ def clean_tree(o, _depth: int = 0):
         return "[too deep]"
     if isinstance(o, str):
         return clean_text(o, 512)
-    if o is None or isinstance(o, (bool, int)):
+    if o is None or isinstance(o, bool):
         return o
+    if isinstance(o, int):
+        return max(-canon.MAX_INT, min(canon.MAX_INT, o))          # canonical JSON has no integers beyond 2**53-1: a FUSE/sparse mount reporting exabytes must not fail the whole op
     if isinstance(o, float):
         return int(o) if o == o and abs(o) < 2**53 else None
     if isinstance(o, (list, tuple)):
         return [clean_tree(x, _depth + 1) for x in o]
     if isinstance(o, dict):
-        return {clean_name(k, 96): clean_tree(v, _depth + 1) for k, v in o.items()}
+        return {redact.redact_light(clean_name(k, 96)): clean_tree(v, _depth + 1) for k, v in o.items()}
     return clean_text(repr(o), 64)
+
+
+def clamp_ints(o, _depth: int = 0):
+    """For structures that go to the spool unfiltered (samples): bound integers to the canonical-JSON range."""
+    if _depth > _MAX_DEPTH:
+        return None
+    if isinstance(o, bool) or o is None or isinstance(o, str):
+        return o
+    if isinstance(o, int):
+        return max(-canon.MAX_INT, min(canon.MAX_INT, o))
+    if isinstance(o, (list, tuple)):
+        return [clamp_ints(x, _depth + 1) for x in o]
+    if isinstance(o, dict):
+        return {k: clamp_ints(v, _depth + 1) for k, v in o.items()}
+    return None
 
 
 def _size(o) -> int:

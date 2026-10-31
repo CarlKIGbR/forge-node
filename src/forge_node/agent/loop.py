@@ -13,7 +13,7 @@ from .. import PROTOCOL_VERSION, __version__, protocol
 from ..protocol import ProtoError
 from ..redact import redact_light
 from ..t0.engine import Outcome, T0Engine
-from ..t0.policy import PolicyError, PolicyView, load_installed, verify_blob
+from ..t0.policy import PolicyError, PolicyView, load_installed, read_signers, verify_blob
 from .client import HubClient, HubError, HubUnreachable, PinError
 
 WAIT_S = 25
@@ -33,19 +33,25 @@ class Runtime:
 class PolicyHolder:
     """Re-reads the installed policy when its directory listing or the file's identity changes; any failure to verify means NO policy (fail closed, never an older file)."""
 
-    def __init__(self, cfg, clock, log):
-        self.cfg, self.clock, self.log = cfg, clock, log
+    def __init__(self, cfg, clock, log, ssh_keygen):
+        self.cfg, self.clock, self.log, self.ssh_keygen = cfg, clock, log, ssh_keygen
         self._sig = None
         self._last_err = None
         self.view: PolicyView | None = None
 
     def _signature(self):
+        """Identity of everything the decision rests on: the policy files AND the owner key file (a rotated or revoked owner key must be noticed without a policy change)."""
         try:
             names = sorted(n for n in os.listdir(self.cfg.policy_dir) if n.startswith("policy-"))
             st = [os.stat(os.path.join(self.cfg.policy_dir, n), follow_symlinks=False) for n in names]
-            return tuple((n, s.st_ino, s.st_mtime_ns, s.st_size) for n, s in zip(names, st))
+            files = tuple((n, s.st_ino, s.st_mtime_ns, s.st_size) for n, s in zip(names, st))
         except OSError:
             return None
+        try:
+            a = os.stat(self.cfg.allowed_signers, follow_symlinks=False)
+            return files + (("allowed_signers", a.st_ino, a.st_mtime_ns, a.st_size),)
+        except OSError:
+            return files + (("allowed_signers", None),)
 
     def refresh(self) -> tuple[PolicyView | None, bool]:
         """(view, changed)"""
@@ -54,11 +60,12 @@ class PolicyHolder:
             return self.view, False
         self._sig = sig
         try:
-            view = load_installed(self.cfg.policy_dir, self.cfg.allowed_signers, self.cfg.node_id, self.clock(), owner_uid=self.cfg.owner_uid)
-        except PolicyError as e:
-            if e.detail != self._last_err and (self.view is not None or sig is not None):
-                self.log(f"policy: no usable policy ({e.detail})")
-            self._last_err = e.detail
+            view = load_installed(self.cfg.policy_dir, self.cfg.allowed_signers, self.cfg.node_id, self.clock(), owner_uid=self.cfg.owner_uid, ssh_keygen=self.ssh_keygen)
+        except Exception as e:  # noqa: BLE001 - ANY failure to establish the policy means no policy: never keep serving the previous one
+            detail = e.detail if isinstance(e, PolicyError) else f"unexpected {type(e).__name__}"
+            if detail != self._last_err and (self.view is not None or sig is not None):
+                self.log(f"policy: no usable policy ({detail})")
+            self._last_err = detail
             self.view = None
             return None, True
         self._last_err = None
@@ -70,9 +77,9 @@ class PolicyHolder:
 
 
 class Agent:
-    def __init__(self, cfg, holder: PolicyHolder, build_runtime, spool, sampler_factory, clock, sleep=time.sleep, log=None, rng=None):
+    def __init__(self, cfg, holder: PolicyHolder, build_runtime, spool, sampler_factory, clock, ssh_keygen, sleep=time.sleep, log=None, rng=None):
         self.cfg, self.holder, self.build_runtime, self.spool, self.sampler_factory = cfg, holder, build_runtime, spool, sampler_factory
-        self.clock, self.sleep = clock, sleep
+        self.clock, self.sleep, self.ssh_keygen = clock, sleep, ssh_keygen
         self.log = log or (lambda m: None)
         self.rng = rng or (lambda: 0.5)
         self.rt: Runtime | None = None
@@ -132,7 +139,7 @@ class Agent:
         try:
             if set(resp) != {"v", "lease", "jobs", "reconcile", "policy_serial_latest", "server_time"} or resp["v"] != PROTOCOL_VERSION or not isinstance(resp["jobs"], list) or len(resp["jobs"]) > 1:
                 raise ProtoError("BAD_REQUEST", "poll response shape")
-            lease = protocol.verify_lease(resp["lease"], rt.policy.hub_gate_keys, self.cfg.node_id, now, self._last_lease_seq)
+            lease = protocol.verify_lease(resp["lease"], rt.policy.hub_gate_keys, self.cfg.node_id, now, self._last_lease_seq, self.ssh_keygen)
             self._last_lease_seq = lease["seq"]
         except ProtoError as e:
             self.log(f"hub response discarded: {e.code} {e.detail[:80]}")
@@ -152,7 +159,7 @@ class Agent:
     def _run_job(self, rt: Runtime, env: dict):
         now = self.clock()
         try:
-            job = protocol.verify_job(env, rt.policy.hub_gate_keys, self.cfg.node_id, now)
+            job = protocol.verify_job(env, rt.policy.hub_gate_keys, self.cfg.node_id, now, self.ssh_keygen)
         except ProtoError as e:
             self.log(f"job rejected: {e.code} {e.detail[:80]}")           # unverifiable: nothing is posted for an id we cannot trust
             return
@@ -206,12 +213,17 @@ class Agent:
             doc = rt.client.get_policy(serial)
             if set(doc) != {"serial", "policy", "sig"} or doc["serial"] != serial:
                 raise ProtoError("BAD_REQUEST", "policy answer shape")
-            with open(self.cfg.allowed_signers, "rb") as f:
-                signers = f.read(65536).decode("ascii")
-            verify_blob(doc["policy"].encode("utf-8"), doc["sig"], signers, self.cfg.node_id, serial, self.clock())
-        except (HubUnreachable, HubError, ProtoError, PolicyError, OSError, UnicodeError) as e:
+            if not isinstance(doc["policy"], str) or not isinstance(doc["sig"], str):
+                raise ProtoError("BAD_REQUEST", "policy answer types")
+            signers = read_signers(self.cfg.allowed_signers, self.cfg.owner_uid)
+            verify_blob(doc["policy"].encode("utf-8"), doc["sig"], signers, self.cfg.node_id, serial, self.clock(), self.ssh_keygen)
+            self._write_staged(serial, doc)
+        except Exception as e:  # noqa: BLE001 - staging is best effort; whatever goes wrong must not abort the handling of this response (its jobs)
             self.log(f"policy {serial} not staged: {type(e).__name__}")
             return
+        self.log(f"policy {serial}: signature verified, staged for privd/privctl (not active)")
+
+    def _write_staged(self, serial: int, doc: dict):
         d = os.path.join(self.cfg.state_dir, "staging")
         os.makedirs(d, mode=0o700, exist_ok=True)
         for name, content in ((f"policy-{serial}.json", doc["policy"]), (f"policy-{serial}.json.sig", doc["sig"])):
@@ -220,7 +232,6 @@ class Agent:
             with os.fdopen(fd, "w") as f:
                 f.write(content)
             os.replace(tmp, os.path.join(d, name))
-        self.log(f"policy {serial}: signature verified, staged for privd/privctl (not active)")
 
     # ------------------------------------------------------------------------------------------------------------------- loop
     def stop(self):

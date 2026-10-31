@@ -20,7 +20,7 @@ from .spool import Spool
 from .wire import ProbeDenied, ProbeUnavailable
 
 # section names each probe answers with (an unreachable or failing probe turns each of them into a status section)
-PROBE_SECTIONS = {"net": ("listeners", "docker_user"), "containers": ("containers",), "vms": ("domains", "pools"), "certs": ("certs",), "git": ("repos",),
+PROBE_SECTIONS = {"net": ("listeners",), "firewall": ("docker_user",), "containers": ("containers",), "container_net": ("container_net",), "vms": ("domains", "pools"), "certs": ("certs",), "git": ("repos",),
                   "access": ("sshd", "groups", "authorized_keys"), "models": ("models",), "journal": ("log",), "activity": ("activity",), "uulog": ("uulog",)}
 RETRYABLE_PROBE_CODES = frozenset({"DENY_WINDOW", "DENY_RATE", "DENY_STOP", "DENY_LOCAL_STOP", "DENY_STALE_LEASE", "DENY_CLOCK", "DENY_AUDIT_DOWN", "DENY_QUARANTINE"})
 
@@ -43,6 +43,7 @@ class T0Engine:
         """`hub_cert_der` returns the DER of the hub certificate seen on the live connection (None before the first handshake): inv.certs reports its expiry (Design 4.1)."""
         self.node, self.env, self.limiter, self.probe, self.spool, self.node_cert_path, self.hub_cert_der = node, env, limiter, probe, spool, node_cert_path, hub_cert_der
         self._lock = threading.Lock()
+        self._last_sample = None
         self._ops: dict[str, tuple[bool, Callable[[dict], tuple[dict, str]]]] = {
             "inv.host": (False, lambda p: (collect.host(env), "internal")),
             "inv.disks": (False, lambda p: (collect.disks(env), "internal")),
@@ -77,11 +78,8 @@ class T0Engine:
     def _net(self) -> dict:
         out = collect.net_local(self.env)
         p = self._probe("net", {})
-        if "listeners" in p and p["listeners"].get("status") == "ok":
-            out.update(p)
-        else:
-            out["listeners"] = collect.listeners_unprivileged(self.env)          # degraded: no process names
-            out["docker_user"] = p.get("docker_user", unavailable("needs the privileged probe"))
+        out["listeners"] = p["listeners"] if p.get("listeners", {}).get("status") == "ok" else collect.listeners_unprivileged(self.env)         # degraded: no process names
+        out.update(self._probe("firewall", {}))
         return out
 
     def _vms(self) -> dict:
@@ -103,6 +101,21 @@ class T0Engine:
         return self._probe("journal", probe_params), lu.sensitivity
 
     # ----------------------------------------------------------------------------------------------------------- the one path
+    def sample(self) -> int | None:
+        """The continuous `metrics.sample` collection (Design 14.2 M1) goes through the same engine: gates, tier-0 policy, a rate bucket of its own and the >= 30 s cadence (held
+        HERE, per engine, however often and by whomever this is called). Returns the spool seq or None if nothing was collected."""
+        env = self.env
+        if not gates.decide("metrics.sample", 0, env.policy.profile, {}).allowed or 0 not in env.policy.tiers_enabled:
+            return None
+        with self._lock:
+            now = env.now()
+            if self._last_sample is not None and abs((now - self._last_sample).total_seconds()) < metrics.MIN_INTERVAL_S:
+                return None
+            if not self.limiter.take("metrics.collect", False):
+                return None
+            self._last_sample = now
+            return self.spool.append(sanitize.clamp_ints(metrics.take_sample(env)))
+
     def execute(self, op: str, tier: int, params: dict) -> Outcome:
         env = self.env
         d = gates.decide(op, tier, env.policy.profile, params)                                   # 1

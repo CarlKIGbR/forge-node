@@ -213,7 +213,7 @@ def test_policy_too_long_list_and_oversized_file(tmp_path, owner):
     s.write_text(signers_text(owner["pub"]))
     os.chmod(s, 0o644)
     with pytest.raises(P.PolicyError) as e:
-        P.load_installed(str(d), str(s), "g2", NOW, owner_uid=os.getuid())
+        P.load_installed(str(d), str(s), "g2", NOW, owner_uid=os.getuid(), ssh_keygen="ssh-keygen")
     assert "too large" in e.value.detail or "not a regular" in e.value.detail
 
 
@@ -226,11 +226,8 @@ def test_probe_error_branches(tmp_path):
     # working dir that does not exist -> owner unknown; log path in docker dir that vanished -> age None; with_usage with an unreadable /proc/<pid>/net/dev -> no net key
     line = inspect_line(labels={"com.docker.compose.project.working_dir": "/srv/gone", "com.docker.compose.project": "p"}, pid=777)
     r = FakeRunner({"docker_ps_ids": CID + "\n", "docker_inspect": line + "\n"})
-    c = probes.run_probe("containers", {"with_usage": True}, env_with(tmp_path, r))["containers"]["containers"][0]
+    c = probes.run_probe("containers", {}, env_with(tmp_path, r))["containers"]["containers"][0]
     assert c["attribution"]["working_dir_owner_uid"] is None and c["last_log_age_s"] is None and "net" not in c
-    env = env_with(tmp_path, r, files={"/proc/777/net/dev": PROC["/proc/net/dev"]})
-    c = probes.run_probe("containers", {"with_usage": True}, env)["containers"]["containers"][0]
-    assert c["net"] == {"rx_bytes": 5000, "tx_bytes": 7000}
 
 
 def test_certs_probe_error_rows(tmp_path):
@@ -441,7 +438,8 @@ def test_main_wiring_and_helpers(monkeypatch, tmp_path, capsys):
         def stop(self):
             calls["stopped"] = True
     monkeypatch.setenv("FORGE_NODE_NODE_ID", "g2")
-    monkeypatch.setattr(agent_main, "build", lambda cfg, **kw: (calls.setdefault("probe_uid", kw["probe"].expect_uid), calls.setdefault("runner", type(kw["runner"]).__name__), FakeAgent())[2])
+    monkeypatch.setattr(agent_main, "trusted_binary", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(agent_main, "build", lambda cfg, **kw: (calls.setdefault("probe_uid", kw["probe"].expect_uid), calls.setdefault("runner", type(kw["runner"]).__name__), calls.setdefault("keygen", kw["ssh_keygen"]), FakeAgent())[3])
     import signal
     old = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
     try:
@@ -450,7 +448,9 @@ def test_main_wiring_and_helpers(monkeypatch, tmp_path, capsys):
     finally:
         for s, h in old.items():
             signal.signal(s, h)
-    assert calls == {"probe_uid": 0, "runner": "ReadOnlyRunner", "ran": True, "stopped": True}
+    assert calls == {"probe_uid": 0, "runner": "ReadOnlyRunner", "keygen": "/usr/bin/ssh-keygen", "ran": True, "stopped": True}
+    monkeypatch.setattr(agent_main, "trusted_binary", lambda name: (_ for _ in ()).throw(runner.RunnerError("no trusted ssh-keygen")))
+    assert agent_main.main([]) == 2 and "no trusted ssh-keygen" in capsys.readouterr().err
 
 
 class StubClient:
@@ -482,7 +482,7 @@ def stub_agent(tmp_path, client, owner_pub=None, engine=None):
     spool = Spool(str(tmp_path / "state"), os.getuid(), 1 << 16)
     holder = type("H", (), {"refresh": lambda self: (v, False), "cfg": cfg})()
     rt = L.Runtime(v, client, engine or type("E", (), {"execute": lambda *a: None, "env": None})())
-    ag = L.Agent(cfg, holder, lambda view_: rt, spool, lambda r: None, lambda: NOW, log=logs.append)
+    ag = L.Agent(cfg, holder, lambda view_: rt, spool, lambda r: None, lambda: NOW, "ssh-keygen", log=logs.append)
     ag.logs = logs
     return ag
 
@@ -503,7 +503,7 @@ def test_agent_survives_engine_exceptions(tmp_path, monkeypatch):
     client = StubClient()
     ag = stub_agent(tmp_path, client, engine=Boom())
     from conftest import job_payload
-    monkeypatch.setattr(L.protocol, "verify_job", lambda env, keys, node, now: job_payload(node="g2"))
+    monkeypatch.setattr(L.protocol, "verify_job", lambda env, keys, node, now, kg: job_payload(node="g2"))
     rt = ag._runtime()
     ag._run_job(rt, {})
     assert client.posted[0][1]["reason_code"] == "FAIL_EXEC" and client.posted[0][1]["status"] == "failed" and any("unexpected" in m for m in ag.logs)
@@ -546,7 +546,7 @@ def test_policy_holder_dedupes_log_lines_and_handles_missing_dir(tmp_path):
     from forge_node.agent.config import AgentConfig
     cfg = AgentConfig("g2", "127.0.0.1", 1, "/c", "/k", "/ca", str(tmp_path / "nopolicy"), str(tmp_path / "signers"), str(tmp_path), "/s", os.getuid(), os.getuid(), "/")
     logs = []
-    h = L.PolicyHolder(cfg, lambda: NOW, logs.append)
+    h = L.PolicyHolder(cfg, lambda: NOW, logs.append, "ssh-keygen")
     assert h.refresh() == (None, False) and h.refresh() == (None, False)
     assert logs == []                                                         # nothing was ever installed: silent
     (tmp_path / "nopolicy").mkdir()
@@ -557,7 +557,7 @@ def test_policy_holder_dedupes_log_lines_and_handles_missing_dir(tmp_path):
     h.refresh()
     assert len(logs) == 1
     assert h._signature() is not None
-    assert L.PolicyHolder(AgentConfig("g2", "127.0.0.1", 1, "/c", "/k", "/ca", "/definitely/not/here", "/s", "/st", "/p", 0, 0, "/"), lambda: NOW, logs.append)._signature() is None
+    assert L.PolicyHolder(AgentConfig("g2", "127.0.0.1", 1, "/c", "/k", "/ca", "/definitely/not/here", "/s", "/st", "/p", 0, 0, "/"), lambda: NOW, logs.append, "ssh-keygen")._signature() is None
 
 
 def test_selfcheck_ok_when_everything_required_is_present(tmp_path):
@@ -574,7 +574,7 @@ def test_reconcile_requests_are_logged_not_acted_on_and_invalid_results_become_f
     ag = stub_agent(tmp_path, client)
     rt = ag._runtime()
     from conftest import lease_payload, job_payload
-    monkeypatch.setattr(L.protocol, "verify_lease", lambda env, keys, node, now, last: lease_payload(node="g2", seq=last + 1))
+    monkeypatch.setattr(L.protocol, "verify_lease", lambda env, keys, node, now, last, kg: lease_payload(node="g2", seq=last + 1))
     resp = {"v": 1, "lease": {}, "jobs": [], "reconcile": ["x"], "policy_serial_latest": 0, "server_time": "2026-10-31T13:40:10Z"}
     assert ag._handle(rt, resp) == "idle" and any("no ledger" in m for m in ag.logs)
 
@@ -584,7 +584,7 @@ def test_reconcile_requests_are_logged_not_acted_on_and_invalid_results_become_f
         def execute(self, *a):
             return L.Outcome("committed", "DENY_STOP", "x")          # committed with a reason code is not a valid result
     ag2 = stub_agent(tmp_path / "w", StubClient(), engine=Weird())
-    monkeypatch.setattr(L.protocol, "verify_job", lambda env, keys, node, now: job_payload(node="g2"))
+    monkeypatch.setattr(L.protocol, "verify_job", lambda env, keys, node, now, kg: job_payload(node="g2"))
     ag2._run_job(ag2._runtime(), {})
     posted = ag2.rt.client.posted[0][1]
     assert posted["status"] == "failed" and posted["reason_code"] == "FAIL_EXEC" and any("invalid" in m for m in ag2.logs)

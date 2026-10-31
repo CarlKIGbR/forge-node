@@ -70,7 +70,7 @@ def rig(pki, certs, hub, hubcfg, adm, clock, gate, owner, tmp_path):
         cfg = AgentConfig("g2", "127.0.0.1", srv.server_address[1], str(certs["g2"][1]), str(certs["g2"][0]), str(pki.ca_crt), str(tmp_path / "policy"), str(signers), str(tmp_path / "state"),
                           str(tmp_path / "nosock"), os.getuid(), os.getuid(), str(tmp_path / "root"))
         os.makedirs(tmp_path / "state", exist_ok=True)
-        return agent_main.build(cfg, runner=r.runner, clock=clock, log=r.logs.append, probe=r.probe)
+        return agent_main.build(cfg, runner=r.runner, clock=clock, log=r.logs.append, probe=r.probe, ssh_keygen="ssh-keygen")
     r.make_agent = make_agent
     r.enqueue = lambda op, tier=0, **params: hub.enqueue_job(JobRequest(node="g2", tier=tier, op=op, params=params)).job_id
     yield r

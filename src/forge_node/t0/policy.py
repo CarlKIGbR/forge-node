@@ -201,7 +201,7 @@ def _read_root_file(dirfd: int, name: str, limit: int, owner_uid: int) -> bytes:
         os.close(fd)
 
 
-def load_installed(policy_dir: str, allowed_signers_path: str, node: str, now: datetime, *, owner_uid: int, ssh_keygen: str = "ssh-keygen") -> PolicyView:
+def load_installed(policy_dir: str, allowed_signers_path: str, node: str, now: datetime, *, owner_uid: int, ssh_keygen: str) -> PolicyView:
     """The installed policy is the highest serial in `policy_dir`. If that one does not verify there is NO policy (fail closed): falling back to an older file would be the
     downgrade the monotonic serial exists to prevent. Raises PolicyError."""
     try:
@@ -223,14 +223,14 @@ def load_installed(policy_dir: str, allowed_signers_path: str, node: str, now: d
     finally:
         os.close(dfd)
     try:
-        signers = _read_signers(allowed_signers_path, owner_uid)
+        signers = read_signers(allowed_signers_path, owner_uid)
         sshsig.verify(raw, sig.decode("ascii"), sshsig.NS_POLICY, OWNER_PRINCIPAL, signers, ssh_keygen)
     except (sshsig.SigError, UnicodeDecodeError, OSError) as e:
         raise PolicyError("DENY_POLICY_INVALID", f"policy signature invalid ({type(e).__name__})") from e
     return parse_policy(raw, node, serial, now)
 
 
-def _read_signers(path: str, owner_uid: int) -> str:
+def read_signers(path: str, owner_uid: int) -> str:
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         st = os.fstat(fd)
@@ -241,7 +241,7 @@ def _read_signers(path: str, owner_uid: int) -> str:
         os.close(fd)
 
 
-def verify_blob(raw: bytes, sig: str, allowed_signers: str, node: str, serial: int, now: datetime, ssh_keygen: str = "ssh-keygen") -> PolicyView:
+def verify_blob(raw: bytes, sig: str, allowed_signers: str, node: str, serial: int, now: datetime, ssh_keygen: str) -> PolicyView:
     """For a policy blob downloaded from the hub (staging): same checks as for the installed file, applied to the bytes in memory."""
     if len(raw) > MAX_POLICY_BYTES:
         _bad("policy blob too large")

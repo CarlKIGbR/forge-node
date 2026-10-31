@@ -54,7 +54,7 @@ class FakeRunner:
         self.avail = available
         self.calls: list[tuple[str, dict]] = []
 
-    def run(self, cmd_id, slots=None, stdin=None):
+    def run(self, cmd_id, slots=None, stdin=None, max_wait_s=None):
         assert cmd_id in runner_mod.CMDS, f"unknown command id {cmd_id}"
         self.calls.append((cmd_id, dict(slots or {})))
         r = self.script.get(cmd_id)

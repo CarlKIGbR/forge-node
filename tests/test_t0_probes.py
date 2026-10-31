@@ -30,7 +30,7 @@ def test_unknown_probe_and_non_object_params_rejected(tmp_path):
     with pytest.raises(ProbeError) as e:
         run_probe("net", [], env)
     assert e.value.code == "DENY_PARAM"
-    for name in ("net", "vms", "certs", "git", "access", "models", "activity"):
+    for name in ("net", "firewall", "vms", "certs", "git", "access", "models", "activity", "container_net"):
         with pytest.raises(ProbeError) as e:
             run_probe(name, {"x": 1}, env)
         assert e.value.code == "DENY_PARAM", name
@@ -48,19 +48,26 @@ def test_heavy_probes_refuse_inside_the_blackout_window_at_execution_time(tmp_pa
 
 
 # ------------------------------------------------------------------------------------------------------------------------------------ net
-def test_net_probe_lists_listeners_with_process_names_and_docker_user_rules(tmp_path):
-    r = FakeRunner({"ss_listen_procs": 'tcp LISTEN 0 4096 192.168.10.4:8094 0.0.0.0:* users:(("python3",pid=1,fd=3))\n', "iptables_docker_user": "-N DOCKER-USER\n-A DOCKER-USER -s 192.168.10.0/29 -p tcp -m tcp --dport 8094 -j ACCEPT\n-A DOCKER-USER -j RETURN\n"})
-    n = run_probe("net", {}, env_with(tmp_path, r))
-    assert n["listeners"]["listeners"][0]["processes"] == ["python3"] and n["listeners"]["processes_visible"] and n["docker_user"]["count"] == 3
-    r = FakeRunner({"ss_listen_procs": "", "iptables_docker_user": Run(False, "nonzero", 1, b"", "chain missing")})
-    assert run_probe("net", {}, env_with(tmp_path, r))["docker_user"]["status"] == "error"
+def test_net_probe_lists_listeners_with_process_names_and_firewall_probe_lists_docker_user_rules(tmp_path):
+    r = FakeRunner({"ss_listen_procs": 'tcp LISTEN 0 4096 192.168.10.4:8094 0.0.0.0:* users:(("python3",pid=1,fd=3))\n',
+                    "iptables_docker_user": "-N DOCKER-USER\n-A DOCKER-USER -s 192.168.10.0/29 -p tcp -m tcp --dport 8094 -j ACCEPT\n-A DOCKER-USER -j RETURN\n"})
+    env = env_with(tmp_path, r)
+    n = run_probe("net", {}, env)
+    assert set(n) == {"listeners"} and n["listeners"]["listeners"][0]["processes"] == ["python3"] and n["listeners"]["processes_visible"]
+    f = run_probe("firewall", {}, env)
+    assert set(f) == {"docker_user"} and f["docker_user"]["count"] == 3
+    assert [c[0] for c in r.calls] == ["ss_listen_procs", "iptables_docker_user"]            # each probe runs only its own command
+    r = FakeRunner({"iptables_docker_user": Run(False, "nonzero", 1, b"", "chain missing")})
+    assert run_probe("firewall", {}, env_with(tmp_path / "b", r))["docker_user"]["status"] == "error"
 
 
 # ----------------------------------------------------------------------------------------------------------------------------- containers
 def inspect_line(cid=CID, name="/pg", image="sha256:" + "d" * 64, ref="postgres:16", state="running", restarts=2, started="2026-10-30T10:00:00Z", pid=4242, logpath="/var/lib/docker/containers/x/x-json.log",
-                 labels=None, ports=None, mounts="bind|/srv/forge/node/mnt/pg|/var/lib/postgresql|true;volume|vol1|/data|true;"):
+                 labels=None, ports=None, mounts=None):
     j = json.dumps
-    return "\t".join([j(cid), j(name), j(image), j(ref), j(state), j(restarts), j(started), j(pid), j(logpath), j(labels), j(ports), mounts])
+    if mounts is None:
+        mounts = [{"Type": "bind", "Source": "/srv/forge/node/mnt/pg", "Destination": "/var/lib/postgresql", "RW": True}, {"Type": "volume", "Name": "vol1", "Source": "/var/lib/docker/volumes/vol1/_data", "Destination": "/data", "RW": True}]
+    return "\t".join([j(cid), j(name), j(image), j(ref), j(state), j(restarts), j(started), j(pid), j(logpath), j(labels), j(ports), j(mounts)])
 
 
 def test_containers_probe_keeps_only_safe_fields_and_flags_attribution(tmp_path):
@@ -72,7 +79,7 @@ def test_containers_probe_keeps_only_safe_fields_and_flags_attribution(tmp_path)
                     "docker_image_inspect": json.dumps("sha256:" + "d" * 64) + "\t" + json.dumps(["postgres@sha256:" + "f" * 64]) + "\n"})
     env = env_with(tmp_path, r, files={"/srv/forge/fc/compose.yaml": "x", "/var/lib/docker/containers/x/x-json.log": "log\n"})
     os.utime(tmp_path / "var/lib/docker/containers/x/x-json.log", (NOW.timestamp() - 600, NOW.timestamp() - 600))
-    c = run_probe("containers", {"with_usage": True}, env)["containers"]
+    c = run_probe("containers", {}, env)["containers"]
     a, b = c["containers"]
     assert a["id"] == CID[:12] and a["name"] == "pg" and a["image_digests"] == ["postgres@sha256:" + "f" * 64] and a["ports"] == ["127.0.0.1:5432->5432/tcp"]
     assert "secret.thing" not in a["labels"] and a["labels"]["forge.project"] == "forge-core" and a["forge_managed"] and a["forge_critical"] and a["bind_sources"] == ["/srv/forge/node/mnt/pg"]
@@ -82,10 +89,9 @@ def test_containers_probe_keeps_only_safe_fields_and_flags_attribution(tmp_path)
 
 
 def test_containers_probe_never_requests_env_cmd_and_params_are_closed(tmp_path):
-    with pytest.raises(ProbeError):
-        run_probe("containers", {"env": True}, env_with(tmp_path))
-    with pytest.raises(ProbeError):
-        run_probe("containers", {"with_usage": "yes"}, env_with(tmp_path))
+    for params in ({"env": True}, {"with_usage": True}):
+        with pytest.raises(ProbeError):
+            run_probe("containers", params, env_with(tmp_path))
     assert run_probe("containers", {}, env_with(tmp_path, FakeRunner({})))["containers"] == {"status": "unavailable", "reason": "docker not installed"}
 
 
@@ -94,6 +100,32 @@ def test_inspect_parser_rejects_malformed_lines():
     assert probes.parse_inspect_line("\t".join(["\"nothex\""] + ["x"] * 11)) is None
     ok = probes.parse_inspect_line(inspect_line(labels={"a": "b"}, ports={}))
     assert ok["mounts"][0] == {"type": "bind", "source": "/srv/forge/node/mnt/pg", "destination": "/var/lib/postgresql", "rw": True}
+
+
+def test_a_container_with_tab_newline_or_separators_in_a_mount_path_is_still_inventoried(tmp_path):
+    """Review finding: a raw tab-separated mount list let a bind source containing TAB/NEWLINE/'|'/';' make the row unparsable and the container vanish. Mounts are JSON now."""
+    nasty = "/srv/x\tevil\nline|pipe;semi"
+    line = inspect_line(mounts=[{"Type": "bind", "Source": nasty, "Destination": "/d", "RW": True}], labels={"forge.project": "p"})
+    r = FakeRunner({"docker_ps_ids": CID + "\n" + "e" * 64 + "\n", "docker_inspect": line + "\n" + "garbage-row-without-fields\n"})
+    c = run_probe("containers", {}, env_with(tmp_path, r))["containers"]
+    assert c["count"] == 1 and c["unparsed"] == 1 and c["containers"][0]["bind_sources"] == [nasty]
+    assert "{{json .Mounts}}" in " ".join(runner_cmd("docker_inspect"))
+
+
+def runner_cmd(cid):
+    from forge_node.t0 import runner
+    return runner.CMDS[cid].argv
+
+
+def test_container_net_probe_reads_proc_net_dev_per_container(tmp_path):
+    r = FakeRunner({"docker_ps_ids": CID + "\n", "docker_inspect": inspect_line(pid=777) + "\n"})
+    env = env_with(tmp_path, r, files={"/proc/777/net/dev": "h\nh\n  eth0: 5000 5 0 0 0 0 0 0 7000 7 0 0 0 0 0 0\n    lo: 9 1 0 0 0 0 0 0 9 1 0 0 0 0 0 0\n"})
+    assert run_probe("container_net", {}, env)["container_net"]["containers"] == {CID[:12]: {"rx_bytes": 5000, "tx_bytes": 7000}}
+    env = env_with(tmp_path / "b", FakeRunner({"docker_ps_ids": CID + "\n", "docker_inspect": inspect_line(pid=778) + "\n"}))
+    assert run_probe("container_net", {}, env)["container_net"]["containers"] == {}
+    assert run_probe("container_net", {}, env_with(tmp_path / "c", FakeRunner({})))["container_net"]["status"] == "unavailable"
+    with pytest.raises(ProbeError):
+        run_probe("container_net", {"x": 1}, env)
 
 
 def test_log_path_outside_docker_dir_is_not_statted(tmp_path):

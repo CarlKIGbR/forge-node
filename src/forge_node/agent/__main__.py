@@ -11,7 +11,7 @@ from ..t0.env import Env
 from ..t0.engine import T0Engine
 from ..t0.fsread import Fs, ProtectedSet
 from ..t0.limits import RateLimiter
-from ..t0.runner import ReadOnlyRunner
+from ..t0.runner import ReadOnlyRunner, RunnerError, trusted_binary
 from ..t0.spool import Spool
 from ..t0.wire import SocketProbeClient
 from .client import HubClient
@@ -28,7 +28,7 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def build(cfg: AgentConfig, *, runner, clock, log, probe) -> Agent:
+def build(cfg: AgentConfig, *, runner, clock, log, probe, ssh_keygen: str) -> Agent:
     """Wire the agent. runner/clock/log/probe are required: main() passes the real ones; the tests pass fakes of the same two-method interfaces. Everything that guards is built here
     from the policy view and the config, never taken from a caller."""
     import os
@@ -43,7 +43,7 @@ def build(cfg: AgentConfig, *, runner, clock, log, probe) -> Agent:
         engine = T0Engine(node=cfg.node_id, env=env, limiter=limiter, probe=probe, spool=spool, node_cert_path=cfg.node_cert, hub_cert_der=client.hub_certificate_der)
         return Runtime(view, client, engine)
 
-    return Agent(cfg, PolicyHolder(cfg, clock, log), build_runtime, spool, lambda rt: metrics.Sampler(rt.engine.env, spool), clock, log=log)
+    return Agent(cfg, PolicyHolder(cfg, clock, log, ssh_keygen), build_runtime, spool, lambda rt: metrics.Sampler(rt.engine), clock, ssh_keygen, log=log)
 
 
 def main(argv=None) -> int:
@@ -59,7 +59,12 @@ def main(argv=None) -> int:
     except ConfigError as e:
         sys.stderr.write(f"configuration error: {e}\n")
         return 2
-    agent = build(cfg, runner=ReadOnlyRunner(), clock=_now, log=_log, probe=SocketProbeClient(cfg.priv_socket, expect_uid=cfg.owner_uid))
+    try:
+        ssh_keygen = trusted_binary("ssh-keygen")
+    except RunnerError as e:
+        sys.stderr.write(f"cannot start: {e}\n")
+        return 2
+    agent = build(cfg, runner=ReadOnlyRunner(), clock=_now, log=_log, probe=SocketProbeClient(cfg.priv_socket, expect_uid=cfg.owner_uid), ssh_keygen=ssh_keygen)
     signal.signal(signal.SIGTERM, lambda *_: agent.stop())
     signal.signal(signal.SIGINT, lambda *_: agent.stop())
     agent.run()

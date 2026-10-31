@@ -187,19 +187,19 @@ def test_probe_main_loads_the_policy_itself_and_answers_one_json_line(tmp_path, 
     signers.write_text(signers_text(owner["pub"]))
     os.chmod(signers, 0o644)
     out = io.StringIO()
-    rc = probe_main.main(["vms"], io.StringIO("{}\n"), out, node_id="g2", policy_dir=str(pol), allowed_signers=str(signers), fs_root=str(tmp_path), owner_uid=os.getuid(), now=lambda: NOW)
+    rc = probe_main.main(["vms"], io.StringIO("{}\n"), out, node_id="g2", policy_dir=str(pol), allowed_signers=str(signers), fs_root=str(tmp_path), owner_uid=os.getuid(), now=lambda: NOW, ssh_keygen="ssh-keygen")
     r = json.loads(out.getvalue())
     assert rc == 0 and r["ok"] is True and r["data"]["domains"]["status"] in ("unavailable", "ok", "error")
     out = io.StringIO()
-    assert probe_main.main(["journal"], io.StringIO('{"unit":"sshd.service"}\n'), out, node_id="g2", policy_dir=str(pol), allowed_signers=str(signers), fs_root=str(tmp_path), owner_uid=os.getuid(), now=lambda: NOW) == 0
+    assert probe_main.main(["journal"], io.StringIO('{"unit":"sshd.service"}\n'), out, node_id="g2", policy_dir=str(pol), allowed_signers=str(signers), fs_root=str(tmp_path), owner_uid=os.getuid(), now=lambda: NOW, ssh_keygen="ssh-keygen") == 0
     assert json.loads(out.getvalue())["code"] == "DENY_NOT_ALLOWLISTED"
     out = io.StringIO()
-    assert probe_main.main(["vms"], io.StringIO("{}\n"), out, node_id="g3", policy_dir=str(pol), allowed_signers=str(signers), fs_root=str(tmp_path), owner_uid=os.getuid(), now=lambda: NOW) == 1
+    assert probe_main.main(["vms"], io.StringIO("{}\n"), out, node_id="g3", policy_dir=str(pol), allowed_signers=str(signers), fs_root=str(tmp_path), owner_uid=os.getuid(), now=lambda: NOW, ssh_keygen="ssh-keygen") == 1
     assert json.loads(out.getvalue())["code"] == "DENY_POLICY_INVALID"
     out = io.StringIO()
-    assert probe_main.main(["vms", "extra"], io.StringIO(""), out, node_id="g2", policy_dir=str(pol), allowed_signers=str(signers), fs_root=str(tmp_path), owner_uid=os.getuid(), now=lambda: NOW) == 2
+    assert probe_main.main(["vms", "extra"], io.StringIO(""), out, node_id="g2", policy_dir=str(pol), allowed_signers=str(signers), fs_root=str(tmp_path), owner_uid=os.getuid(), now=lambda: NOW, ssh_keygen="ssh-keygen") == 2
     out = io.StringIO()
-    assert probe_main.main(["vms"], io.StringIO("not json\n"), out, node_id="g2", policy_dir=str(pol), allowed_signers=str(signers), fs_root=str(tmp_path), owner_uid=os.getuid(), now=lambda: NOW) == 2
+    assert probe_main.main(["vms"], io.StringIO("not json\n"), out, node_id="g2", policy_dir=str(pol), allowed_signers=str(signers), fs_root=str(tmp_path), owner_uid=os.getuid(), now=lambda: NOW, ssh_keygen="ssh-keygen") == 2
 
 
 @pytest.mark.parametrize("op,params,ok", [

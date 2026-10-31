@@ -3,6 +3,7 @@ inv.net, inv.certs, inv.usage. Every section returns a status dict; one failing 
 import os
 import re
 import threading
+import time
 from datetime import datetime
 from fnmatch import fnmatchcase
 
@@ -21,32 +22,50 @@ def _rd(env: Env, path: str, limit: int = 1024 * 1024) -> str | None:
 
 
 # ------------------------------------------------------------------------------------------------------------------------ inv.host
+def _from(env: Env, path: str, build, limit: int = 1024 * 1024) -> dict:
+    """A section from one file: `unavailable` (never an empty `ok`) when the file cannot be read or yields nothing - an `ok` section must carry data."""
+    try:
+        text = env.fs.read_text(path, limit)
+    except FsError as e:
+        return unavailable(f"{path}: {e.code}")
+    data = build(text)
+    if not data or all(v is None for v in data.values()):
+        return unavailable(f"{path}: nothing parsable")
+    return ok(**data)
+
+
 def host(env: Env) -> dict:
-    mem = parse.meminfo(_rd(env, "/proc/meminfo") or "")
-    cpu = parse.cpuinfo(_rd(env, "/proc/cpuinfo") or "")
-    osr = parse.os_release(_rd(env, "/etc/os-release") or "")
-    up = parse.uptime(_rd(env, "/proc/uptime") or "")
     td = env.runner.run("timedatectl")
     ntp = parse.timedatectl(td.text) if td.ok else None
     rr = env.fs.exists("/var/run/reboot-required") or env.fs.exists("/run/reboot-required")
-    sections = {
-        "os": ok(**osr),
-        "kernel": ok(release=(_rd(env, "/proc/sys/kernel/osrelease") or "").strip()),
-        "hostname": ok(name=(_rd(env, "/proc/sys/kernel/hostname") or "").strip()),
-        "uptime": ok(seconds=up) if up is not None else unavailable("/proc/uptime unreadable"),
-        "load": ok(**parse.loadavg(_rd(env, "/proc/loadavg") or "")),
-        "cpu": ok(**cpu),
-        "memory": ok(ram_total=mem.get("MemTotal"), ram_available=mem.get("MemAvailable"), swap_total=mem.get("SwapTotal"), swap_free=mem.get("SwapFree"),
-                     swap_used=(mem["SwapTotal"] - mem["SwapFree"]) if "SwapTotal" in mem and "SwapFree" in mem else None),
+
+    def memory(text):
+        mem = parse.meminfo(text)
+        return {"ram_total": mem.get("MemTotal"), "ram_available": mem.get("MemAvailable"), "swap_total": mem.get("SwapTotal"), "swap_free": mem.get("SwapFree"),
+                "swap_used": (mem["SwapTotal"] - mem["SwapFree"]) if "SwapTotal" in mem and "SwapFree" in mem else None}
+    return {
+        "os": _from(env, "/etc/os-release", parse.os_release),
+        "kernel": _from(env, "/proc/sys/kernel/osrelease", lambda t: {"release": t.strip() or None}),
+        "hostname": _from(env, "/proc/sys/kernel/hostname", lambda t: {"name": t.strip() or None}),
+        "uptime": _from(env, "/proc/uptime", lambda t: {"seconds": parse.uptime(t)}),
+        "load": _from(env, "/proc/loadavg", parse.loadavg),
+        "cpu": _from(env, "/proc/cpuinfo", parse.cpuinfo),
+        "memory": _from(env, "/proc/meminfo", memory),
         "time": ok(**ntp) if ntp else run_failure(td),
         "reboot_required": ok(required=rr),
     }
-    return sections
 
 
 # ----------------------------------------------------------------------------------------------------------------------- inv.disks
+_HUNG: dict[str, float] = {}
+HUNG_MEMORY_S = 600.0
+DF_BUDGET_S = 8.0
+
+
 def _statvfs(path: str, timeout: float = 3.0) -> dict | None:
-    """statvfs in a helper thread: a dead NFS server must cost 3 s, not hang the agent."""
+    """statvfs in a helper thread: a dead NFS server must cost 3 s once, not hang the agent - and not again for the next ten minutes (every hung call leaves a blocked thread)."""
+    if time.monotonic() - _HUNG.get(path, -HUNG_MEMORY_S) < HUNG_MEMORY_S:
+        return {"unresponsive": True, "remembered": True}
     res: list = []
 
     def work():
@@ -59,7 +78,10 @@ def _statvfs(path: str, timeout: float = 3.0) -> dict | None:
     t = threading.Thread(target=work, daemon=True)
     t.start()
     t.join(timeout)
-    return res[0] if res else {"unresponsive": True}
+    if not res:
+        _HUNG[path] = time.monotonic()
+        return {"unresponsive": True}
+    return res[0]
 
 
 def disks(env: Env, statvfs=_statvfs) -> dict:
@@ -70,6 +92,7 @@ def disks(env: Env, statvfs=_statvfs) -> dict:
     out["block_devices"] = ok(devices=parse.lsblk(lb.text)) if lb.ok else run_failure(lb)
     if fm.ok:
         mnts = []
+        t_df_end = time.monotonic() + DF_BUDGET_S
         for m in parse.findmnt(fm.text):
             if m["fstype"] in ("proc", "sysfs", "cgroup2", "devpts", "devtmpfs", "tmpfs", "securityfs", "pstore", "bpf", "tracefs", "debugfs", "mqueue", "hugetlbfs", "fusectl", "configfs", "autofs", "binfmt_misc", "overlay", "squashfs", "nsfs", "ramfs", "efivarfs"):
                 continue
@@ -77,7 +100,7 @@ def disks(env: Env, statvfs=_statvfs) -> dict:
             hit = prot.hit(norm_abs(t)) if t.startswith("/") else None
             e = {"target": t, "source": m["source"], "fstype": m["fstype"], "options": m["options"], "protected": bool(hit), "role": "kmu-protected" if hit else None}
             if len(mnts) < 120:
-                e["df"] = statvfs(t)
+                e["df"] = statvfs(t) if time.monotonic() < t_df_end else {"skipped": "budget"}
             mnts.append(e)
         out["mounts"] = ok(mounts=mnts[:200], truncated=len(mnts) > 200)
     else:

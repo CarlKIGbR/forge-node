@@ -18,7 +18,7 @@ def signers(tmp_path, owner):
 
 
 def load(tmp_path, signers, node="g2", now=NOW):
-    return P.load_installed(str(tmp_path / "policy"), signers, node, now, owner_uid=os.getuid())
+    return P.load_installed(str(tmp_path / "policy"), signers, node, now, owner_uid=os.getuid(), ssh_keygen="ssh-keygen")
 
 
 def test_installed_signed_policy_loads_and_exposes_what_the_agent_uses(tmp_path, owner, signers):
@@ -149,7 +149,7 @@ def test_empty_missing_directory_and_unsafe_allowed_signers(tmp_path, owner, sig
         load(tmp_path, signers)
     assert "no policy" in e.value.detail
     with pytest.raises(P.PolicyError):
-        P.load_installed(str(tmp_path / "nope"), signers, "g2", NOW, owner_uid=os.getuid())
+        P.load_installed(str(tmp_path / "nope"), signers, "g2", NOW, owner_uid=os.getuid(), ssh_keygen="ssh-keygen")
     install_policy(tmp_path / "policy", policy_doc(), owner["priv"])
     os.chmod(signers, 0o666)
     with pytest.raises(P.PolicyError):
@@ -171,13 +171,13 @@ def test_verify_blob_for_hub_delivered_policy(owner, signers):
     raw = json.dumps(policy_doc(serial=7)).encode()
     sig = sshsig.sign(raw, owner["priv"], sshsig.NS_POLICY)
     text = open(signers).read()
-    assert P.verify_blob(raw, sig, text, "g2", 7, NOW).serial == 7
+    assert P.verify_blob(raw, sig, text, "g2", 7, NOW, "ssh-keygen").serial == 7
     with pytest.raises(P.PolicyError):
-        P.verify_blob(raw + b" ", sig, text, "g2", 7, NOW)
+        P.verify_blob(raw + b" ", sig, text, "g2", 7, NOW, "ssh-keygen")
     with pytest.raises(P.PolicyError):
-        P.verify_blob(raw, sig, text, "g2", 8, NOW)
+        P.verify_blob(raw, sig, text, "g2", 8, NOW, "ssh-keygen")
     with pytest.raises(P.PolicyError):
-        P.verify_blob(b"x" * (P.MAX_POLICY_BYTES + 1), sig, text, "g2", 7, NOW)
+        P.verify_blob(b"x" * (P.MAX_POLICY_BYTES + 1), sig, text, "g2", 7, NOW, "ssh-keygen")
 
 
 def test_old_gate_key_signatures_rejected_after_policy_serial_plus_one(gate, gate2):

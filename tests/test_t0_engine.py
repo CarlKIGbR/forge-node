@@ -36,7 +36,7 @@ class FakeProbe:
             raise r
         if callable(r):
             return r(params)
-        return r if r is not None else {name: {"status": "ok"}}
+        return r if r is not None else {sec: {"status": "ok"} for sec in E.PROBE_SECTIONS[name]}
 
 
 def make(tmp_path, runner=None, probe=None, t0=None, now=NOW, files=None):
@@ -141,10 +141,11 @@ def test_unreachable_privd_degrades_sections_and_still_commits(tmp_path):
 
 def test_inv_net_falls_back_to_unprivileged_listeners_without_process_names(tmp_path):
     r = FakeRunner({"ip_route": "[]", "ss_listen": "tcp LISTEN 0 1 127.0.0.1:22 0.0.0.0:*\n"})
-    eng, *_ = make(tmp_path, r, FakeProbe({"net": ProbeUnavailable("down")}))
+    eng, *_ = make(tmp_path, r, FakeProbe({"net": ProbeUnavailable("down"), "firewall": ProbeUnavailable("down")}))
     d = data(eng.execute("inv.net", 0, {}))
     assert d["listeners"]["processes_visible"] is False and d["docker_user"]["status"] == "unavailable"
-    eng, *_ = make(tmp_path / "b" if (tmp_path / "b").mkdir() is None else tmp_path, r, FakeProbe({"net": {"listeners": {"status": "ok", "listeners": [], "processes_visible": True}, "docker_user": {"status": "ok", "rules": [], "count": 0}}}))
+    (tmp_path / "b").mkdir()
+    eng, *_ = make(tmp_path / "b", r, FakeProbe({"net": {"listeners": {"status": "ok", "listeners": [], "processes_visible": True}}, "firewall": {"docker_user": {"status": "ok", "rules": [], "count": 0}}}))
     assert data(eng.execute("inv.net", 0, {}))["listeners"]["processes_visible"] is True
 
 
@@ -237,7 +238,7 @@ def test_no_function_in_the_t0_layer_or_agent_has_an_optional_guard_input():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1] / "src" / "forge_node"
     guards = {"pins", "pin", "limiter", "window", "policy", "probe", "gates", "gate_set", "force", "skip", "unsafe", "bypass", "insecure", "verify", "check", "trust", "override", "clock", "now", "owner_uid",
-              "expect_uid", "allowed_signers", "protected", "env"}
+              "expect_uid", "allowed_signers", "protected", "env", "ssh_keygen", "runner", "engine"}
     offenders = []
     for p in list((root / "t0").glob("*.py")) + list((root / "agent").glob("*.py")):
         for n in ast.walk(ast.parse(p.read_text())):

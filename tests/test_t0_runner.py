@@ -99,11 +99,56 @@ def test_runs_with_fixed_environment_no_shell_no_stdin(fakebin):
 
 
 def test_argument_with_shell_metacharacters_is_one_argv_element(fakebin):
-    fakebin("du", 'for a in "$@"; do echo "[$a]"; done')
-    fakebin("nice", 'shift 2; exec "$@"')
-    fakebin("ionice", 'shift; exec "$@"')
-    r = runner.run("du_ionice", {"path": "/tmp/a b,c=d"})
-    assert "[/tmp/a b,c=d]" in r.text
+    fakebin("ionice", 'for a in "$@"; do echo "[$a]"; done')
+    for weird in ("/tmp/a b,c=d", "/srv/models/Qwen3 (Q4)", "/srv/models/M\u00fcnchen", "/srv/models/a&b;c", "/srv/models/$(id)", "/srv/models/'q'"):
+        r = runner.run("du_ionice", {"path": weird})
+        assert r.ok and f"[{weird}]" in r.text.splitlines(), weird
+    for bad in ("/srv/models/a\nb", "/srv/models/a\x01b", "/srv/models/../etc", "relative"):
+        with pytest.raises(runner.RunnerError):
+            runner.run("du_ionice", {"path": bad})
+
+
+def test_programs_the_command_itself_starts_are_part_of_the_trust_check(fakebin):
+    fakebin("ionice", "echo ok")
+    assert runner.run("du_ionice", {"path": "/tmp"}).ok
+    cmd = runner.CMDS["du_ionice"]
+    object.__setattr__(cmd, "extra_binaries", ("/usr/bin/nice", "/nonexistent/du"))
+    try:
+        assert runner.run("du_ionice", {"path": "/tmp"}).reason == "untrusted_binary" and not runner.ReadOnlyRunner().available("du_ionice")
+    finally:
+        object.__setattr__(cmd, "extra_binaries", ("/usr/bin/nice", "/usr/bin/du"))
+
+
+def test_binary_in_a_group_writable_directory_is_untrusted_but_sticky_root_dirs_are_fine(fakebin, tmp_path):
+    p = fakebin("lsblk", "echo hi")
+    assert runner.run("lsblk").ok                                  # fake dir under root-owned, sticky /tmp
+    os.chmod(p.parent, 0o775)
+    assert runner.run("lsblk").reason == "untrusted_binary"
+    os.chmod(p.parent, 0o755)
+    sub = p.parent / "sub"
+    sub.mkdir()
+    os.chmod(sub, 0o777)
+    assert runner.run("lsblk").ok                                  # a writable directory NEXT to the binary does not matter, only the ones above it
+
+
+def test_max_wait_can_only_shorten_the_timeout(fakebin):
+    fakebin("lsblk", "/usr/bin/sleep 5")
+    t0 = time.monotonic()
+    assert runner.run("lsblk", max_wait_s=0.5).reason == "timeout" and time.monotonic() - t0 < 4
+    t0 = time.monotonic()
+    fakebin("findmnt", "/usr/bin/sleep 2; echo done")
+    assert runner.run("findmnt", max_wait_s=3600).ok and time.monotonic() - t0 < 10        # a huge value does not extend the table's own timeout
+
+
+def test_git_gets_explicit_git_dir_and_common_dir_and_ignores_submodules(fakebin):
+    fakebin("git", '/usr/bin/env | /usr/bin/sort | /usr/bin/grep -E "^GIT_(DIR|COMMON_DIR)="; echo "$*"')
+    r = runner.run("git_status_tracked", {"repo": "/srv/my repo"})
+    assert "GIT_DIR=/srv/my repo/.git" in r.text and "GIT_COMMON_DIR=/srv/my repo/.git" in r.text and "--ignore-submodules=all" in r.text
+
+
+def test_every_declared_slot_must_be_used_in_the_argv():
+    with pytest.raises(runner.RunnerError):
+        runner._expand(runner.Cmd("x", ("a",), slots=(("p", "int"),)), {"p": "1"})
 
 
 def test_missing_binary_is_reported_not_raised(fakebin):

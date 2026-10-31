@@ -16,6 +16,16 @@ class Env:
     policy: PolicyView
 
 
+def run_slots(runner, cmd_id: str, slots: dict, max_wait_s: float | None = None):
+    """Run a table command whose slot values come from the filesystem (directory names, repository paths): a name the table refuses (control characters, '..') is a per-item
+    'bad_slot' result, never an exception that would take the whole probe down."""
+    from .runner import Run, RunnerError
+    try:
+        return runner.run(cmd_id, slots, None, max_wait_s)
+    except RunnerError:
+        return Run(False, "bad_slot")
+
+
 def ok(**data) -> dict:
     return {"status": "ok", **data}
 

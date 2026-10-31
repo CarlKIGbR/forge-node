@@ -5,11 +5,11 @@ A probe takes ONLY a name and a small parameter object. Everything that decides 
 window - comes from the root-installed, signature-checked policy loaded by the probe process, never from the request: whatever the agent sends is untrusted input."""
 import re
 from . import parse
-from .env import Env, failed, ok, run_failure, unavailable
+from .env import Env, failed, ok, run_failure, run_slots, unavailable
 from .fsread import FsError, norm_abs, under
 
 HEAVY_PROBES = frozenset({"models", "git"})
-PROBE_NAMES = ("net", "containers", "vms", "certs", "git", "access", "models", "journal", "activity", "uulog")
+PROBE_NAMES = ("net", "firewall", "containers", "container_net", "vms", "certs", "git", "access", "models", "journal", "activity", "uulog")
 _SAFE_GIT_FILES = re.compile(r"^/.{1,4000}/\.git/(?:HEAD|packed-refs|config|refs/heads/[A-Za-z0-9._/-]{1,200}|refs/remotes/[A-Za-z0-9._/-]{1,200})\Z")
 _JOURNAL_BUDGET = 48 * 1024
 
@@ -38,17 +38,19 @@ def _no_params(params: dict):
 
 # ---------------------------------------------------------------------------------------------------------------------------- net
 def _probe_net(params: dict, env: Env) -> dict:
+    """Listening sockets WITH process names (`ss -p`: needs CAP_SYS_PTRACE). The firewall rules are a separate probe (CAP_NET_ADMIN)."""
     _no_params(params)
-    out: dict = {}
     r = env.runner.run("ss_listen_procs")
-    out["listeners"] = ok(listeners=parse.ss(r.text)[:300], processes_visible=True) if r.ok else run_failure(r)
+    return {"listeners": ok(listeners=parse.ss(r.text)[:300], processes_visible=True) if r.ok else run_failure(r)}
+
+
+def _probe_firewall(params: dict, env: Env) -> dict:
+    _no_params(params)
     ipt = env.runner.run("iptables_docker_user")
     if ipt.ok:
         rules = [l for l in ipt.text.splitlines() if l.startswith("-")][:200]
-        out["docker_user"] = ok(rules=rules, count=len(rules))
-    else:
-        out["docker_user"] = run_failure(ipt)
-    return out
+        return {"docker_user": ok(rules=rules, count=len(rules))}
+    return {"docker_user": run_failure(ipt)}
 
 
 # ------------------------------------------------------------------------------------------------------------------------ containers
@@ -77,10 +79,10 @@ def parse_inspect_line(line: str) -> dict | None:
                 if isinstance(b, dict):
                     pubs.append(f"{b.get('HostIp', '')}:{b.get('HostPort', '')}->{cport}")
     mts = []
-    for m in mounts.split(";"):
-        q = m.split("|")
-        if len(q) == 4:
-            mts.append({"type": q[0], "source": q[1], "destination": q[2], "rw": q[3] == "true"})
+    mj = _json_field(mounts)
+    for m in mj if isinstance(mj, list) else []:
+        if isinstance(m, dict):
+            mts.append({"type": m.get("Type"), "source": m.get("Source"), "destination": m.get("Destination"), "rw": m.get("RW") is True})
     return {"id": cid_v, "short": cid_v[:12], "name": str(_json_field(name) or "").lstrip("/"), "image_id": _json_field(image), "image": _json_field(image_ref),
             "state": _json_field(state), "restarts": _json_field(restarts), "started_at": _json_field(started), "pid": _json_field(pid), "log_path": _json_field(logpath),
             "labels": lab if isinstance(lab, dict) else {}, "ports": sorted(pubs), "mounts": mts}
@@ -89,27 +91,27 @@ def parse_inspect_line(line: str) -> dict | None:
 _LABEL_KEEP = re.compile(r"^(forge\.[a-z0-9._-]{1,48}|com\.docker\.compose\.(?:project|service|project\.working_dir|project\.config_files)|org\.opencontainers\.image\.(?:title|version|source|revision))\Z")
 
 
-def _containers(env: Env) -> tuple[list[dict], str | None]:
+def _containers(env: Env) -> tuple[list[dict], str | None, int]:
+    """(rows, error, skipped): `skipped` = containers docker listed that could not be parsed - reported, never silently dropped."""
     ids = env.runner.run("docker_ps_ids")
     if not ids.ok:
-        return [], ids.reason
+        return [], ids.reason, 0
     all_ids = [x for x in ids.text.split() if re.match(r"^[0-9a-f]{64}$", x)]
     rows = []
     for i in range(0, min(len(all_ids), 400), 40):
         r = env.runner.run("docker_inspect", {"id": all_ids[i:i + 40]})
         if not r.ok:
-            return rows, r.reason
+            return rows, r.reason, 0
         for line in r.text.splitlines():
             row = parse_inspect_line(line)
             if row:
                 rows.append(row)
-    return rows, None
+    return rows, None, max(0, min(len(all_ids), 400) - len(rows))
 
 
 def _probe_containers(params: dict, env: Env) -> dict:
-    if set(params) - {"with_usage"} or not isinstance(params.get("with_usage", False), bool):
-        raise ProbeError("DENY_PARAM", "only with_usage:boolean is allowed")
-    rows, err = _containers(env)
+    _no_params(params)
+    rows, err, skipped = _containers(env)
     if err:
         return {"containers": unavailable("docker not installed") if err == "missing" else failed(err)}
     digests: dict = {}
@@ -127,7 +129,7 @@ def _probe_containers(params: dict, env: Env) -> dict:
     for r in rows:
         labels = {k: v for k, v in r["labels"].items() if _LABEL_KEEP.match(str(k))}
         e = {"id": r["short"], "name": r["name"], "image": r["image"], "image_id": r["image_id"], "image_digests": digests.get(r["image_id"], [])[:3], "state": r["state"],
-             "restarts": r["restarts"], "started_at": r["started_at"], "labels": labels, "ports": r["ports"][:20], "bind_sources": sorted({m["source"] for m in r["mounts"] if m["type"] == "bind"})[:20],
+             "restarts": r["restarts"], "started_at": r["started_at"], "labels": labels, "ports": r["ports"][:20], "bind_sources": sorted({m["source"] for m in r["mounts"] if m["type"] == "bind" and isinstance(m["source"], str)})[:20],
              "forge_managed": labels.get("forge.managed") == "true", "forge_critical": labels.get("forge.critical") == "true"}
         # attribution for the Revision (Design 4.1 inv.usage): project, compose context, owner of the working directory; unattributed when nothing says who owns it
         wd = labels.get("com.docker.compose.project.working_dir")
@@ -145,16 +147,27 @@ def _probe_containers(params: dict, env: Env) -> dict:
                 e["last_log_age_s"] = max(0, int(now - env.fs.stat_meta(norm_abs(lp))["mtime"]))
             except FsError:
                 e["last_log_age_s"] = None
-        if params.get("with_usage") and isinstance(r["pid"], int) and r["pid"] > 1:
-            nd = None
+        out.append(e)
+    return {"containers": ok(containers=out, count=len(out), unparsed=skipped, truncated=len(rows) >= 400)}
+
+
+def _probe_container_net(params: dict, env: Env) -> dict:
+    """Per container network byte counters, read from /proc/<pid>/net/dev of the container's init process. Needs CAP_SYS_PTRACE (other users' /proc entries), so it is its own
+    probe: the plain `containers` inventory does not get that capability."""
+    _no_params(params)
+    rows, err, _ = _containers(env)
+    if err:
+        return {"container_net": unavailable("docker not installed") if err == "missing" else failed(err)}
+    out = {}
+    for r in rows:
+        if isinstance(r["pid"], int) and r["pid"] > 1:
             try:
                 nd = parse.net_dev(env.fs.read_text(f"/proc/{r['pid']}/net/dev"))
             except FsError:
-                pass
-            if nd is not None:
-                e["net"] = {"rx_bytes": sum(v["rx_bytes"] for v in nd.values()), "tx_bytes": sum(v["tx_bytes"] for v in nd.values())}
-        out.append(e)
-    return {"containers": ok(containers=out, count=len(out), truncated=len(rows) >= 400)}
+                continue
+            if nd:
+                out[r["short"]] = {"rx_bytes": sum(v["rx_bytes"] for v in nd.values()), "tx_bytes": sum(v["tx_bytes"] for v in nd.values())}
+    return {"container_net": ok(containers=out)}
 
 
 # -------------------------------------------------------------------------------------------------------------------------------- vms
@@ -189,7 +202,11 @@ def _probe_certs(params: dict, env: Env) -> dict:
                     f_real = env.fs.resolve_dir(f)
                 except FsError:
                     continue
-                r = env.runner.run("openssl_x509_file", {"path": f_real})
+                # a link in a cert directory (letsencrypt/live -> archive) is followed, but the TARGET must look like a certificate file and not be protected
+                if not _CERT_FILE.match(f_real.rsplit("/", 1)[-1]) or env.fs.protected.hit(f_real):
+                    row["certs"].append({"file": f.rsplit("/", 1)[-1], "error": "target_not_a_certificate_name"})
+                    continue
+                r = run_slots(env.runner, "openssl_x509_file", {"path": f_real}, 10)
                 if r.ok:
                     d = parse.x509(r.text)
                     if d.get("not_after_epoch") is not None:
@@ -217,6 +234,7 @@ _SAFE_CONFIG = {
     "pull": {"rebase", "ff"},
     "push": {"default"},
     "init": {"defaultbranch"},
+    "submodule": {"active", "url", "branch", "ignore", "fetchrecursesubmodules"},       # inert: `git status` runs with --ignore-submodules=all and never reads a submodule's own config
 }
 
 
@@ -284,12 +302,15 @@ def _probe_git(params: dict, env: Env) -> dict:
             row.update(_git_rev(env, real))
             cfg_before = env.fs.read_exception(f"{real}/.git/config", _SAFE_GIT_FILES)
             safe, why = git_config_is_safe(cfg_before)
+            for extra in ("commondir", "config.worktree"):          # config from somewhere else than the scanned file: such a layout is not run at all
+                if safe and env.fs.exists_unfiltered(f"{real}/.git/{extra}"):
+                    safe, why = False, f".git/{extra} present"
             if not safe:
                 row["dirty_tracked"], row["dirty_status"], row["dirty_reason"] = None, "skipped_unsafe_config", why
             elif env.now().timestamp() >= t_end:
                 row["dirty_tracked"], row["dirty_status"] = None, "skipped_budget"
             else:
-                r = env.runner.run("git_status_tracked", {"repo": real})
+                r = run_slots(env.runner, "git_status_tracked", {"repo": real}, max(5.0, t_end - env.now().timestamp()))
                 # the config is writable by the repository's owner, who is not trusted: read it again AFTER the run and discard the result if it changed in between
                 if env.fs.read_exception(f"{real}/.git/config", _SAFE_GIT_FILES) != cfg_before:
                     row["dirty_tracked"], row["dirty_status"] = None, "config_changed_during_read"
@@ -336,7 +357,7 @@ def _probe_access(params: dict, env: Env) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------------------------------------- models
-MODELS_DU_BUDGET_S = 150
+MODELS_DU_BUDGET_S = 150          # + the last du may use what is left of it: total < RuntimeMaxSec (240)
 
 
 def _probe_models(params: dict, env: Env) -> dict:
@@ -362,9 +383,12 @@ def _probe_models(params: dict, env: Env) -> dict:
                         item["children_truncated"] = st
                     except FsError:
                         item["children"] = []
-                    if sizes_ok and env.now().timestamp() < t_end:
-                        d = env.runner.run("du_ionice", {"path": f"{real}/{e['name']}"})
+                    left = t_end - env.now().timestamp()
+                    if sizes_ok and left >= 5:
+                        d = run_slots(env.runner, "du_ionice", {"path": f"{real}/{e['name']}"}, min(120.0, left))        # never longer than what is left of the budget
                         item["size"] = parse.du_bytes(d.text) if d.ok else None
+                        if not d.ok:
+                            item["size_status"] = "unsupported_name" if d.reason == "bad_slot" else d.reason
                     else:
                         item["size"] = None
                         item["size_status"] = "skipped_budget" if sizes_ok else "no_ionice"

@@ -21,6 +21,7 @@ READ_ALLOW = (
     re.compile(r"^/sys/block/[A-Za-z0-9]+/(?:queue/rotational|size|removable)\Z"),
     re.compile(r"^/sys/bus/pci/devices/[0-9a-f:.]+/(?:current_link_speed|current_link_width|max_link_speed|max_link_width)\Z"),
     re.compile(r"^/etc/(?:os-release|passwd|group|ufw/ufw\.conf|timezone)\Z"),
+    re.compile(r"^/usr/lib/os-release\Z"),                                   # what /etc/os-release points to on Debian/Ubuntu
     re.compile(r"^/(?:var/)?run/reboot-required(?:\.pkgs)?\Z"),
     re.compile(r"^/var/log/unattended-upgrades/(?:unattended-upgrades|unattended-upgrades-dpkg)\.log\Z"),
 )
@@ -105,23 +106,31 @@ class Fs:
             return False
 
     # ------------------------------------------------------------------------------------------------------------ content reads
-    def read_text(self, logical: str, limit: int = _MAX_READ) -> str:
-        """Content of an allowlisted file. /proc and /sys files report size 0, so they are read in chunks up to `limit`."""
+    def _resolve_for_read(self, logical: str) -> str:
+        """Symlinks are everywhere on real hosts (/etc/os-release -> ../usr/lib/os-release, /proc/net -> self/net, /var/run -> /run, /sys/class/* -> /sys/devices/*): the REQUESTED path
+        must be allowlisted, it is resolved, and the RESOLVED path must be allowlisted too (anything pointing elsewhere is 'escape'). The file is then opened without following links."""
         logical = norm_abs(logical)
         if not any(rx.match(logical) for rx in READ_ALLOW):
             raise FsError("not_allowed", logical)
-        if self.protected.hit(logical):
-            raise FsError("protected", logical)
+        real = self.resolve_dir(logical)
         if logical.startswith("/sys/"):
-            logical = self.resolve_dir(logical)         # /sys/class/* and /sys/block/* are symlink farms into /sys/devices; the target must stay inside /sys
-            if not logical.startswith("/sys/"):
+            if not real.startswith("/sys/"):
                 raise FsError("escape", logical)
-        fd = self._walk_open(logical, want_dir=False)
+        elif not any(rx.match(real) for rx in READ_ALLOW):
+            raise FsError("escape", f"{logical} -> {real}")
+        if self.protected.hit(logical) or self.protected.hit(real):
+            raise FsError("protected", logical)
+        return real
+
+    def read_text(self, logical: str, limit: int = _MAX_READ) -> str:
+        """Content of an allowlisted file. /proc and /sys files report size 0, so they are read in chunks up to `limit`."""
+        real = self._resolve_for_read(logical)
+        fd = self._walk_open(real, want_dir=False)
         try:
             st = os.fstat(fd)
             if not st_mod.S_ISREG(st.st_mode):
-                raise FsError("not_regular", logical)
-            if st.st_size > limit and not (logical.startswith("/proc/") or logical.startswith("/sys/")):
+                raise FsError("not_regular", real)
+            if st.st_size > limit and not (real.startswith("/proc/") or real.startswith("/sys/")):
                 return self._read_tail(fd, st.st_size, limit)
             chunks, left = [], limit + 1
             while left > 0:
@@ -132,7 +141,7 @@ class Fs:
                 left -= len(b)
             data = b"".join(chunks)
             if len(data) > limit:
-                raise FsError("too_large", logical)
+                raise FsError("too_large", real)
             return data.decode("utf-8", "replace")
         finally:
             os.close(fd)
@@ -147,11 +156,19 @@ class Fs:
 
     def exists(self, logical: str) -> bool:
         try:
-            fd = self._walk_open(logical, want_dir=False)
+            fd = self._walk_open(self._resolve_for_read(logical), want_dir=False)
         except FsError:
             return False
         os.close(fd)
         return True
+
+    def exists_unfiltered(self, logical: str) -> bool:
+        """lstat existence of a policy-derived path (no allowlist: used for layout checks like .git/commondir). Never opens it."""
+        try:
+            os.lstat(self._actual(norm_abs(logical)))
+            return True
+        except (OSError, FsError):
+            return False
 
     # ----------------------------------------------------------------------------------------------------------------- metadata
     def resolve_dir(self, logical: str) -> str:

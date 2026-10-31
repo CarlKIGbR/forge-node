@@ -117,3 +117,82 @@ def test_even_if_the_scanner_were_wrong_the_command_line_disables_fsmonitor_and_
     make_repo(tmp_path / "repo", config_extra=f"[core]\n\tfsmonitor = {hook}\n")
     r = runner.run("git_status_tracked", {"repo": str(tmp_path / "repo")})
     assert r.ok and not marker.exists() and r.text.count("tracked.txt") == 1
+
+
+def _git(path, *a, env_extra=None):
+    env = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "PATH": os.environ["PATH"], "HOME": "/nonexistent", "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x", **(env_extra or {})}
+    return subprocess.run(["git", "-C", str(path), *a], env=env, capture_output=True, check=True)
+
+
+def make_commondir_repo(tmp_path, evil_script):
+    """The attack from the review: <repo>/.git has a benign config, but its `commondir` file points at a git dir whose config defines a clean filter; .gitattributes applies it."""
+    make_repo(tmp_path / "real", "")
+    common = tmp_path / "evil-common"
+    shutil_copy = __import__("shutil").copytree
+    shutil_copy(tmp_path / "real" / ".git", common)
+    with open(common / "config", "a") as f:
+        f.write(f'[filter "x"]\n\tclean = {evil_script}\n')
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    for n in ("HEAD", "index"):
+        shutil_copy_file = __import__("shutil").copy
+        shutil_copy_file(tmp_path / "real" / ".git" / n, repo / ".git" / n)
+    (repo / ".git" / "commondir").write_text(str(common) + "\n")
+    (repo / ".git" / "config").write_text("[core]\n\trepositoryformatversion = 0\n")          # benign: this is the only file the scanner reads
+    for n in ("tracked.txt", "other.txt"):
+        (repo / n).write_text("two\n")
+    (repo / ".gitattributes").write_text("* filter=x\n")
+    for n in ("tracked.txt", "other.txt", ".gitattributes"):
+        os.utime(repo / n, (1, 1))                                      # stat data differs from the index: status must hash the content, i.e. run the clean filter
+    return repo
+
+
+@need("git")
+def test_a_commondir_that_points_at_an_unscanned_config_cannot_run_a_filter_as_the_probe_user(tmp_path):
+    marker = tmp_path / "filter-ran"
+    evil = tmp_path / "evil.sh"
+    evil.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n")
+    os.chmod(evil, 0o755)
+    repo = make_commondir_repo(tmp_path, evil)
+    # control: plain `git status` on this layout really runs the filter named in the config that `commondir` points to
+    subprocess.run(["git", "-c", f"safe.directory={repo}", "-C", str(repo), "status", "--porcelain"], env={"PATH": os.environ["PATH"], "HOME": "/nonexistent", "GIT_CONFIG_GLOBAL": "/dev/null"}, capture_output=True)
+    assert marker.exists(), "control failed: this git version did not run the commondir filter"
+    marker.unlink()
+    # the probe refuses the layout outright
+    pol = view(policy_doc(t0={"repos": [str(repo)]}))
+    g = probes.run_probe("git", {}, real_env(pol))["repos"]["repos"][0]
+    assert g["dirty_status"] == "skipped_unsafe_config" and "commondir" in g["dirty_reason"] and not marker.exists()
+    # and even if the layout check were missing, the command line pins git to <repo>/.git as common dir, so the filter is not found
+    marker.unlink(missing_ok=True)
+    r = runner.run("git_status_tracked", {"repo": str(repo)})
+    assert not marker.exists(), "the explicit GIT_COMMON_DIR must override the commondir file"
+    assert r.ok or r.reason == "nonzero"
+
+
+@need("git")
+def test_submodule_config_is_never_consulted(tmp_path):
+    marker = tmp_path / "sub-filter-ran"
+    evil = tmp_path / "evil.sh"
+    evil.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n")
+    os.chmod(evil, 0o755)
+    make_repo(tmp_path / "sub", "")
+    make_repo(tmp_path / "super", "")
+    _git(tmp_path / "super", "-c", "protocol.file.allow=always", "submodule", "add", str(tmp_path / "sub"), "m")
+    _git(tmp_path / "super", "commit", "-q", "-m", "sub")
+    modcfg = tmp_path / "super" / ".git" / "modules" / "m" / "config"
+    modcfg.write_text(modcfg.read_text() + f'[filter "x"]\n\tclean = {evil}\n')
+    (tmp_path / "super" / "m" / ".gitattributes").write_text("* filter=x\n")
+    for p in (tmp_path / "super" / "m").iterdir():
+        if p.is_file():
+            os.utime(p, (1, 1))
+    # control: a plain `git status` of the super project does consult the submodule and runs its filter
+    subprocess.run(["git", "-c", f"safe.directory={tmp_path / 'super'}", "-C", str(tmp_path / "super"), "status", "--porcelain"], env={"PATH": os.environ["PATH"], "HOME": "/nonexistent", "GIT_CONFIG_GLOBAL": "/dev/null"}, capture_output=True)
+    assert marker.exists(), "control failed: plain git status did not run the submodule filter in this image"
+    marker.unlink()
+    for p in (tmp_path / "super" / "m").iterdir():
+        if p.is_file():
+            os.utime(p, (1, 1))
+    pol = view(policy_doc(t0={"repos": [str(tmp_path / "super")]}))
+    g = probes.run_probe("git", {}, real_env(pol))["repos"]["repos"][0]
+    assert g["dirty_status"] == "ok" and not marker.exists()

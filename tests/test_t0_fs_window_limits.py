@@ -57,15 +57,17 @@ def test_protected_set_cannot_lose_builtin_entries_and_can_gain():
     assert ps.hit("/srv/models/a/b") == "/srv/models" and ps.hit("/srv/modelsX") is None and ps.hit("/srv/extra") == "/srv/extra"
 
 
-def test_symlink_on_the_path_is_refused(fs, tmp_path):
+def test_symlink_to_something_not_allowlisted_is_refused_as_escape(fs, tmp_path):
+    write_tree(tmp_path, {"/etc/shadow": "root:$6$secret::::::\n"})
     os.unlink(tmp_path / "proc" / "loadavg")
-    os.symlink(str(tmp_path / "proc" / "meminfo"), tmp_path / "proc" / "loadavg")
+    os.symlink(str(tmp_path / "etc" / "shadow"), tmp_path / "proc" / "loadavg")
     with pytest.raises(FsError) as e:
         fs.read_text("/proc/loadavg")
     assert e.value.code == "escape"
+    assert not fs.exists("/proc/loadavg")
 
 
-def test_directory_symlink_on_the_path_is_refused(tmp_path):
+def test_directory_symlink_to_a_non_allowlisted_tree_is_refused(tmp_path):
     (tmp_path / "real").mkdir()
     write_tree(tmp_path, {"/real/os-release": "ID=x\n"})
     os.symlink(str(tmp_path / "real"), tmp_path / "etc")
@@ -73,6 +75,29 @@ def test_directory_symlink_on_the_path_is_refused(tmp_path):
     with pytest.raises(FsError) as e:
         f.read_text("/etc/os-release")
     assert e.value.code == "escape"
+
+
+def test_real_world_symlinks_to_allowlisted_targets_are_followed(tmp_path):
+    """Live proof (Ubuntu 24.04): /etc/os-release -> ../usr/lib/os-release, /proc/net -> self/net, /var/run -> /run. Refusing them made inv.host 'ok' but empty and net counters 0."""
+    write_tree(tmp_path, {"/usr/lib/os-release": 'PRETTY_NAME="Ubuntu 24.04"\n', "/run/reboot-required": "x\n", "/run/reboot-required.pkgs": "linux-image\n",
+                          "/proc/self/net/dev": "Inter-|   Receive\n face |bytes\n  eth0: 5000 50 0 0 0 0 0 0 7000 70 0 0 0 0 0 0\n"})
+    (tmp_path / "etc").mkdir()
+    os.symlink("../usr/lib/os-release", tmp_path / "etc" / "os-release")
+    os.symlink("self/net", tmp_path / "proc" / "net")
+    (tmp_path / "var").mkdir()
+    os.symlink("/run", tmp_path / "var" / "run")                  # absolute link: relative to the relocated root in this test via the realpath below
+    f = Fs(ProtectedSet.from_policy([]), str(tmp_path))
+    assert "Ubuntu" in f.read_text("/etc/os-release")
+    assert "eth0" in f.read_text("/proc/net/dev")
+    # /var/run -> /run is an absolute link: in the relocated tree it leaves the root, which is refused (production root is '/', where it resolves)
+    assert f.exists("/run/reboot-required") and f.read_text("/run/reboot-required.pkgs") == "linux-image\n"
+
+
+def test_real_host_symlinks_are_followed_on_the_real_filesystem():
+    """Not a fixture: the same reads on the machine the tests run on (the test image is Debian: /etc/os-release is a symlink there too)."""
+    f = Fs(ProtectedSet.from_policy([]))
+    assert "ID=" in f.read_text("/etc/os-release")
+    assert f.read_text("/proc/net/dev").count(":") >= 1
 
 
 def test_dot_dot_and_relative_paths_are_normalized_or_refused(fs):

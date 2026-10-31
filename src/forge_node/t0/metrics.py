@@ -61,11 +61,13 @@ def take_sample(env: Env) -> dict:
     mem = parse.meminfo(rd("/proc/meminfo"))
     cpu = parse.cpu_times(rd("/proc/stat")) or {}
     load = parse.loadavg(rd("/proc/loadavg"))
-    nd = parse.net_dev(rd("/proc/net/dev"))
+    net_text = rd("/proc/net/dev")
+    nd = parse.net_dev(net_text)
     s: dict = {"ts": protocol.fmt_ts(env.now()), "up": parse.uptime(rd("/proc/uptime")), "cpu": cpu, "load1_milli": load.get("load1_milli"),
                "mem": {"total": mem.get("MemTotal"), "avail": mem.get("MemAvailable"), "swap_total": mem.get("SwapTotal"), "swap_free": mem.get("SwapFree")},
-               "disk": {k: [v["rd_sectors"], v["wr_sectors"], v["io_ms"], v["inflight"]] for k, v in parse.diskstats(rd("/proc/diskstats")).items()},
-               "net": {"rx": sum(v["rx_bytes"] for v in nd.values()), "tx": sum(v["tx_bytes"] for v in nd.values())}}
+               "disk": {k: [v["rd_sectors"], v["wr_sectors"], v["io_ms"], v["inflight"]] for k, v in parse.diskstats(rd("/proc/diskstats")).items()}}
+    if nd:                                        # absent when /proc/net/dev was unreadable or empty: a zero would be a false measurement
+        s["net"] = {"rx": sum(v["rx_bytes"] for v in nd.values()), "tx": sum(v["tx_bytes"] for v in nd.values())}
     g = env.runner.run("nvidia_gpus")
     if g.ok:
         gpus = parse.nvidia_gpus(g.text)
@@ -98,17 +100,13 @@ def _pid_cgroup_key(env: Env, pid) -> str | None:
 
 
 class Sampler:
-    def __init__(self, env: Env, spool: Spool):
-        self.env, self.spool = env, spool
-        self._last: datetime | None = None
+    """Schedules the engine's continuous collection. Holds no cadence, no guard and no reader of its own: `engine.sample()` is the only caller of take_sample()."""
+
+    def __init__(self, engine):
+        self.engine = engine
 
     def tick(self) -> int | None:
-        """At most one sample per MIN_INTERVAL_S, whoever calls and however often (the cadence is not a parameter). Returns the seq or None if it was too early."""
-        now = self.env.now()
-        if self._last is not None and abs((now - self._last).total_seconds()) < MIN_INTERVAL_S:
-            return None
-        self._last = now
-        return self.spool.append(take_sample(self.env))
+        return self.engine.sample()
 
 
 def read_op(spool: Spool, params: dict) -> dict:

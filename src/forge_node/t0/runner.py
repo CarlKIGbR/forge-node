@@ -24,7 +24,7 @@ SLOT_PATTERNS = {
     "image_id": re.compile(r"^sha256:[0-9a-f]{64}\Z"),
     "int": re.compile(r"^[0-9]{1,9}\Z"),
     "seconds": re.compile(r"^-?[0-9]{1,8}s\Z"),
-    "abs_path": re.compile(r"^/[A-Za-z0-9_.@:+,=%~/ -]{1,4095}\Z"),
+    "abs_path": re.compile(r"^/[^\x00-\x1f\x7f]{0,4095}\Z"),          # argv elements are never shell-parsed: any printable path is safe, control characters and '..' components are not
     "pkg_pattern": re.compile(r"^[a-z0-9][a-z0-9+.*-]{0,63}\Z"),
 }
 
@@ -40,6 +40,8 @@ class Cmd:
     stdin: bool = False
     max_list: int = 64
     env: tuple[tuple[str, str], ...] = ()       # extra constant environment (git hardening)
+    env_slots: tuple[tuple[str, str, str], ...] = ()    # (ENV NAME, slot name, suffix appended to the validated slot value): environment values taken from a validated slot
+    extra_binaries: tuple[str, ...] = ()        # absolute paths of programs the command itself starts (checked like the main binary on every call)
 
 
 def _cmds() -> dict[str, Cmd]:
@@ -69,7 +71,7 @@ def _cmds() -> dict[str, Cmd]:
     d["docker_ps_ids"] = Cmd("docker", ("ps", "-a", "-q", "--no-trunc"), timeout_s=30)
     d["docker_inspect"] = Cmd("docker", ("inspect", "--format", "{{json .Id}}\t{{json .Name}}\t{{json .Image}}\t{{json .Config.Image}}\t{{json .State.Status}}\t{{json .RestartCount}}\t"
                                                               "{{json .State.StartedAt}}\t{{json .State.Pid}}\t{{json .LogPath}}\t{{json .Config.Labels}}\t{{json .NetworkSettings.Ports}}\t"
-                                                              "{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}|{{.RW}};{{end}}", "<id...>"),
+                                                              "{{json .Mounts}}", "<id...>"),
                               slots=(("id", "hex64"),), max_out=4 * 1024 * 1024, timeout_s=30, max_list=40)
     d["docker_image_inspect"] = Cmd("docker", ("image", "inspect", "--format", "{{json .Id}}\t{{json .RepoDigests}}", "<id...>"), slots=(("id", "image_id"),), timeout_s=30, max_list=40)
     d["virsh_list"] = Cmd("virsh", ("-r", "list", "--all"))
@@ -79,12 +81,16 @@ def _cmds() -> dict[str, Cmd]:
     _git_env = (("GIT_CONFIG_GLOBAL", "/dev/null"), ("GIT_CONFIG_NOSYSTEM", "1"), ("GIT_OPTIONAL_LOCKS", "0"), ("GIT_TERMINAL_PROMPT", "0"), ("GIT_ASKPASS", "/bin/false"),
                 ("GIT_EXTERNAL_DIFF", "/bin/false"), ("GIT_PAGER", "cat"))
     d["git_status_tracked"] = Cmd("git", ("--no-optional-locks", "-c", "safe.directory=<repo>", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "core.hooksPath=/dev/null",
-                                          "-C", "<repo>", "status", "--porcelain=v1", "--untracked-files=no", "--no-renames"), slots=(("repo", "abs_path"),), timeout_s=60, max_out=512 * 1024, env=_git_env)
+                                          "-C", "<repo>", "status", "--porcelain=v1", "--untracked-files=no", "--no-renames", "--ignore-submodules=all"),
+                                  slots=(("repo", "abs_path"),), timeout_s=60, max_out=512 * 1024, env=_git_env,
+                                  # the repository's config is taken from EXACTLY <repo>/.git (an explicit GIT_COMMON_DIR overrides a `commondir` file that could point at a config nobody scanned)
+                                  env_slots=(("GIT_DIR", "repo", "/.git"), ("GIT_COMMON_DIR", "repo", "/.git")))
     d["sshd_effective"] = Cmd("sshd", ("-T",), timeout_s=10)
     d["journal_unit"] = Cmd("journalctl", ("-u", "<unit>", "--since=<since>", "-n", "<lines>", "--no-pager", "-o", "short-iso", "--no-hostname"),
                             slots=(("unit", "unit"), ("since", "seconds"), ("lines", "int")), max_out=256 * 1024, timeout_s=30)
     d["journal_last"] = Cmd("journalctl", ("-u", "<unit>", "-n", "1", "--no-pager", "-o", "short-unix", "--no-hostname"), slots=(("unit", "unit"),), max_out=32 * 1024, timeout_s=15)
-    d["du_ionice"] = Cmd("ionice", ("-c3", "nice", "-n", "19", "du", "-s", "-b", "-x", "--", "<path>"), slots=(("path", "abs_path"),), timeout_s=120, max_out=4096)
+    d["du_ionice"] = Cmd("ionice", ("-c3", "/usr/bin/nice", "-n", "19", "/usr/bin/du", "-s", "-b", "-x", "--", "<path>"), slots=(("path", "abs_path"),), timeout_s=120, max_out=4096,
+                         extra_binaries=("/usr/bin/nice", "/usr/bin/du"))
     return d
 
 
@@ -119,12 +125,22 @@ def _resolve(binary: str) -> str | None:
 
 
 def _trusted(path: str) -> bool:
-    """Re-observed on every call: the resolved binary (after symlinks) is root-owned and neither group- nor world-writable."""
+    """Re-observed on every call: the resolved binary (after symlinks) is root-owned and neither group- nor world-writable, and so is every directory above it (a root-owned sticky
+    directory such as /tmp is tolerated: others cannot rename or replace entries in it)."""
     try:
         s = os.stat(path)
+        if not (s.st_uid == 0 and stat.S_ISREG(s.st_mode) and not (s.st_mode & 0o022)):
+            return False
+        d = os.path.dirname(path)
+        while True:
+            ds = os.stat(d)
+            if ds.st_uid != 0 or (ds.st_mode & 0o022 and not (ds.st_mode & stat.S_ISVTX)):
+                return False
+            if d == "/":
+                return True
+            d = os.path.dirname(d)
     except OSError:
         return False
-    return s.st_uid == 0 and stat.S_ISREG(s.st_mode) and not (s.st_mode & 0o022)
 
 
 def _expand(cmd: Cmd, slots: dict) -> list[str]:
@@ -132,6 +148,7 @@ def _expand(cmd: Cmd, slots: dict) -> list[str]:
     if set(slots) != set(declared):
         raise RunnerError(f"slots must be exactly {sorted(declared)}")
     out: list[str] = []
+    used: set[str] = set()
     for tok in cmd.argv:
         names = re.findall(r"<([a-z_]+)(\.\.\.)?>", tok)
         if not names:
@@ -150,15 +167,22 @@ def _expand(cmd: Cmd, slots: dict) -> list[str]:
             if not isinstance(v, str) or not pat.match(v) or (v.startswith("-") and tok in (f"<{name}>", f"<{name}...>")) or (declared[name] == "abs_path" and (".." in v.split("/") or "\x00" in v)):
                 raise RunnerError(f"slot {name}: value rejected")
         out.extend(tok.replace("<" + name + ("..." if many else "") + ">", v) for v in vals)
+        used.add(name)
+    if used != set(declared):
+        raise RunnerError("every declared slot must appear in the argv (it is validated there)")
     return out
 
 
-def _env(cmd: Cmd) -> dict:
-    return {**_ENV_BASE, **dict(cmd.env)}
+def _env(cmd: Cmd, slots: dict) -> dict:
+    env = {**_ENV_BASE, **dict(cmd.env)}
+    for name, slot, suffix in cmd.env_slots:
+        env[name] = slots[slot] + suffix                   # the slot was validated by _expand (same pattern as in argv)
+    return env
 
 
-def run(cmd_id: str, slots: dict | None = None, stdin: bytes | None = None) -> Run:
-    """Execute one table entry. Raises RunnerError for a programming error (unknown id, bad slots); returns a Run for every operational outcome."""
+def run(cmd_id: str, slots: dict | None = None, stdin: bytes | None = None, max_wait_s: float | None = None) -> Run:
+    """Execute one table entry. Raises RunnerError for a programming error (unknown id, bad slots); returns a Run for every operational outcome.
+    `max_wait_s` can only SHORTEN the table's timeout (a caller with a deadline of its own)."""
     cmd = CMDS.get(cmd_id)
     if cmd is None:
         raise RunnerError(f"unknown command {cmd_id!r}")
@@ -168,15 +192,15 @@ def run(cmd_id: str, slots: dict | None = None, stdin: bytes | None = None) -> R
     path = _resolve(cmd.binary)
     if path is None:
         return Run(False, "missing", argv=(cmd.binary, *argv_tail))
-    if not _trusted(os.path.realpath(path)):
+    if not all(_trusted(os.path.realpath(p)) for p in (path, *cmd.extra_binaries)):
         return Run(False, "untrusted_binary", argv=(cmd.binary, *argv_tail))
     argv = [path, *argv_tail]
     try:
         p = subprocess.Popen(argv, stdin=subprocess.PIPE if cmd.stdin else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, close_fds=True,
-                             start_new_session=True, env=_env(cmd), cwd="/")
+                             start_new_session=True, env=_env(cmd, slots or {}), cwd="/")
     except OSError as e:
         return Run(False, "oserror", err=type(e).__name__, argv=tuple(argv))
-    deadline = time.monotonic() + cmd.timeout_s
+    deadline = time.monotonic() + (cmd.timeout_s if max_wait_s is None else max(0.1, min(cmd.timeout_s, max_wait_s)))
     out, err = bytearray(), bytearray()
     truncated = timed_out = False
     if cmd.stdin and p.stdin:
@@ -236,13 +260,22 @@ def _kill(p: subprocess.Popen):
             pass
 
 
+def trusted_binary(name: str) -> str:
+    """Absolute path of a program in the fixed PATH whose file and directories are root-owned and not writable by others (used for ssh-keygen, which decides whether a policy or a
+    hub job is genuine). Raises RunnerError when there is none."""
+    path = _resolve(name)
+    if path is None or not _trusted(os.path.realpath(path)):
+        raise RunnerError(f"no trusted {name} in {':'.join(FIXED_PATH)}")
+    return path
+
+
 class ReadOnlyRunner:
     """Thin object wrapper so collectors take a runner instance (tests substitute a fake with the same two methods). The production instance has no state."""
 
-    def run(self, cmd_id: str, slots: dict | None = None, stdin: bytes | None = None) -> Run:
-        return run(cmd_id, slots, stdin)
+    def run(self, cmd_id: str, slots: dict | None = None, stdin: bytes | None = None, max_wait_s: float | None = None) -> Run:
+        return run(cmd_id, slots, stdin, max_wait_s)
 
     def available(self, cmd_id: str) -> bool:
         cmd = CMDS[cmd_id]
         p = _resolve(cmd.binary)
-        return p is not None and _trusted(os.path.realpath(p))
+        return p is not None and all(_trusted(os.path.realpath(x)) for x in (p, *cmd.extra_binaries))

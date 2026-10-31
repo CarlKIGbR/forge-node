@@ -79,10 +79,12 @@ def usage(env: Env, spool: Spool, probe, params: dict) -> dict:
     live = metrics.cgroup_counters(env)
     out["now"] = ok(cgroups={k: {"cpu_usec": v[0], "rss": v[1], "io_read_bytes": v[2], "io_write_bytes": v[3]} for k, v in live.items()})
     try:
-        c = probe.call("containers", {"with_usage": True})["containers"]
-        act = probe.call("activity", {})["activity"]
-        out["containers"] = c
-        out["unit_activity"] = act
+        out["containers"] = probe.call("containers", {})["containers"]
+        out["unit_activity"] = probe.call("activity", {})["activity"]
+        try:
+            out["container_net"] = probe.call("container_net", {})["container_net"]
+        except (ProbeUnavailable, ProbeDenied) as e:
+            out["container_net"] = unavailable(f"needs the privileged probe: {e}")
     except ProbeUnavailable as e:
         out["containers"] = unavailable(f"names/labels need the privileged probe: {e}")
     except ProbeDenied as e:

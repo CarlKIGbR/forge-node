@@ -187,12 +187,19 @@ def test_cgroup_scan_keeps_the_biggest_consumers_only(tmp_path):
     assert len(cg) == metrics.MAX_CG and "u:u79.service" in cg and "u:u0.service" not in cg
 
 
-def test_sampler_cadence_is_at_least_30_seconds_whoever_calls(tmp_path):
-    env = make_env(tmp_path, FakeRunner({}))
+def sampler_for(tmp_path, runner=None):
+    from forge_node.t0 import engine as E
+    from forge_node.t0.limits import RateLimiter
+    env = make_env(tmp_path, runner or FakeRunner({}))
     clock = {"t": NOW}
     env.now = lambda: clock["t"]
     spool, _ = mk(tmp_path)
-    sm = metrics.Sampler(env, spool)
+    eng = E.T0Engine(node="g2", env=env, limiter=RateLimiter(str(tmp_path / "rl.json"), lambda: clock["t"]), probe=None, spool=spool, node_cert_path=None, hub_cert_der=lambda: None)
+    return metrics.Sampler(eng), clock, spool, eng
+
+
+def test_sampler_cadence_is_at_least_30_seconds_whoever_calls(tmp_path):
+    sm, clock, spool, eng = sampler_for(tmp_path)
     assert sm.tick() == 1
     for dt in (0, 1, 15, 29):
         clock["t"] = NOW + timedelta(seconds=dt)
@@ -209,7 +216,42 @@ def test_sampler_cadence_is_at_least_30_seconds_whoever_calls(tmp_path):
 
 def test_metrics_cadence_is_a_constant_not_a_parameter():
     import inspect
-    assert metrics.MIN_INTERVAL_S == 30 and "interval" not in inspect.signature(metrics.Sampler.__init__).parameters and "interval" not in inspect.signature(metrics.Sampler.tick).parameters
+    from forge_node.t0 import engine as E
+    assert metrics.MIN_INTERVAL_S == 30 and "interval" not in inspect.signature(metrics.Sampler.__init__).parameters and "interval" not in inspect.signature(E.T0Engine.sample).parameters
+
+
+def test_sampling_goes_through_the_engine_guards(tmp_path):
+    """Review finding: the sampler was a second read path. Now it is T0Engine.sample(): policy tier, gate registry, its own rate bucket, cadence."""
+    sm, clock, spool, eng = sampler_for(tmp_path)
+    object.__setattr__(eng.env.policy, "tiers_enabled", ())
+    assert sm.tick() is None and spool.depth() == 0
+    object.__setattr__(eng.env.policy, "tiers_enabled", (0,))
+    assert sm.tick() == 1
+    # the engine's own persisted bucket bounds restart flapping: a fresh engine has no cadence memory, the bucket (2 tokens, 2/min, stored on disk) still remembers
+    from forge_node.t0 import engine as E
+    from forge_node.t0.limits import RateLimiter
+    (tmp_path / "flap").mkdir()
+    seqs = []
+    for i in range(4):
+        t = NOW + timedelta(seconds=i)
+        env = make_env(tmp_path / "flap", FakeRunner({}))
+        env.now = lambda t=t: t
+        spool2 = Spool(str(tmp_path / "flap"), os.getuid(), 1 << 16)
+        e2 = E.T0Engine(node="g2", env=env, limiter=RateLimiter(str(tmp_path / "flap" / "rl.json"), lambda t=t: t), probe=None, spool=spool2, node_cert_path=None, hub_cert_der=lambda: None)
+        seqs.append(metrics.Sampler(e2).tick())
+    assert [s is not None for s in seqs] == [True, True, False, False]
+    import ast
+    from pathlib import Path
+    src = Path(__file__).resolve().parents[1] / "src" / "forge_node"
+    callers = [p.name for p in (src / "t0").glob("*.py") for n in ast.walk(ast.parse(p.read_text())) if isinstance(n, ast.Call) and getattr(n.func, "attr", getattr(n.func, "id", "")) == "take_sample"]
+    assert sorted(set(callers)) == ["engine.py"], callers          # defined in metrics.py, called only by the engine
+
+
+def test_samples_with_absurd_integers_are_clamped_not_dropped(tmp_path):
+    sm, clock, spool, eng = sampler_for(tmp_path, FakeRunner({"nvidia_gpus": "0, GPU-a, X, 1, 999999999999999999999, 1, 1, 1.0, 1.0, 1, 1, 4, 16, 0x0\n"}))
+    assert sm.tick() == 1
+    g = spool.read_after(0, 1)["samples"][0]["gpu"][0]
+    assert g["tot"] == 2**53 - 1
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------- usage
@@ -232,12 +274,12 @@ def test_usage_window_aggregates_samples_and_joins_probe_names(tmp_path):
                       "gpu": [{"i": 0, "mem": 1000 * (i + 1), "tot": 24564, "util": 10 * i, "temp": 40 + i, "pw": 1, "clk": 1, "pcie": [4, 16], "thr": []}],
                       "gpu_apps": [{"gi": 0, "pid": 1, "proc": "python3", "mib": 500 * (i + 1), "cg": key}], "mem": {"swap_total": 100, "swap_free": 100 - i}, "load1_milli": 100 * i})
     probe = FakeProbe({"containers": {"containers": {"status": "ok", "containers": [{"id": "a" * 12, "name": "pg", "attribution": {"unattributed": False}}]}},
-                       "activity": {"activity": {"status": "ok", "units": []}}})
+                       "activity": {"activity": {"status": "ok", "units": []}}, "container_net": {"container_net": {"status": "ok", "containers": {"a" * 12: {"rx_bytes": 5, "tx_bytes": 6}}}}})
     u = usage_mod.usage(env, spool, probe, {"window_h": 72})
     w = u["window"]
     assert w["samples"] == 5 and w["covered_hours"] == 4 and w["per_cgroup"][key] == {"samples": 5, "cpu_seconds": 40, "rss_max": 5000, "io_read_bytes": 400, "io_write_bytes": 200}
     assert w["gpu"]["0"] == {"mem_used_max": 5000, "mem_free_min": 24564 - 5000, "util_max": 40, "temp_max": 44, "total": 24564} and w["gpu_vram_by_owner_mib"] == {key: 2500}
-    assert w["swap_used_max"] == 4 and w["load1_milli_max"] == 400 and u["containers"]["containers"][0]["name"] == "pg"
+    assert w["swap_used_max"] == 4 and w["load1_milli_max"] == 400 and u["containers"]["containers"][0]["name"] == "pg" and u["container_net"]["containers"]["a" * 12]["rx_bytes"] == 5
     assert u["now"]["cgroups"][key]["rss"] == 1048576
     narrow = usage_mod.usage(env, spool, probe, {"window_h": 2})["window"]
     assert narrow["samples"] == 3
@@ -257,7 +299,7 @@ def test_usage_skips_malformed_spool_records_and_streams(tmp_path):
     spool.append({"ts": protocol.fmt_ts(NOW - timedelta(hours=1)), "cg": {"d:aaa": [1_000_000, 10, 0, 0]}})
     spool.append({"ts": protocol.fmt_ts(NOW - timedelta(minutes=50)), "cg": "garbage", "gpu": [{"i": "x"}]})
     spool.append({"ts": protocol.fmt_ts(NOW - timedelta(minutes=40)), "cg": {"d:aaa": [3_000_000, 20, 0, 0]}})
-    u = usage_mod.usage(env, spool, FakeProbe({"containers": {"containers": {"status": "ok"}}, "activity": {"activity": {"status": "ok"}}}), {"window_h": 2})["window"]
+    u = usage_mod.usage(env, spool, FakeProbe({"containers": {"containers": {"status": "ok"}}, "activity": {"activity": {"status": "ok"}}, "container_net": {"container_net": {"status": "ok"}}}), {"window_h": 2})["window"]
     assert u["samples"] == 3 and u["skipped_records"] >= 1 and u["per_cgroup"]["d:aaa"]["cpu_seconds"] == 2
     import types
     assert isinstance(spool.iter_window("0"), types.GeneratorType)
