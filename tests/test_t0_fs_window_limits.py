@@ -32,6 +32,16 @@ def test_non_allowlisted_path_is_refused_even_if_it_exists(fs, tmp_path):
         assert e.value.code == "not_allowed"
 
 
+def test_protected_set_blocks_an_allowlisted_path_when_the_policy_protects_it(tmp_path):
+    """The allowlist and the protected set are independent layers: a policy that protects an allowlisted file makes it unreadable (code 'protected', not 'not_allowed')."""
+    write_tree(tmp_path, PROC)
+    f = Fs(ProtectedSet.from_policy(["/etc/passwd"]), str(tmp_path))
+    with pytest.raises(FsError) as e:
+        f.read_text("/etc/passwd")
+    assert e.value.code == "protected"
+    assert "root" in Fs(ProtectedSet.from_policy([]), str(tmp_path)).read_text("/etc/passwd")
+
+
 def test_protected_set_blocks_content_reads_below_it(tmp_path):
     write_tree(tmp_path, {"/srv/models/m/weights.bin": "w", "/opt/kmu-ai/x": "x"})
     f = Fs(ProtectedSet.from_policy([]), str(tmp_path))

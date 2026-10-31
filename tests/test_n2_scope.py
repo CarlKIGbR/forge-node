@@ -218,3 +218,14 @@ def test_t0_param_schema_is_shared_by_hub_and_node(op, params, ok):
             with pytest.raises(ProtoError) as e:
                 fn()
             assert e.value.code == "DENY_PARAM"
+
+
+def test_design_n2_list_names_existing_tests():
+    design = (ROOT / "docs" / "design" / "FORGE_NODE.md").read_text()
+    sec = design[design.index("### 16.2 Slice N2 acceptance list"):design.index("## 17. Open questions")]
+    named = set(re.findall(r"`(test_[a-z0-9_]+)`", sec.split("**Not in N2")[0]))
+    defined = set()
+    for f in (ROOT / "tests").glob("test_*.py"):
+        defined |= set(re.findall(r"^def (test_[a-z0-9_]+)\(", f.read_text(), re.M))
+    assert not sorted(named - defined), sorted(named - defined)
+    assert len(named) >= 100

@@ -39,8 +39,9 @@ class OpDenied(Exception):
 
 
 class T0Engine:
-    def __init__(self, *, node: str, env: Env, limiter: RateLimiter, probe, spool: Spool, node_cert_path: str | None):
-        self.node, self.env, self.limiter, self.probe, self.spool, self.node_cert_path = node, env, limiter, probe, spool, node_cert_path
+    def __init__(self, *, node: str, env: Env, limiter: RateLimiter, probe, spool: Spool, node_cert_path: str | None, hub_cert_der: Callable[[], bytes | None]):
+        """`hub_cert_der` returns the DER of the hub certificate seen on the live connection (None before the first handshake): inv.certs reports its expiry (Design 4.1)."""
+        self.node, self.env, self.limiter, self.probe, self.spool, self.node_cert_path, self.hub_cert_der = node, env, limiter, probe, spool, node_cert_path, hub_cert_der
         self._lock = threading.Lock()
         self._ops: dict[str, tuple[bool, Callable[[dict], tuple[dict, str]]]] = {
             "inv.host": (False, lambda p: (collect.host(env), "internal")),
@@ -89,7 +90,8 @@ class T0Engine:
         return self._probe("vms", {})
 
     def _certs(self) -> dict:
-        out = {"node_certificate": collect.own_certs(self.env, self.node_cert_path, self.env.now()), "local_tls": collect.local_tls(self.env)}
+        out = {"node_certificate": collect.own_certs(self.env, self.node_cert_path, self.env.now()), "hub_certificate": collect.der_cert(self.env, self.hub_cert_der()),
+               "local_tls": collect.local_tls(self.env)}
         out.update(self._probe("certs", {}))
         return out
 

@@ -155,11 +155,17 @@ def test_stop_does_not_stop_t0(rig):
 # ------------------------------------------------------------------------------------------------------------------ nothing above T0
 def test_agent_denies_a_tier1_job_even_if_a_hub_with_open_gates_signs_it(rig, open_gates):
     rig.hub.gates = open_gates                         # a (hypothetically compromised/future) hub that signs a T1 job
-    jid = rig.enqueue("container.stop", tier=1, id="x" * 64)
     a = rig.make_agent()
+    a.poll_once(wait_s=0)                              # builds the runtime
+    reached = []
+    real = a.rt.engine.execute
+    a.rt.engine.execute = lambda *args: (reached.append(args), real(*args))[1]
+    jid = rig.enqueue("container.stop", tier=1, id="x" * 64)
+    rig.clock.advance(31)
     assert a.poll_once(wait_s=0) == "job"
     j = state(rig, jid)
     assert j["state"] == "denied" and j["result_reason"] == "DENY_TIER_DISABLED"
+    assert reached == [], "the loop itself must not hand a tier>0 job to the engine"
     assert a.rt.engine.spool.depth() == 0 and not [c for c in rig.runner.calls if c[0].startswith("docker")]
 
 
@@ -345,3 +351,19 @@ def test_sampler_feeds_the_spool_and_metrics_sample_job_reads_it(rig):
     out = json.loads(state(rig, jid)["result_output"])["data"]["samples"]
     assert [s["seq"] for s in out["samples"]] == [1, 2] and out["samples"][0]["mem"]["total"] == 65856000 * 1024
     assert rig.adm.execute("SELECT 1 FROM node.nodes WHERE node_id='g2' AND quarantine").fetchone() is None
+
+
+def test_inv_certs_reports_the_hub_certificate_seen_on_the_live_connection(rig):
+    import subprocess
+    got = {}
+    out = "notAfter=Nov 14 12:00:00 2026 GMT\nsubject=CN=forge-nodehub\nsha256 Fingerprint=" + ":".join(["AB"] * 32) + "\n"
+    rig.runner.script["openssl_x509_der"] = lambda slots, stdin: (got.setdefault("der", stdin), Run(True, "ok", 0, out.encode()))[1]
+    a = rig.make_agent()
+    a.poll_once(wait_s=0)
+    jid = rig.enqueue("inv.certs")
+    rig.clock.advance(31)
+    a.poll_once(wait_s=0)
+    data = json.loads(state(rig, jid)["result_output"])["data"]
+    assert data["hub_certificate"]["status"] == "ok" and data["hub_certificate"]["days_left"] == 13
+    import hashlib
+    assert hashlib.sha256(got["der"]).hexdigest() == rig.pins[0]                      # it is the pinned leaf

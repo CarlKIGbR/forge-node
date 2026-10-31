@@ -39,8 +39,8 @@ def build(cfg: AgentConfig, *, runner, clock, log, probe) -> Agent:
 
     def build_runtime(view) -> Runtime:
         env = Env(Fs(ProtectedSet.from_policy(view.protected_paths), cfg.fs_root), runner, clock, view)
-        engine = T0Engine(node=cfg.node_id, env=env, limiter=limiter, probe=probe, spool=spool, node_cert_path=cfg.node_cert)
         client = HubClient(cfg.hub_host, cfg.hub_port, cfg.node_cert, cfg.node_key, cfg.ca_file, view.hub_tls_pins)
+        engine = T0Engine(node=cfg.node_id, env=env, limiter=limiter, probe=probe, spool=spool, node_cert_path=cfg.node_cert, hub_cert_der=client.hub_certificate_der)
         return Runtime(view, client, engine)
 
     return Agent(cfg, PolicyHolder(cfg, clock, log), build_runtime, spool, lambda rt: metrics.Sampler(rt.engine.env, spool), clock, log=log)

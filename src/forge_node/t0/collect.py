@@ -262,6 +262,19 @@ def own_certs(env: Env, node_cert: str | None, now: datetime) -> dict:
     return ok(**d)
 
 
+def der_cert(env: Env, der: bytes | None) -> dict:
+    """Expiry of a certificate we hold as DER (the hub's, from the live TLS connection)."""
+    if not der:
+        return unavailable("no hub connection has been made yet")
+    r = env.runner.run("openssl_x509_der", stdin=der)
+    if not r.ok:
+        return run_failure(r)
+    d = parse.x509(r.text)
+    if d.get("not_after_epoch") is not None:
+        d["days_left"] = int((d.pop("not_after_epoch") - env.now().timestamp()) // 86400)
+    return ok(**d)
+
+
 LOCAL_TLS_PORTS = (443, 8443)
 
 
@@ -278,14 +291,11 @@ def local_tls(env: Env) -> dict:
             ctx.verify_mode = ssl.CERT_NONE
             with socket.create_connection(("127.0.0.1", port), timeout=2) as s, ctx.wrap_socket(s) as t:
                 der = t.getpeercert(binary_form=True)
-            r = env.runner.run("openssl_x509_der", stdin=der)
-            if r.ok:
-                d = parse.x509(r.text)
-                if d.get("not_after_epoch") is not None:
-                    d["days_left"] = int((d.pop("not_after_epoch") - env.now().timestamp()) // 86400)
-                row.update(d)
+            c = der_cert(env, der)
+            if c["status"] == "ok":
+                row.update({k: v for k, v in c.items() if k != "status"})
             else:
-                row["error"] = r.reason
+                row["error"] = c.get("code", c.get("reason"))
         except (OSError, ssl.SSLError):
             row["listening"] = False
         rows.append(row)

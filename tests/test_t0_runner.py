@@ -127,9 +127,16 @@ def test_nonzero_exit_and_ok_rc_table(fakebin):
     assert runner.run("systemctl_is_active", {"unit": "a.service"}).ok                          # is-active: 3 = inactive is a valid answer
 
 
-def test_timeout_kills_the_whole_process_group(fakebin, tmp_path, monkeypatch):
-    marker = tmp_path / "child-alive"
-    fakebin("lsblk", f"(/usr/bin/sleep 30; /usr/bin/touch {marker}) &\n/usr/bin/sleep 30")
+def _state_of(pid: int) -> str | None:
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return None
+
+
+def test_timeout_kills_the_whole_process_group(fakebin, tmp_path):
+    pidfile = tmp_path / "grandchild.pid"
+    fakebin("lsblk", f"/usr/bin/sleep 60 &\necho $! > {pidfile}\n/usr/bin/sleep 60")
     cmd = runner.CMDS["lsblk"]
     object.__setattr__(cmd, "timeout_s", 1)
     try:
@@ -138,8 +145,12 @@ def test_timeout_kills_the_whole_process_group(fakebin, tmp_path, monkeypatch):
     finally:
         object.__setattr__(cmd, "timeout_s", 20)
     assert r.reason == "timeout" and time.monotonic() - t0 < 10
-    time.sleep(0.5)
-    assert not marker.exists()
+    pid = int(pidfile.read_text())
+    for _ in range(50):
+        if _state_of(pid) in (None, "Z"):              # gone, or killed and not yet reaped by the container's init
+            break
+        time.sleep(0.1)
+    assert _state_of(pid) in (None, "Z"), "the background child of the command survived the timeout"
 
 
 def test_output_is_capped_and_producer_killed(fakebin):

@@ -200,3 +200,14 @@ def test_empty_apt_config_values_are_not_origins(tmp_path):
     env, _ = pkgs_env(tmp_path, conf=conf)
     uu = collect.pkgs(env, UNREADABLE)["unattended_upgrades"]
     assert uu["origins_configured"] == ["${distro_id}:${distro_codename}-security"] and uu["drift"] is False
+
+
+def test_der_cert_reports_hub_certificate_expiry(tmp_path):
+    out = "notAfter=Nov 14 12:00:00 2026 GMT\nsubject=CN=forge-nodehub\nsha256 Fingerprint=" + ":".join(["AB"] * 32) + "\n"
+    seen = {}
+    r = FakeRunner({"openssl_x509_der": lambda slots, stdin: (seen.setdefault("der", stdin), Run(True, "ok", 0, out.encode()))[1]})
+    env = make_env(tmp_path, r)
+    c = collect.der_cert(env, b"\x30\x82")
+    assert c["status"] == "ok" and c["days_left"] == 13 and c["subject"] == "CN=forge-nodehub" and seen["der"] == b"\x30\x82"
+    assert collect.der_cert(env, None)["status"] == "unavailable"
+    assert collect.der_cert(make_env(tmp_path, FakeRunner({})), b"x")["status"] == "unavailable"
