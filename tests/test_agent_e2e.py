@@ -367,3 +367,15 @@ def test_inv_certs_reports_the_hub_certificate_seen_on_the_live_connection(rig):
     assert data["hub_certificate"]["status"] == "ok" and data["hub_certificate"]["days_left"] == 13
     import hashlib
     assert hashlib.sha256(got["der"]).hexdigest() == rig.pins[0]                      # it is the pinned leaf
+
+
+def test_the_agent_verifies_with_the_ssh_keygen_it_was_given_not_with_whatever_is_first_in_path(rig):
+    a = rig.make_agent()
+    assert a.poll_once(wait_s=0) in ("idle", "job")
+    a.ssh_keygen = "/nonexistent/ssh-keygen"
+    rig.enqueue("inv.host")
+    rig.clock.advance(31)
+    assert a.poll_once(wait_s=0) == "bad_response"                       # lease cannot be verified -> whole response dropped
+    a.holder.ssh_keygen = "/nonexistent/ssh-keygen"
+    rig.set_policy(serial=2)
+    assert a.poll_once(wait_s=0) == "no_policy"                          # nor can a policy be verified: silence
