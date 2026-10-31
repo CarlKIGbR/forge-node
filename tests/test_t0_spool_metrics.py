@@ -249,3 +249,15 @@ def test_usage_degrades_without_the_privileged_probe(tmp_path):
     u = usage_mod.usage(menv(tmp_path), spool, FakeProbe(ProbeUnavailable("down")), {})
     assert u["containers"]["status"] == "unavailable" and u["window"]["samples"] == 0 and u["window"]["swap_used_max"] is None
     assert usage_mod.usage(menv(tmp_path), spool, FakeProbe(ProbeDenied("DENY_RATE")), {})["containers"]["status"] == "error"
+
+
+def test_usage_skips_malformed_spool_records_and_streams(tmp_path):
+    env = menv(tmp_path)
+    spool, _ = mk(tmp_path, 1 << 20)
+    spool.append({"ts": protocol.fmt_ts(NOW - timedelta(hours=1)), "cg": {"d:aaa": [1_000_000, 10, 0, 0]}})
+    spool.append({"ts": protocol.fmt_ts(NOW - timedelta(minutes=50)), "cg": "garbage", "gpu": [{"i": "x"}]})
+    spool.append({"ts": protocol.fmt_ts(NOW - timedelta(minutes=40)), "cg": {"d:aaa": [3_000_000, 20, 0, 0]}})
+    u = usage_mod.usage(env, spool, FakeProbe({"containers": {"containers": {"status": "ok"}}, "activity": {"activity": {"status": "ok"}}}), {"window_h": 2})["window"]
+    assert u["samples"] == 3 and u["skipped_records"] >= 1 and u["per_cgroup"]["d:aaa"]["cpu_seconds"] == 2
+    import types
+    assert isinstance(spool.iter_window("0"), types.GeneratorType)

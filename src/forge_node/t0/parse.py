@@ -1,11 +1,9 @@
 """Pure parsers for the output of the allowlisted read-only commands and /proc files. No I/O, no floats in the results (canonical JSON has none): fractional values become integers
 in a stated unit (milli-units, bytes). Anything unparsable is skipped and counted, never guessed."""
 import csv
-import io
 import json
 import re
 
-from .. import canon
 
 
 def milli(s) -> int | None:
@@ -148,38 +146,52 @@ def io_stat(text: str) -> dict:
 
 
 # ----------------------------------------------------------------------------------------------------------------------- commands
-def lsblk(text: str) -> list[dict]:
+def _json(text: str):
+    """Tolerant JSON for tool output: floats become ints (canonical JSON has none); anything unparsable or absurdly nested is None."""
     try:
-        doc = canon.loads(text)
-    except canon.CanonError:
-        try:
-            doc = json.loads(text, parse_float=lambda s: int(float(s)))
-        except ValueError:
-            return []
-    out = []
+        return json.loads(text, parse_float=lambda s: int(float(s)))
+    except (ValueError, RecursionError, OverflowError):
+        return None
 
-    def walk(devs, parent=None):
-        for d in devs or []:
-            mp = d.get("mountpoints") or ([d["mountpoint"]] if d.get("mountpoint") else [])
-            out.append({"name": d.get("name"), "type": d.get("type"), "size": to_int(d.get("size")), "fstype": d.get("fstype"), "mountpoints": [m for m in mp if m],
-                        "ro": bool(d.get("ro")), "rotational": bool(d.get("rota")), "model": (d.get("model") or "").strip() or None, "parent": parent})
-            walk(d.get("children"), d.get("name"))
-    walk(doc.get("blockdevices") if isinstance(doc, dict) else [])
+
+def _str(v) -> str | None:
+    return v if isinstance(v, str) else None
+
+
+def lsblk(text: str) -> list[dict]:
+    doc = _json(text)
+    out: list[dict] = []
+
+    def walk(devs, parent=None, depth=0):
+        if not isinstance(devs, list) or depth > 6:
+            return
+        for d in devs:
+            if not isinstance(d, dict):
+                continue
+            mp = d.get("mountpoints")
+            if not isinstance(mp, list):
+                mp = [d["mountpoint"]] if isinstance(d.get("mountpoint"), str) and d["mountpoint"] else []
+            model = d.get("model")
+            out.append({"name": _str(d.get("name")), "type": _str(d.get("type")), "size": to_int(d.get("size")), "fstype": _str(d.get("fstype")), "mountpoints": [m for m in mp if isinstance(m, str) and m],
+                        "ro": bool(d.get("ro")), "rotational": bool(d.get("rota")), "model": (model.strip() or None) if isinstance(model, str) else None, "parent": parent})
+            walk(d.get("children"), _str(d.get("name")), depth + 1)
+    walk(doc.get("blockdevices") if isinstance(doc, dict) else None)
     return out
 
 
 def findmnt(text: str) -> list[dict]:
-    try:
-        doc = json.loads(text, parse_float=lambda s: int(float(s)))
-    except ValueError:
-        return []
-    out = []
+    doc = _json(text)
+    out: list[dict] = []
 
-    def walk(fs):
-        for f in fs or []:
-            out.append({"target": f.get("target"), "source": f.get("source"), "fstype": f.get("fstype"), "options": f.get("options")})
-            walk(f.get("children"))
-    walk(doc.get("filesystems") if isinstance(doc, dict) else [])
+    def walk(fs, depth=0):
+        if not isinstance(fs, list) or depth > 12:
+            return
+        for f in fs:
+            if not isinstance(f, dict):
+                continue
+            out.append({"target": _str(f.get("target")), "source": _str(f.get("source")), "fstype": _str(f.get("fstype")), "options": _str(f.get("options"))})
+            walk(f.get("children"), depth + 1)
+    walk(doc.get("filesystems") if isinstance(doc, dict) else None)
     return out
 
 
@@ -204,9 +216,18 @@ def kv_lines(text: str) -> dict:
     return {k: v for k, _, v in (l.partition("=") for l in text.splitlines()) if k}
 
 
+def _csv_rows(text: str):
+    """csv rows, one line at a time: a stray CR or quote in one line costs that line, not the whole answer."""
+    for line in text.splitlines():
+        try:
+            yield from csv.reader([line], skipinitialspace=True)
+        except csv.Error:
+            continue
+
+
 def nvidia_gpus(text: str) -> list[dict]:
     out = []
-    for row in csv.reader(io.StringIO(text), skipinitialspace=True):
+    for row in _csv_rows(text):
         if len(row) < 14:
             continue
         out.append({"index": to_int(row[0]), "uuid": row[1], "name": row[2], "mem_used_mib": to_int(row[3]), "mem_total_mib": to_int(row[4]), "util_pct": to_int(row[5]),
@@ -229,7 +250,7 @@ def _throttle(s: str) -> list[str]:
 
 def nvidia_apps(text: str) -> list[dict]:
     out = []
-    for row in csv.reader(io.StringIO(text), skipinitialspace=True):
+    for row in _csv_rows(text):
         if len(row) < 4:
             continue
         name = (row[2].split() or [""])[0].rsplit("/", 1)[-1]          # first word, basename only: command lines can carry tokens, paths add nothing
@@ -243,10 +264,7 @@ def timedatectl(text: str) -> dict:
 
 
 def list_units_json(text: str) -> list[dict]:
-    try:
-        doc = json.loads(text)
-    except ValueError:
-        return []
+    doc = _json(text)
     return [d for d in doc if isinstance(d, dict)] if isinstance(doc, list) else []
 
 
@@ -267,11 +285,8 @@ def ss(text: str) -> list[dict]:
 
 
 def ip_routes(text: str) -> dict:
-    try:
-        doc = json.loads(text)
-    except ValueError:
-        return {"routes": [], "default_gateways": []}
-    routes = [{"dst": r.get("dst"), "gateway": r.get("gateway"), "dev": r.get("dev"), "prefsrc": r.get("prefsrc")} for r in doc if isinstance(r, dict)]
+    doc = _json(text)
+    routes = [{"dst": _str(r.get("dst")), "gateway": _str(r.get("gateway")), "dev": _str(r.get("dev")), "prefsrc": _str(r.get("prefsrc"))} for r in (doc if isinstance(doc, list) else []) if isinstance(r, dict)]
     return {"routes": routes, "default_gateways": sorted({r["gateway"] for r in routes if r["dst"] == "default" and r["gateway"]})}
 
 

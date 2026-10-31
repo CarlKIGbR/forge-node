@@ -180,16 +180,18 @@ class Spool:
         last = out[-1]["seq"] if out else after_seq
         return {"samples": out, "next_seq": last, "gap": bool(out or segs) and after_seq + 1 < (out[0]["seq"] if out else oldest) and after_seq + 1 < oldest, "more": more, "newest_seq": nxt - 1}
 
-    def window(self, since_ts: str) -> list[dict]:
-        """All kept samples with ts >= since_ts (ISO 'Z' strings compare chronologically)."""
+    def iter_window(self, since_ts: str):
+        """Kept samples with ts >= since_ts, oldest first, ONE AT A TIME (a full 50 MiB ring must never be materialised: the agent unit has 96-128 MiB). ISO 'Z' strings compare
+        chronologically."""
         with self._lock:
             segs = list(self._segs)
-        res = []
         for _, name, _ in segs:
             for rec in self._lines(name):
                 if isinstance(rec.get("ts"), str) and rec["ts"] >= since_ts:
-                    res.append(rec)
-        return res
+                    yield rec
+
+    def window(self, since_ts: str) -> list[dict]:
+        return list(self.iter_window(since_ts))
 
     def close(self):
         with self._lock:

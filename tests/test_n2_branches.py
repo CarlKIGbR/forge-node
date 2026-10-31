@@ -558,3 +558,42 @@ def test_policy_holder_dedupes_log_lines_and_handles_missing_dir(tmp_path):
     assert len(logs) == 1
     assert h._signature() is not None
     assert L.PolicyHolder(AgentConfig("g2", "127.0.0.1", 1, "/c", "/k", "/ca", "/definitely/not/here", "/s", "/st", "/p", 0, 0, "/"), lambda: NOW, logs.append)._signature() is None
+
+
+def test_selfcheck_ok_when_everything_required_is_present(tmp_path):
+    from forge_node.t0 import selfcheck as sc
+    avail = set(sc.REQUIRED_COMMANDS)
+    env = make_env(tmp_path, FakeRunner({c: "x" for c in avail}), files={"/sys/fs/cgroup/system.slice/a.service/memory.current": "1\n"})
+    r = sc.selfcheck(env)
+    assert r["missing_required_commands"] == [] and r["cgroup_v2_system_slice"] is True and r["ok"] is True
+
+
+def test_reconcile_requests_are_logged_not_acted_on_and_invalid_results_become_failures(tmp_path, monkeypatch):
+    resp_holder = {}
+    client = StubClient()
+    ag = stub_agent(tmp_path, client)
+    rt = ag._runtime()
+    from conftest import lease_payload, job_payload
+    monkeypatch.setattr(L.protocol, "verify_lease", lambda env, keys, node, now, last: lease_payload(node="g2", seq=last + 1))
+    resp = {"v": 1, "lease": {}, "jobs": [], "reconcile": ["x"], "policy_serial_latest": 0, "server_time": "2026-10-31T13:40:10Z"}
+    assert ag._handle(rt, resp) == "idle" and any("no ledger" in m for m in ag.logs)
+
+    class Weird:
+        env = None
+
+        def execute(self, *a):
+            return L.Outcome("committed", "DENY_STOP", "x")          # committed with a reason code is not a valid result
+    ag2 = stub_agent(tmp_path / "w", StubClient(), engine=Weird())
+    monkeypatch.setattr(L.protocol, "verify_job", lambda env, keys, node, now: job_payload(node="g2"))
+    ag2._run_job(ag2._runtime(), {})
+    posted = ag2.rt.client.posted[0][1]
+    assert posted["status"] == "failed" and posted["reason_code"] == "FAIL_EXEC" and any("invalid" in m for m in ag2.logs)
+
+
+def test_fsread_exists_survives_odd_paths_and_sanitize_walks_nested_strings(tmp_path):
+    write_tree(tmp_path, PROC)
+    f = Fs(ProtectedSet.from_policy([]), str(tmp_path))
+    assert f.exists("/proc/meminfo/not-a-dir") is False
+    body = {"l": [["a" * 400, ["b" * 400]], {"k": "c" * 400}]}
+    out, tr = sanitize.fit(body, 300)
+    assert len(canon.canonical(out)) <= 300 and tr
