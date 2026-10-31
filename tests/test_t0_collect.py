@@ -221,3 +221,10 @@ def test_an_empty_or_unparsable_file_gives_an_unavailable_section_never_an_empty
         assert h[k]["status"] == "unavailable" and "nothing parsable" in h[k]["reason"], k
     for k, sec in collect.host(make_env(tmp_path / "ok", FakeRunner({"timedatectl": "Timezone=x\n"}))).items():
         assert sec["status"] != "ok" or len(sec) > 1, k
+
+
+def test_nfs_mounts_section_is_unavailable_not_empty_when_proc_mounts_cannot_be_read(tmp_path):
+    env = make_env(tmp_path, FakeRunner({"lsblk": LSBLK, "findmnt": FINDMNT}))
+    (tmp_path / "proc/mounts").unlink()
+    d = collect.disks(env, statvfs=lambda p, timeout=3.0: None)
+    assert d["nfs_mounts"] == {"status": "unavailable", "reason": "/proc/mounts unreadable"}

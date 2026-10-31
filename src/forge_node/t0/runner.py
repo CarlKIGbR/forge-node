@@ -153,7 +153,7 @@ def _trusted(path: str) -> bool:
             hops += 1
         p = os.path.realpath(p)
         s = os.stat(p)
-        return s.st_uid == 0 and stat.S_ISREG(s.st_mode) and not (s.st_mode & 0o022) and _dirs_trusted(os.path.dirname(p)) and _dirs_trusted(os.path.dirname(os.path.abspath(path)))
+        return s.st_uid == 0 and stat.S_ISREG(s.st_mode) and not (s.st_mode & 0o022) and _dirs_trusted(os.path.dirname(p))
     except OSError:
         return False
 
