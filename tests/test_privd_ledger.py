@@ -434,10 +434,24 @@ def test_fence_mismatch_worker_exits_without_effect(privd_env, tmp_path):
     assert worker.run(str(wd), ops.EFFECTS, owner_uid=0) == 0
     st = worker.read_status(str(wd))
     assert st["outcome"] == "fenced" and st["code"] == "FAIL_FENCED" and not (wd / "effect.mark").exists()
+    # the fence on its own (row still `started`, only the number differs - the check does not rely on the state machine never producing this)
+    e.ledger._c.execute("UPDATE exec SET state='started', fence=7 WHERE job_id=?", (jid,))
+    req["fence"] = 6
+    (wd / "request.json").write_text(json.dumps(req))
+    os.unlink(wd / "status.json")
+    assert worker.run(str(wd), ops.EFFECTS, owner_uid=0) == 0
+    st = worker.read_status(str(wd))
+    assert st["outcome"] == "fenced" and st["ledger_fence"] == 7 and not (wd / "effect.mark").exists()
+    os.unlink(wd / "status.json")
+    req["fence"] = 7                                                                      # ... and with the matching fence the same worker acts
+    (wd / "request.json").write_text(json.dumps(req))
+    assert worker.run(str(wd), ops.EFFECTS, owner_uid=0) == 0 and worker.read_status(str(wd))["outcome"] == "done" and (wd / "effect.mark").exists()
+    os.unlink(wd / "status.json")
+    os.unlink(wd / "effect.mark")
+    e.ledger._c.execute("UPDATE exec SET state='reconciling', fence=2 WHERE job_id=?", (jid,))
     # a worker for a row that is not `started`, or an unknown row, is fenced too
     req["fence"] = 2
     (wd / "request.json").write_text(json.dumps(req))
-    os.unlink(wd / "status.json")
     assert worker.run(str(wd), ops.EFFECTS, owner_uid=0) == 0 and worker.read_status(str(wd))["outcome"] == "fenced"
 
 
