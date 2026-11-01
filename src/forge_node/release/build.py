@@ -13,12 +13,11 @@ profile (fixed mtimes, owners and modes, sorted entries). Nothing here installs 
 import hashlib
 import io
 import json
-import os
 import re
-import shutil
 import tarfile
 import tempfile
-import zipapp
+import time
+import zipfile
 from pathlib import Path
 from typing import Callable
 
@@ -29,6 +28,7 @@ SWITCHER_API = 1
 STATE_MIN, STATE_MAX = 1, 1
 POLICY_SCHEMA = 1
 EPOCH = 1_762_000_000                                       # fixed mtime (2025-11-01): reproducible archives
+ZIP_DATE = time.gmtime(EPOCH)[:6]                           # the same instant as the zip's DOS date (UTC, never the builder's local time)
 EXCLUDE_DIRS = {"hub", "release", "__pycache__"}
 # A t0 artifact (g1/g4: no workloads, no mutating op) carries only the privd modules LISTED here; anything else - op code today, `ops_*.py` of N5-N7 tomorrow - is not in it unless a reviewer
 # adds it to this list. test_t0_artifacts_contain_only_listed_privd_modules_and_every_module_is_classified fails on a module that is in neither list.
@@ -60,19 +60,21 @@ def package_files(src_root: Path, profile: str) -> list[Path]:
 
 
 def build_zipapp(src_root: Path, profile: str, target: Path) -> None:
-    with tempfile.TemporaryDirectory(prefix="fn-zipapp-") as t:
-        stage = Path(t) / "app"
-        for p in package_files(src_root, profile):
-            dst = stage / "forge_node" / p.relative_to(src_root / "forge_node")
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(p, dst)
-        (stage / "forge_node" / "profile.py").write_text(f'"""Build profile (written by the release builder)."""\nPROFILE = "{profile}"\n')
-        # zipapp's own `main=` spec would call main() and DROP its return value (exit status 0 always): write the entry ourselves
-        (stage / "__main__.py").write_text("import sys\nfrom forge_node.cli import main\n\nsys.exit(main())\n")
-        for d in [stage, *stage.rglob("*")]:
-            os.chmod(d, 0o755 if d.is_dir() else 0o644)                       # the zip records the mode: the builder's umask must not reach the artifact
-            os.utime(d, (EPOCH, EPOCH))
-        zipapp.create_archive(str(stage), str(target), compressed=False)
+    """The release zipapp, written entry by entry with a fixed timestamp, fixed modes and a sorted order: the bytes depend on the source tree only - not on the builder's umask, time zone
+    (zipapp/zipfile store LOCAL time), file mtimes or directory order. A zipapp is a zip with a `__main__.py`; `python3 -I forge-node.pyz` needs no header."""
+    entries: dict[str, bytes] = {}
+    for p in package_files(src_root, profile):
+        entries["forge_node/" + p.relative_to(src_root / "forge_node").as_posix()] = p.read_bytes()
+    entries["forge_node/profile.py"] = f'"""Build profile (written by the release builder)."""\nPROFILE = "{profile}"\n'.encode()
+    # zipapp's own `main=` spec would call main() and DROP its return value (exit status 0 always): write the entry ourselves
+    entries["__main__.py"] = b"import sys\nfrom forge_node.cli import main\n\nsys.exit(main())\n"
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_STORED) as z:
+        for name in sorted(entries):
+            zi = zipfile.ZipInfo(name, date_time=ZIP_DATE)
+            zi.compress_type = zipfile.ZIP_STORED
+            zi.create_system = 3
+            zi.external_attr = 0o100644 << 16
+            z.writestr(zi, entries[name])
 
 
 def _wrapper() -> bytes:
