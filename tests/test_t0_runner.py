@@ -267,3 +267,40 @@ def test_a_symlinked_command_is_trusted_only_if_every_link_and_its_directory_are
     os.unlink(alt / "lsblk")
     os.symlink(alt / "lsblk", alt / "lsblk")                          # a loop is refused, not an exception
     assert runner.run("lsblk").reason in ("missing", "untrusted_binary")
+
+
+def test_a_child_that_closes_its_pipes_and_keeps_running_is_waited_for_and_keeps_its_exit_code(fakebin):
+    """Final verification (MAJOR): the group was killed on EOF of both pipes, so a wrapper that closes its fds, sleeps 200 ms and exits 0 came back as rc=-9 after ~5 ms."""
+    fakebin("lsblk", "echo out; exec >&- 2>&-; /usr/bin/sleep 0.2; exit 0")
+    t0 = time.monotonic()
+    r = runner.run("lsblk")
+    dt = time.monotonic() - t0
+    assert r.ok and r.rc == 0 and r.text == "out\n" and 0.19 <= dt < 5
+    fakebin("lsblk", "exec >&- 2>&-; /usr/bin/sleep 0.2; exit 3")
+    r = runner.run("lsblk")
+    assert not r.ok and r.rc == 3 and r.reason == "nonzero"
+
+
+def test_a_child_that_closes_its_pipes_and_overruns_the_deadline_is_killed(fakebin):
+    fakebin("lsblk", "exec >&- 2>&-; /usr/bin/sleep 60")
+    cmd = runner.CMDS["lsblk"]
+    object.__setattr__(cmd, "timeout_s", 1)
+    try:
+        t0 = time.monotonic()
+        r = runner.run("lsblk")
+    finally:
+        object.__setattr__(cmd, "timeout_s", 20)
+    assert r.reason == "timeout" and time.monotonic() - t0 < 5
+
+
+def test_background_children_left_behind_by_a_finished_command_are_still_stopped(fakebin, tmp_path):
+    pidfile = tmp_path / "bg.pid"
+    fakebin("lsblk", f"/usr/bin/sleep 60 >&- 2>&- &\necho $! > {pidfile}\nexit 0")
+    r = runner.run("lsblk")
+    assert r.ok and r.rc == 0
+    pid = int(pidfile.read_text())
+    for _ in range(50):
+        if _state_of(pid) in (None, "Z"):
+            break
+        time.sleep(0.1)
+    assert _state_of(pid) in (None, "Z")

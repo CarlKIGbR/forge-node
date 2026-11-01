@@ -248,8 +248,14 @@ def run(cmd_id: str, slots: dict | None = None, stdin: bytes | None = None, max_
                     truncated = True
                     break
     finally:
-        if timed_out or truncated or p.poll() is None:
-            _kill(p)
+        if not (timed_out or truncated):
+            # EOF on both pipes only means the child closed its output (a wrapper may close its fds and still be running): let it end by itself, up to what is left of the deadline,
+            # and keep its real exit status. Only a child that overruns the deadline is killed.
+            try:
+                p.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        _kill(p)                        # truncated/timed out: stop the group; normal end: leftovers of the group (background children) go too - the leader is reaped, its status stays
         try:
             p.wait(timeout=5)
         except subprocess.TimeoutExpired:
