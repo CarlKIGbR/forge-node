@@ -49,15 +49,16 @@ class LogSpec:
     dir_mode: int          # 0o750 priv, 0o755 agent
     lock_mode: int         # 0o600 priv, 0o660 agent
     trust_anchor: str      # directories from `dir` up to here must be owned by owner_uid and not writable by group/others ("/" in production)
-    max_file_bytes: int    # rotation threshold
+    max_file_bytes: int    # rotation threshold (size)
+    max_age_s: int         # rotation threshold (age of the active file; a file holding only its chain_link is never rotated for age)
 
 
-def priv_spec(*, dir="/var/log/forge-node-priv", lock="/var/lib/forge-node-priv/locks/priv.log.lock", gid: int, owner_uid=0, trust_anchor="/", max_file_bytes=64 * 1024 * 1024) -> LogSpec:
-    return LogSpec("priv", "priv", dir, lock, gid, owner_uid, 0o640, 0o750, 0o600, trust_anchor, max_file_bytes)
+def priv_spec(*, dir="/var/log/forge-node-priv", lock="/var/lib/forge-node-priv/locks/priv.log.lock", gid: int, owner_uid=0, trust_anchor="/", max_file_bytes=64 * 1024 * 1024, max_age_s=86400) -> LogSpec:
+    return LogSpec("priv", "priv", dir, lock, gid, owner_uid, 0o640, 0o750, 0o600, trust_anchor, max_file_bytes, max_age_s)
 
 
-def agent_spec(*, dir="/var/log/forge-node-agent", lock="/var/log/forge-node-agent/audit.lock", gid: int, owner_uid=0, trust_anchor="/", max_file_bytes=64 * 1024 * 1024) -> LogSpec:
-    return LogSpec("agent", "audit", dir, lock, gid, owner_uid, 0o660, 0o755, 0o660, trust_anchor, max_file_bytes)
+def agent_spec(*, dir="/var/log/forge-node-agent", lock="/var/log/forge-node-agent/audit.lock", gid: int, owner_uid=0, trust_anchor="/", max_file_bytes=64 * 1024 * 1024, max_age_s=86400) -> LogSpec:
+    return LogSpec("agent", "audit", dir, lock, gid, owner_uid, 0o660, 0o755, 0o660, trust_anchor, max_file_bytes, max_age_s)
 
 
 def gen_name(prefix: str, n: int) -> str:

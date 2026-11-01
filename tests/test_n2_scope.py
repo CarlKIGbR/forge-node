@@ -133,13 +133,15 @@ def test_writes_are_confined_to_the_agent_state_modules():
             assert not ({"chmod", "fchmod", "chown", "symlink", "link", "unlink", "remove", "rmdir"} & set(hits)), (name, hits)
 
 
-def test_no_audit_file_writer_in_n2_so_gate_d_has_nothing_to_seal():
-    """Audit files (agent audit.jsonl, priv.jsonl), rotation and sealing arrive with N3. N2 must not contain the pieces: chain sealing, chattr, +a handling, CURRENT pointer."""
-    for m in MODULES + [SRC / "hub" / "core.py"]:
-        t = m.read_text()
-        if m.name == "core.py":
-            continue
-        assert "seal_record" not in t and "chattr" not in t and "FS_APPEND_FL" not in t and "FS_IOC_SETFLAGS" not in t and "audit.jsonl" not in t and "priv.jsonl" not in t and "CURRENT" not in t, m.name
+def test_agent_and_t0_layers_contain_no_sealing_rotation_or_audit_admin_code():
+    """N3 superseded N2's 'no audit file writer': the agent now appends to its own audit log (audit.log.Appender, single writer, O_APPEND under a flock). What it must still NOT contain
+    is anything that SEALS, rotates, recovers or purges (gate D's protocol, which needs CAP_LINUX_IMMUTABLE and belongs to root): no AuditAdmin, no inode-flag calls, no chattr."""
+    import re as _re
+    for m in MODULES:
+        t = code_only(m)
+        assert not _re.search(r"AuditAdmin|fsflags|FS_IOC|chattr|seal_record|\.rotate\(|\.recover\(|\.purge\(|\.init\(\)", t), m.name
+        imported = {a.name for n in ast.walk(ast.parse(m.read_text())) if isinstance(n, ast.ImportFrom) and (n.module or "").startswith(("audit", "..audit")) for a in n.names}
+        assert imported <= {"Appender", "AuditDown", "AuditCorrupt", "agent_spec"}, (m.name, imported)
     assert gates.GATES["D"].met is False and all(not g.met for g in gates.GATES.values())
 
 

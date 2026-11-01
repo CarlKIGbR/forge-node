@@ -442,3 +442,17 @@ def test_rotation_due_by_size(realfs):
     assert a.due()
     a.rotate()
     assert not a.due()
+
+
+def test_rotation_due_by_age_only_when_the_file_holds_more_than_its_chain_link(realfs):
+    from datetime import timedelta
+    clock = Clock()
+    specs = make_specs(realfs, max_age_s=3600)
+    a = admin(specs["priv"], clock)
+    a.init()
+    clock.t += timedelta(hours=2)
+    assert not a.due()                                  # an idle node does not produce a new file every day
+    a.append("t0", {})
+    assert a.due()                                      # old enough and it holds a record besides the chain_link
+    a.rotate()
+    assert not a.due()

@@ -81,8 +81,10 @@ class Ctl:
         return 0 if not any(res.values()) else 1
 
     def cmd_audit_rotate(self, which: str) -> int:
+        """`both` / `priv` / `agent` rotate now; `due` (what the timer runs) rotates each log only when its size or age threshold is reached."""
         require_root(self.euid)
-        r = self.client.request("audit.rotate", {"log": which})
+        body = {"log": "both", "when": "due"} if which == "due" else {"log": which}
+        r = self.client.request("audit.rotate", body)
         self.emit(r)
         return 0 if r.get("ok") else 1
 

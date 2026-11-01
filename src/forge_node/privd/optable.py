@@ -76,9 +76,13 @@ def noop_params(p: dict) -> dict:
     return {"note": note}
 
 
-def build_optable() -> OpTable:
-    """The table of this release. N3 delivers the machinery and ONE executable op, `selftest.noop` (T1, full profile only, gated by D): it touches nothing but its own work directory.
+def build_optable(profile: str) -> OpTable:
+    """The table of this release for a build profile (`t0` artifacts contain no op code at all: the table is empty and ops.py/opworker.py are not even in the zipapp). N3 delivers the machinery and ONE executable op, `selftest.noop` (T1, full profile only, gated by D): it touches nothing but its own work directory.
     Every other op of gates.OPS arrives with its slice (N5 T1, N6 T2, N7 T3) and is DENY_OP_UNKNOWN until then."""
+    if profile == "t0":
+        return OpTable([])
+    if profile != "full":
+        raise ValueError("unknown build profile")
     from .ops import noop_probe
     return OpTable([
         OpEntry("selftest.noop", 1, True, frozenset({"full"}), "selftest", noop_params, lambda p: "selftest.noop", "probe", noop_probe, None, "selftest.noop", 30, True, True, ((6, 60),)),

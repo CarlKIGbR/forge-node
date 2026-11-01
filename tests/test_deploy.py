@@ -85,19 +85,29 @@ def _strings_in_calls(tree, attrs):
 
 
 def test_source_never_generates_keys_or_touches_the_system():
+    """N1/N2 never touched the system. N3's privd drives systemd (transient units) and maintains its own root-owned state; the scope of that is pinned PER MODULE: only these modules
+    may contain these commands, nothing may contain sudo/useradd/iptables/docker/openssl or any key generation."""
     import ast
 
+    ever_banned = ("sudo", "useradd", "iptables", "docker", "openssl", "-genkey", "genpkey", "ecparam", "-t")
+    allowed = {                                                       # module -> the otherwise banned words (as literal arguments of process-starting calls) it may carry
+        "privd/units.py": {"systemctl", "systemd-run"},                # the systemd backend
+        "privd/main.py": {"systemctl", "systemd-run"},                 # trusted binary lookup for the backend / privctl
+        "privd/privctl.py": {"systemctl"},                             # lockdown: stop the agent, disable the socket
+        "release/switcher.py": {"systemctl"},                          # link/daemon-reload/start/stop around a release switch
+    }
     importers = []
     for p in (ROOT / "src").rglob("*.py"):
+        rel = str(p.relative_to(ROOT / "src" / "forge_node"))
         tree = ast.parse(p.read_text())
         mods = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names} | {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
         if "subprocess" in mods:
-            importers.append(p.name)
-        calls = _strings_in_calls(tree, {"run", "Popen", "call", "check_call", "check_output", "system", "popen", "execv", "execvp", "chmod", "chown"})
-        for bad in ("systemctl", "systemd-run", "sudo", "useradd", "chattr", "iptables", "docker", "openssl", "-genkey", "genpkey", "ecparam", "-t"):
-            assert bad not in calls, (p.name, bad)
-    # ssh-keygen -Y sign/verify (sshsig) and the T0 read-only command table (N2: t0/runner.py, a closed argv table - see test_t0_runner.py)
-    assert sorted(importers) == ["runner.py", "sshsig.py"]
+            importers.append(rel)
+        calls = _strings_in_calls(tree, {"run", "Popen", "call", "check_call", "check_output", "system", "popen", "execv", "execvp", "chmod", "fchmod", "chown", "fchown"})
+        for bad in ("systemctl", "systemd-run", "chattr", *ever_banned):
+            if bad in calls:
+                assert bad in allowed.get(rel, set()) and bad not in ever_banned, (rel, bad)
+    assert sorted(importers) == ["privd/main.py", "privd/units.py", "release/switcher.py", "sshsig.py", "t0/runner.py"]
     sshsig = (ROOT / "src" / "forge_node" / "sshsig.py").read_text()
     assert sorted(set(re.findall(r'"(-Y|-lf|-q)"', sshsig))) == ["-Y", "-lf", "-q"] and '"sign"' in sshsig and '"verify"' in sshsig
     assert "-N" not in sshsig and "-t\"" not in sshsig and "keygen\", \"-" not in sshsig
@@ -122,14 +132,20 @@ def test_migration_touches_only_schema_node():
 
 
 def test_hub_package_has_no_policy_or_install_or_approval_surface():
-    """Neither N1 nor N2 delivers privd, privctl, a ledger, the unit resolver, policy application or T3 proposals (N2 adds the agent and the T0 layer)."""
+    """The HUB has no endpoint that applies policy, releases, T3 proposals or runs anything, and no privileged code is reachable from the agent package: privd, the audit admin and the
+    release tooling are separate packages that the agent never imports beyond the append-only writer and the socket client (N3 delivers them; N2 had none)."""
     pkg = ROOT / "src" / "forge_node"
-    assert sorted(p.name for p in pkg.iterdir() if p.is_dir() and p.name != "__pycache__") == ["agent", "hub", "t0"]
-    assert not any((pkg / n).exists() for n in ("privd.py", "agent.py", "privctl.py", "ledger.py", "resolver.py", "privd", "privctl"))
-    assert not [f for d in ("agent", "t0") for n in ("privd*.py", "ledger*.py", "resolver*.py", "approval*.py", "apply*.py") for f in (pkg / d).glob(n)]
+    assert sorted(p.name for p in pkg.iterdir() if p.is_dir() and p.name != "__pycache__") == ["agent", "audit", "hub", "privd", "release", "t0"]
+    assert not [f for d in ("agent", "t0", "hub") for n in ("privd*.py", "ledger*.py", "resolver*.py", "approval*.py", "apply*.py") for f in (pkg / d).glob(n)]
     server = (pkg / "hub" / "server.py").read_text()
     for route in ("/v1/stop", "/v1/release/apply", "/v1/policy/apply", "/v1/t3", "/v1/exec"):
         assert route not in server
+    import ast
+    for d in ("agent", "hub", "t0"):
+        for p in (pkg / d).rglob("*.py"):
+            for n in ast.walk(ast.parse(p.read_text())):
+                if isinstance(n, ast.ImportFrom) and n.module and n.module.split(".")[0] in ("privd", "release"):
+                    assert d == "agent" and n.module == "privd.client", (p.name, n.module)            # the agent's only way to privd is the socket client
 
 
 def test_run_tests_script_is_not_world_writable_and_executable():

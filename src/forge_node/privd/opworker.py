@@ -43,11 +43,15 @@ def selfcheck(work_dir: str, ledger_path: str, lock_dir: str) -> dict:
     return out
 
 
-if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "run":
-        sys.exit(run(sys.argv[2], EFFECTS, owner_uid=0))
-    if len(sys.argv) == 3 and sys.argv[1] == "selfcheck":
-        req = canon.loads(open(os.path.join(sys.argv[2], "selfcheck.json"), "rb").read())
-        print(canon.canonical_text({"ok": True, "data": selfcheck(sys.argv[2], req["ledger_path"], req["lock_dir"])}))
-        sys.exit(0)
+def main(argv: list) -> int:
+    if len(argv) == 2 and argv[0] == "run":
+        return run(argv[1], EFFECTS, owner_uid=0)
+    if len(argv) == 2 and argv[0] == "selfcheck":
+        req = canon.loads(open(os.path.join(argv[1], "selfcheck.json"), "rb").read())
+        print(canon.canonical_text({"ok": True, "data": selfcheck(argv[1], req["ledger_path"], req["lock_dir"])}))
+        return 0
     raise SystemExit("usage: opworker run|selfcheck <work_dir>")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

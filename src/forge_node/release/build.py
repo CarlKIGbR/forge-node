@@ -1,0 +1,120 @@
+"""Per-profile release artifact (Design 13.C C2/C4, 13.E): `forge-node-<VER>-<profile>.tar` (+ `.tar.sig`) containing
+
+    forge-node-<VER>/RELEASE.json            manifest: release, profile, switcher_api, state window, policy schema, units, sha256 of EVERY file
+    forge-node-<VER>/RELEASE.json.sig        the owner's signature over RELEASE.json (namespace forge-node-release)
+    forge-node-<VER>/forge-node.pyz          agent, privd, privctl, probes, doctor (zipapp). Profile t0: no op code (privd/ops.py, opworker.py) at all
+    forge-node-<VER>/bin/privctl             /sbin-style wrapper around the zipapp
+    forge-node-<VER>/sbin/forge-node-release the switcher (also installed OUTSIDE the tree by the owner, once)
+    forge-node-<VER>/units/*                 the unit files (linked by the switcher, never copied)
+    forge-node-<VER>/policy/policy-<nid>.json  templates for the nodes of this profile
+
+The builder never holds a key: `sign` is a function the caller provides (the owner's `ssh-keygen -Y sign` on the Mac). The output is deterministic for a given source tree, version and
+profile (fixed mtimes, owners and modes, sorted entries). Nothing here installs anything."""
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import tarfile
+import tempfile
+import zipapp
+from pathlib import Path
+from typing import Callable
+
+from . import policies, units
+
+VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}\Z")
+SWITCHER_API = 1
+STATE_MIN, STATE_MAX = 1, 1
+POLICY_SCHEMA = 1
+EPOCH = 1_762_000_000                                       # fixed mtime (2025-11-01): reproducible archives
+EXCLUDE_DIRS = {"hub", "release", "__pycache__"}
+T0_EXCLUDE = {"privd/ops.py", "privd/opworker.py"}
+
+
+class BuildError(Exception):
+    pass
+
+
+def _sha(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def package_files(src_root: Path, profile: str) -> list[Path]:
+    """The forge_node source files that go into the zipapp of a profile."""
+    pkg = src_root / "forge_node"
+    out = []
+    for p in sorted(pkg.rglob("*.py")):
+        rel = p.relative_to(pkg)
+        if any(part in EXCLUDE_DIRS for part in rel.parts) or str(rel) == "profile.py":
+            continue
+        if profile == "t0" and str(rel) in T0_EXCLUDE:
+            continue
+        out.append(p)
+    return out
+
+
+def build_zipapp(src_root: Path, profile: str, target: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="fn-zipapp-") as t:
+        stage = Path(t) / "app"
+        for p in package_files(src_root, profile):
+            dst = stage / "forge_node" / p.relative_to(src_root / "forge_node")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(p, dst)
+        (stage / "forge_node" / "profile.py").write_text(f'"""Build profile (written by the release builder)."""\nPROFILE = "{profile}"\n')
+        # zipapp's own `main=` spec would call main() and DROP its return value (exit status 0 always): write the entry ourselves
+        (stage / "__main__.py").write_text("import sys\nfrom forge_node.cli import main\n\nsys.exit(main())\n")
+        for d in [stage, *stage.rglob("*")]:
+            os.utime(d, (EPOCH, EPOCH))
+        zipapp.create_archive(str(stage), str(target), compressed=False)
+
+
+def _wrapper() -> bytes:
+    return (b"#!/bin/sh\n# forge-node privctl: always runs the artifact that is `current`\n"
+            b"exec /usr/bin/python3 -I /opt/forge-node/current/forge-node.pyz privctl \"$@\"\n")
+
+
+def build_release(version: str, profile: str, out_dir: Path, *, src_root: Path, sign: Callable[[bytes], str], switcher_api: int = SWITCHER_API, state_window: tuple = (STATE_MIN, STATE_MAX),
+                  policy_schema: int = POLICY_SCHEMA) -> dict:
+    """Returns {tar, sig, sha256, manifest}. `sign(bytes) -> armored ssh signature text` is the owner's signature function (namespace forge-node-release)."""
+    if not VERSION_RE.match(version) or profile not in ("full", "t0"):
+        raise BuildError("bad version or profile")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    top = f"forge-node-{version}"
+    files: dict[str, tuple[bytes, int]] = {}                                    # relative path -> (content, mode)
+    with tempfile.TemporaryDirectory(prefix="fn-build-") as t:
+        pyz = Path(t) / "forge-node.pyz"
+        build_zipapp(Path(src_root), profile, pyz)
+        files["forge-node.pyz"] = (pyz.read_bytes(), 0o644)
+    files["bin/privctl"] = (_wrapper(), 0o755)
+    switcher = (Path(src_root) / "forge_node" / "release" / "switcher.py").read_bytes()
+    files["sbin/forge-node-release"] = (switcher, 0o755)
+    unit_texts = units.all_units()
+    for name, text in sorted(unit_texts.items()):
+        files[f"units/{name}"] = (text.encode(), 0o644)
+    for nid in policies.nodes_for(profile):
+        files[f"policy/policy-{nid}.json"] = (json.dumps(policies.template(nid), indent=1, sort_keys=True).encode() + b"\n", 0o644)
+    manifest = {"fmt": 1, "release": version, "profile": profile, "switcher_api": switcher_api, "state_min": state_window[0], "state_max": state_window[1], "policy_schema": policy_schema,
+                "units": sorted(unit_texts), "files": {k: _sha(v[0]) for k, v in sorted(files.items())}}
+    manifest_raw = json.dumps(manifest, indent=1, sort_keys=True).encode() + b"\n"
+    sig = sign(manifest_raw)
+    files["RELEASE.json"] = (manifest_raw, 0o644)
+    files["RELEASE.json.sig"] = (sig.encode("ascii"), 0o644)
+    tar_path = out_dir / f"forge-node-{version}-{profile}.tar"
+    with tarfile.open(tar_path, "w", format=tarfile.PAX_FORMAT) as tf:
+        for d in ("", "bin", "sbin", "units", "policy"):
+            ti = tarfile.TarInfo(f"{top}/{d}".rstrip("/"))
+            ti.type, ti.mode, ti.mtime, ti.uid, ti.gid, ti.uname, ti.gname = tarfile.DIRTYPE, 0o755, EPOCH, 0, 0, "root", "root"
+            if d != "policy" or any(k.startswith("policy/") for k in files):
+                tf.addfile(ti)
+        for name in sorted(files):
+            data, mode = files[name]
+            ti = tarfile.TarInfo(f"{top}/{name}")
+            ti.size, ti.mode, ti.mtime, ti.uid, ti.gid, ti.uname, ti.gname = len(data), mode, EPOCH, 0, 0, "root", "root"
+            tf.addfile(ti, io.BytesIO(data))
+    tar_bytes = tar_path.read_bytes()
+    sig_path = Path(str(tar_path) + ".sig")
+    sig_path.write_text(sign(tar_bytes))
+    return {"tar": tar_path, "sig": sig_path, "sha256": _sha(tar_bytes), "manifest": manifest}

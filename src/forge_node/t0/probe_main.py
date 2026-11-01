@@ -41,7 +41,11 @@ def main(argv, stdin, stdout, *, node_id: str, policy_dir: str, allowed_signers:
     return 0
 
 
-if __name__ == "__main__":
+def production_main(argv) -> int:
     import os
-    sys.exit(main(sys.argv[1:], sys.stdin, sys.stdout, node_id=os.environ["FORGE_NODE_NODE_ID"], policy_dir="/etc/forge-node/policy", allowed_signers="/etc/forge-node/allowed_signers",
-                  fs_root="/", owner_uid=0, now=lambda: datetime.now(timezone.utc), ssh_keygen=trusted_binary("ssh-keygen")))
+    return main(argv, sys.stdin, sys.stdout, node_id=os.environ["FORGE_NODE_NODE_ID"], policy_dir="/etc/forge-node/policy", allowed_signers="/etc/forge-node/allowed_signers",
+                fs_root="/", owner_uid=0, now=lambda: datetime.now(timezone.utc), ssh_keygen=trusted_binary("ssh-keygen"))
+
+
+if __name__ == "__main__":
+    sys.exit(production_main(sys.argv[1:]))

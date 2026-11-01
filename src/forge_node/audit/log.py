@@ -482,12 +482,18 @@ class AuditAdmin(Appender):
                 self._unlock()
 
     def due(self) -> bool:
-        """Size threshold reached (the timer rotates by age as well: privctl audit-rotate)."""
+        """The active file reached the size threshold, or is older than max_age_s AND holds more than its chain_link (an idle node does not produce a new file every day)."""
         with self._mutex:
             self._lock()
             try:
                 self._open_current_locked()
-                return os.fstat(self._fd).st_size >= self.spec.max_file_bytes
+                if os.fstat(self._fd).st_size >= self.spec.max_file_bytes:
+                    return True
+                first = parse_record(os.pread(self._fd, chain.MAX_RECORD_BYTES + 64, 0).split(b"\n", 1)[0], self.node, self.spec.source)
+                tail = self._refresh_tail()
+                if first is None or tail.seq is None or tail.seq <= first["seq"]:
+                    return False
+                return (self.clock() - protocol.parse_ts(first["ts"])).total_seconds() >= self.spec.max_age_s
             finally:
                 self._unlock()
 

@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 
 from .. import __version__, gates, protocol
+from ..profile import PROFILE
 from ..audit.log import AuditAdmin
 from ..audit.spec import agent_spec, priv_spec
 from ..t0.runner import FIXED_PATH, RunnerError, trusted_binary
@@ -75,7 +76,7 @@ def protected_devs() -> set:
 def build_context(node: str, agent_user: str = "forgenode") -> Context:
     ssh_keygen = trusted_binary("ssh-keygen")
     pw = pwd.getpwnam(agent_user)
-    table = build_optable()
+    table = build_optable(PROFILE)
     ledger = Ledger(PATHS.ledger)
     priv_log = AuditAdmin(priv_spec(gid=pw.pw_gid), node, now)
     agent_log = AuditAdmin(agent_spec(gid=pw.pw_gid), node, now)

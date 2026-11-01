@@ -1,0 +1,504 @@
+"""Release artifact per profile, signed manifest, version-independent switcher (Design 13.C-13.E, T-REL) and the unit texts / policy templates it carries."""
+import ast
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tarfile
+import zipfile
+from pathlib import Path
+
+import pytest
+from privd_helpers import NOW, SRC
+
+from forge_node import canon, sshsig
+from forge_node.privd.policy_full import parse_full
+from forge_node.release import build, policies, units
+from forge_node.release.switcher import SWITCHER_API, Refused, Switcher, VERSION_RE, main as switcher_main
+from forge_node.t0.policy import OWNER_PRINCIPAL
+
+SRC_ROOT = Path(SRC)
+
+
+@pytest.fixture(scope="module")
+def mkey(tmp_path_factory):
+    d = tmp_path_factory.mktemp("relkey")
+    os.chmod(d, 0o700)
+    priv = d / "owner"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(priv)], check=True, capture_output=True)
+    pub = " ".join((d / "owner.pub").read_text().split()[:2])
+    return priv, pub
+
+
+def docs(text):
+    """All JSON documents in the switcher's output, in order."""
+    dec, i, out = json.JSONDecoder(), 0, []
+    while i < len(text):
+        if text[i].isspace():
+            i += 1
+            continue
+        d, i = dec.raw_decode(text, i)
+        out.append(d)
+    return out
+
+
+class Env:
+    """A fake node: /opt/forge-node tree, ledger, policy dir, signers, recorded systemctl, a doctor whose verdict the test chooses."""
+
+    def __init__(self, tmp: Path, key):
+        self.tmp, (self.priv, self.pub) = tmp, key
+        self.base = tmp / "opt" / "forge-node"
+        (self.base / "releases").mkdir(parents=True)
+        for d in (self.tmp / "opt", self.base, self.base / "releases"):
+            os.chmod(d, 0o755)
+        self.signers = tmp / "allowed_signers"
+        self.signers.write_text(sshsig.allowed_signers_text([(OWNER_PRINCIPAL, self.pub, sshsig.NS_RELEASE)]))
+        os.chmod(self.signers, 0o644)
+        self.policy_dir = tmp / "policy"
+        self.policy_dir.mkdir()
+        self.ledger = tmp / "ledger.sqlite"
+        self.calls = []
+        self.doctor_ok = True
+        self.self_path = tmp / "sbin" / "forge-node-release"
+        self.self_path.parent.mkdir()
+        self.out = __import__("io").StringIO()
+
+    def sign(self, ns=sshsig.NS_RELEASE):
+        return lambda raw: sshsig.sign(raw, self.priv, ns)
+
+    def run(self, argv, stdin, timeout):
+        self.calls.append(list(argv))
+        if argv[0].endswith("ssh-keygen"):
+            r = subprocess.run(argv, input=stdin, capture_output=True, timeout=timeout)
+            return r.returncode, r.stdout, r.stderr
+        if "doctor" in argv:
+            return (0 if self.doctor_ok else 1), b"", b""
+        return 0, b"", b""
+
+    def release(self, ver="0.3.0", profile="full", **kw):
+        out = self.tmp / f"out-{ver}-{profile}"
+        res = build.build_release(ver, profile, out, src_root=SRC_ROOT, sign=kw.pop("sign", self.sign()), **kw)
+        d = self.base / "releases" / ver
+        d.mkdir(parents=True)
+        with tarfile.open(res["tar"]) as tf:                      # exactly 13.C C4: tar -xf ... -C releases/$VER --strip-components=1 --no-same-owner
+            for m in tf.getmembers():
+                m.name = m.name.split("/", 1)[1] if "/" in m.name else ""
+                if m.name:
+                    tf.extract(m, d, filter="tar")
+        os.chmod(d, 0o755)
+        return res
+
+    def switcher(self, **kw) -> Switcher:
+        args = dict(base=str(self.base), root="/opt/forge-node", ledger=str(self.ledger), signers=str(self.signers), policy_dir=str(self.policy_dir), ssh_keygen=shutil.which("ssh-keygen"),
+                    run=self.run, self_path=str(self.self_path), owner_uid=0, out=self.out)
+        args.update(kw)
+        return Switcher(**args)
+
+    def make_ledger(self, user_version=1, state=None):
+        c = sqlite3.connect(self.ledger)
+        c.execute("CREATE TABLE IF NOT EXISTS exec(job_id TEXT, state TEXT)")
+        if state:
+            c.execute("INSERT INTO exec VALUES('j', ?)", (state,))
+        c.execute(f"PRAGMA user_version={user_version}")
+        c.commit()
+        c.close()
+
+
+@pytest.fixture
+def env(tmp_path, mkey):
+    os.chown(tmp_path, 0, 0)
+    os.chmod(tmp_path, 0o755)
+    return Env(tmp_path, mkey)
+
+
+# -------------------------------------------------------------------------------------------------------------------------- artifact
+def test_release_artifact_per_profile_contains_only_profile_ops(env):
+    full = build.build_release("0.3.0", "full", env.tmp / "o-full", src_root=SRC_ROOT, sign=env.sign())
+    t0 = build.build_release("0.3.0", "t0", env.tmp / "o-t0", src_root=SRC_ROOT, sign=env.sign())
+    # open the zipapps straight out of the tars
+    def pyz_names(res):
+        with tarfile.open(res["tar"]) as tf:
+            data = tf.extractfile("forge-node-0.3.0/forge-node.pyz").read()
+        p = env.tmp / f"x-{res['sha256'][:6]}.pyz"
+        p.write_bytes(data)
+        return p, set(zipfile.ZipFile(p).namelist())
+    pf, nf = pyz_names(full)
+    pt, nt = pyz_names(t0)
+    assert "forge_node/privd/ops.py" in nf and "forge_node/privd/opworker.py" in nf
+    assert "forge_node/privd/ops.py" not in nt and "forge_node/privd/opworker.py" not in nt           # g1/g4 get no op code at all (test_g4_profile_has_no_t1_t2_helpers)
+    for names in (nf, nt):
+        assert not [n for n in names if n.startswith("forge_node/hub/") or n.startswith("forge_node/release/") or "test" in n]
+        assert "forge_node/privd/gate.py" in names and "forge_node/privd/privctl.py" in names and "forge_node/cli.py" in names
+    # the built-in profile of each artifact
+    for p, want in ((pf, "full"), (pt, "t0")):
+        code = "import sys; sys.path.insert(0, %r); from forge_node import profile; from forge_node.privd.optable import build_optable; print(profile.PROFILE, sorted(build_optable(profile.PROFILE).names('full')))" % str(p)
+        out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True)
+        assert out.stdout.split()[0] == want, out
+        assert ("selftest.noop" in out.stdout) == (want == "full")
+    # the t0 zipapp refuses to run an op worker; the full one parses its arguments
+    assert subprocess.run([sys.executable, "-I", str(pt), "opworker", "run", "/nonexistent"], capture_output=True).returncode == 2
+    assert b"contains no op worker" in subprocess.run([sys.executable, "-I", str(pt), "opworker", "run", "/x"], capture_output=True).stderr
+    assert subprocess.run([sys.executable, "-I", str(pf), "nonsense"], capture_output=True).returncode == 2
+    assert subprocess.run([sys.executable, "-I", str(pf)], capture_output=True).returncode == 2
+
+
+def test_the_build_is_reproducible_and_carries_a_signed_manifest_of_every_file(env, mkey):
+    a, b = env.release("0.3.0", "full"), build.build_release("0.3.0", "full", env.tmp / "again", src_root=SRC_ROOT, sign=env.sign())
+    assert a["manifest"] == b["manifest"] and a["manifest"]["files"] == b["manifest"]["files"]
+    with tarfile.open(a["tar"]) as t1, tarfile.open(b["tar"]) as t2:
+        assert [(m.name, m.mode, m.uid, m.gid, m.mtime) for m in t1.getmembers()] == [(m.name, m.mode, m.uid, m.gid, m.mtime) for m in t2.getmembers()]
+        for m in t1.getmembers():
+            if m.isfile() and m.name != "forge-node-0.3.0/RELEASE.json.sig":                    # signatures carry no randomness for ed25519, but compare the rest strictly
+                assert t1.extractfile(m).read() == t2.extractfile(m.name).read(), m.name
+    man = a["manifest"]
+    assert man["profile"] == "full" and man["switcher_api"] == SWITCHER_API and set(man["units"]) == set(units.all_units())
+    assert set(man["files"]) == {"forge-node.pyz", "bin/privctl", "sbin/forge-node-release", *[f"units/{u}" for u in units.all_units()], "policy/policy-g2.json", "policy/policy-g3.json"}
+    assert {k for k in build.build_release("0.3.0", "t0", env.tmp / "t0", src_root=SRC_ROOT, sign=env.sign())["manifest"]["files"] if k.startswith("policy/")} == {"policy/policy-g1.json", "policy/policy-g4.json"}
+    # the tar's own signature verifies the way 13.C C2 does it
+    sig = Path(str(a["tar"]) + ".sig").read_text()
+    assert sshsig.verify(Path(a["tar"]).read_bytes(), sig, sshsig.NS_RELEASE, OWNER_PRINCIPAL, env.signers.read_text(), shutil.which("ssh-keygen"))
+    for bad in ("../x", "a b", "", "x" * 70, ".hidden"):
+        with pytest.raises(build.BuildError):
+            build.build_release(bad, "full", env.tmp / "bad", src_root=SRC_ROOT, sign=env.sign())
+    with pytest.raises(build.BuildError):
+        build.build_release("1", "other", env.tmp / "bad", src_root=SRC_ROOT, sign=env.sign())
+
+
+def test_no_unit_files_sudoers_or_keys_are_installed_by_the_builder(env):
+    before = set(os.listdir("/tmp"))
+    env.release("0.3.0", "full")
+    man = json.loads(next((env.base / "releases" / "0.3.0").glob("RELEASE.json")).read_text())
+    assert not [f for f in man["files"] if "sudoers" in f or f.endswith((".key", ".pem")) or "id_" in f]
+    assert not os.path.exists("/etc/systemd/system/forge-node-agent.service") and not os.path.exists("/etc/sudoers.d/forge-node")
+
+
+# -------------------------------------------------------------------------------------------------------------------------- units
+def parse_unit(text):
+    sec, out = None, {}
+    for line in text.splitlines():
+        if line.startswith("["):
+            sec = line[1:-1]
+            out[sec] = {}
+        elif "=" in line:
+            k, _, v = line.partition("=")
+            out[sec][k] = v
+    return out
+
+
+def test_agent_and_privd_units_match_the_design(env):
+    u = {n: parse_unit(t) for n, t in units.all_units().items()}
+    a, p, s = u["forge-node-agent.service"]["Service"], u["forge-node-privd.service"]["Service"], u["forge-node-privd.socket"]["Socket"]
+    assert a["User"] == "forgenode" and a["NoNewPrivileges"] == "yes" and a["CapabilityBoundingSet"] == "" and a["IPAddressDeny"] == "any" and a["IPAddressAllow"].startswith("192.168.10.4/32")
+    assert a["ReadWritePaths"] == "/var/lib/forge-node /var/log/forge-node-agent"          # the agent's directory log path is root-owned; it only appends to the file
+    assert a["ExecStart"].endswith("forge-node.pyz agent run") and a["EnvironmentFile"] == "/etc/forge-node/node.env"
+    assert p["User"] == "root" and p["NoNewPrivileges"] == "yes" and p["ProtectSystem"] == "strict" and p["RestrictAddressFamilies"] == "AF_UNIX" and p["IPAddressDeny"] == "any"
+    assert p["CapabilityBoundingSet"] == "CAP_LINUX_IMMUTABLE CAP_CHOWN" and p["KillMode"] == "process"
+    # test_privd_unit_writes_only_state_log_policy
+    assert set(p["ReadWritePaths"].split()) == {"/var/lib/forge-node-priv", "/var/log/forge-node-priv", "/var/log/forge-node-agent", "/run/forge-node", "/etc/forge-node"}
+    assert s == {"ListenStream": "/run/forge-node/priv.sock", "SocketMode": "0660", "SocketUser": "root", "SocketGroup": "forgenode", "DirectoryMode": "0755", "Accept": "no", "RemoveOnStop": "yes"}
+    assert u["forge-node-audit-rotate.timer"]["Timer"]["Persistent"] == "yes" and "audit-rotate due" in u["forge-node-audit-rotate.service"]["Service"]["ExecStart"]
+    for name, t in units.all_units().items():
+        assert "sudo" not in t and "\t" not in t and not any(line.endswith(" ") for line in t.splitlines()), name
+
+
+def test_units_are_linked_to_current_not_copied(env):
+    env.release("0.3.0", "full")
+    sw = env.switcher()
+    assert sw.cmd_install_first("0.3.0") == 0
+    links = [c for c in env.calls if c[:2] == ["/usr/bin/systemctl", "link"]]
+    assert sorted(c[2] for c in links) == sorted(f"/opt/forge-node/current/units/{u}" for u in units.all_units())      # via `current`, never a version directory
+    assert ["/usr/bin/systemctl", "daemon-reload"] in env.calls and not [c for c in env.calls if c[1:2] in (["enable"], ["start"])]
+    assert os.readlink(env.base / "current") == "releases/0.3.0" and (env.base / "profile").read_text() == "full\n"
+
+
+# --------------------------------------------------------------------------------------------------------------------------- switching
+def test_release_switch_moves_agent_ops_units_together(env):
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    env.calls.clear()
+    assert sw.cmd_switch("0.3.1") == 0
+    seq = [(c[1], c[2:]) for c in env.calls if c[0] == "/usr/bin/systemctl"]
+    assert seq[0] == ("stop", ["forge-node-agent.service"])                                  # quiesce first
+    assert seq[1] == ("stop", ["forge-node-privd.service", "forge-node-privd.socket", "forge-node-audit-rotate.timer"])
+    assert seq[-1] == ("start", ["forge-node-privd.socket", "forge-node-agent.service", "forge-node-audit-rotate.timer"])
+    assert os.readlink(env.base / "current") == "releases/0.3.1" and os.readlink(env.base / "previous") == "releases/0.3.0"
+    assert any("doctor" in c for c in env.calls)                                              # doctor ran after the switch, as forgenode
+    # ONE pointer moves agent, privd, op table and units: everything version-bound is inside the release directory
+    man = json.loads((env.base / "releases" / "0.3.1" / "RELEASE.json").read_text())
+    assert "forge-node.pyz" in man["files"] and all(f"units/{u}" in man["files"] for u in man["units"])
+
+
+def test_a_failing_doctor_restores_the_previous_release_by_itself(env):
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    env.doctor_ok = False
+    assert sw.cmd_switch("0.3.1") == 1
+    assert os.readlink(env.base / "current") == "releases/0.3.0"
+    res = docs(env.out.getvalue())[-1]
+    assert res["restored"] == "0.3.0" and res["doctor"] == "failed" and res["switched"] is None
+
+
+def test_rollback_refused_on_state_schema_outside_window(env):
+    env.release("0.3.0", "full")
+    env.release("0.2.0", "full", state_window=(2, 3))                                       # an older release that cannot run on schema 1
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger(user_version=1)
+    with pytest.raises(Refused, match="state schema 1 is outside the window 2..3"):
+        sw.cmd_switch("0.2.0")
+    with pytest.raises(Refused):
+        sw.cmd_check("0.2.0")
+    assert os.readlink(env.base / "current") == "releases/0.3.0" and not [c for c in env.calls if c[1:2] == ["stop"]]      # nothing was touched, not even stopped
+
+
+def test_rollback_refused_while_ledger_nonterminal(env):
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    for state in ("received", "started", "effect_done", "reconciling"):
+        env.ledger.unlink(missing_ok=True)
+        env.make_ledger(state=state)
+        env.calls.clear()
+        with pytest.raises(Refused, match="not terminal"):
+            sw.cmd_switch("0.3.1")
+        assert os.readlink(env.base / "current") == "releases/0.3.0"
+        stops = [c for c in env.calls if c[1:2] == ["stop"]]
+        assert stops == [["/usr/bin/systemctl", "stop", "forge-node-agent.service"]]          # the agent was stopped to freeze the ledger, found it non-terminal, and was started again
+        assert env.calls[-1] == ["/usr/bin/systemctl", "start", "forge-node-agent.service"]
+    env.ledger.unlink()
+    env.make_ledger(state="committed")                                                       # terminal rows do not block
+    assert sw.cmd_switch("0.3.1") == 0
+
+
+def test_the_ledger_is_reread_after_the_agent_is_stopped(env):
+    """G28: an op that is claimed between 'the check looked clean' and 'current is moved' must stop the switch. The ledger is read AFTER the agent was stopped."""
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    real_run = env.run
+
+    def run(argv, stdin, timeout):
+        if argv[:3] == ["/usr/bin/systemctl", "stop", "forge-node-agent.service"]:
+            c = sqlite3.connect(env.ledger)
+            c.execute("INSERT INTO exec VALUES('late', 'started')")                          # the last in-flight delivery lands while the agent is being stopped
+            c.commit()
+            c.close()
+        return real_run(argv, stdin, timeout)
+    sw.run = run
+    with pytest.raises(Refused, match="not terminal"):
+        sw.cmd_switch("0.3.1")
+    assert os.readlink(env.base / "current") == "releases/0.3.0"
+
+
+def test_rollback_keeps_ledger_audit_policy_untouched(env):
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    (env.policy_dir / "policy-1.json").write_text('{"schema":1}')
+    audit = env.tmp / "audit"
+    audit.mkdir()
+    (audit / "priv.jsonl").write_text("x\n")
+    env.make_ledger(state="committed")
+
+    def snap():
+        return {str(p): (p.stat().st_mtime_ns, p.stat().st_size, p.read_bytes()) for d in (env.policy_dir, audit) for p in d.rglob("*") if p.is_file()} | {"ledger": env.ledger.read_bytes()}
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    before = snap()
+    assert sw.cmd_switch("0.3.1") == 0 and sw.cmd_switch("0.3.0") == 0
+    assert snap() == before
+
+
+def test_switcher_supports_lower_switcher_api_and_refuses_higher_with_self_update_hint(env):
+    env.release("0.3.0", "full")
+    env.release("0.4.0", "full", switcher_api=SWITCHER_API + 1)
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    with pytest.raises(Refused, match="switcher_api 2.*self-update 0.4.0"):
+        sw.cmd_check("0.4.0")
+    with pytest.raises(Refused):
+        sw.cmd_switch("0.4.0")
+    env.release("0.2.5", "full", switcher_api=SWITCHER_API - 1 if SWITCHER_API > 0 else 0)  # equal-or-lower api is fine
+    assert sw.cmd_check("0.2.5") == 0
+
+
+def test_switcher_self_update_verifies_signature_and_keeps_prev(env):
+    env.release("0.3.0", "full")
+    sw = env.switcher()
+    env.self_path.write_text("#!/bin/sh\necho old\n")
+    assert sw.cmd_self_update("0.3.0") == 0
+    new = env.self_path.read_bytes()
+    assert new == (SRC_ROOT / "forge_node" / "release" / "switcher.py").read_bytes() and os.access(env.self_path, os.X_OK)
+    assert Path(str(env.self_path) + ".prev").read_text() == "#!/bin/sh\necho old\n"           # rollback of the switcher: mv forge-node-release.prev forge-node-release
+    # a release whose switcher was swapped after signing is refused and nothing is installed
+    env.release("0.3.1", "full")
+    sw_path = env.base / "releases" / "0.3.1" / "sbin" / "forge-node-release"
+    os.chmod(sw_path, 0o755)
+    sw_path.write_text("#!/bin/sh\nrm -rf /\n")
+    before = env.self_path.read_bytes()
+    with pytest.raises(Refused, match="differs from RELEASE.json"):
+        sw.cmd_self_update("0.3.1")
+    assert env.self_path.read_bytes() == before
+    # and a signature by anybody but the owner
+    other = env.tmp / "otherkey"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(other)], check=True, capture_output=True)
+    env.release("0.3.2", "full", sign=lambda raw: sshsig.sign(raw, other, sshsig.NS_RELEASE))
+    with pytest.raises(Refused, match="owner signature"):
+        sw.cmd_self_update("0.3.2")
+
+
+def test_tampered_or_odd_release_trees_are_refused(env):
+    env.release("0.3.0", "full")
+    sw = env.switcher()
+    d = env.base / "releases" / "0.3.0"
+    assert sw.cmd_check("0.3.0") == 0
+    # extra file / changed file / missing file / symlink / hard link / group-writable file or directory / wrong owner is checked via mode+uid
+    (d / "units" / "evil.service").write_text("[Service]\nExecStart=/bin/sh\n")
+    with pytest.raises(Refused, match="not listed"):
+        sw.cmd_check("0.3.0")
+    (d / "units" / "evil.service").unlink()
+    (d / "bin" / "privctl").write_text("#!/bin/sh\necho pwned\n")
+    with pytest.raises(Refused, match="differs from RELEASE.json"):
+        sw.cmd_check("0.3.0")
+    shutil.rmtree(d)
+    env.release("0.3.0", "full")
+    (d / "units" / "forge-node-agent.service").unlink()
+    with pytest.raises(Refused, match="listed but missing"):
+        sw.cmd_check("0.3.0")
+    shutil.rmtree(d)
+    env.release("0.3.0", "full")
+    os.chmod(d / "forge-node.pyz", 0o666)
+    with pytest.raises(Refused, match="only root can write"):
+        sw.cmd_check("0.3.0")
+    os.chmod(d / "forge-node.pyz", 0o644)
+    os.symlink("/etc/passwd", d / "units" / "link.service")
+    with pytest.raises(Refused):
+        sw.cmd_check("0.3.0")
+    os.unlink(d / "units" / "link.service")
+    os.link(d / "forge-node.pyz", d / "units" / "hard.service")
+    with pytest.raises(Refused):
+        sw.cmd_check("0.3.0")
+    os.unlink(d / "units" / "hard.service")
+    os.chmod(d, 0o775)
+    with pytest.raises(Refused, match="root-owned directory"):
+        sw.cmd_check("0.3.0")
+    os.chmod(d, 0o755)
+    assert sw.cmd_check("0.3.0") == 0
+    # RELEASE.json edited (e.g. a lower state_min) => the signature no longer verifies
+    man = json.loads((d / "RELEASE.json").read_text())
+    man["state_min"] = 0
+    (d / "RELEASE.json").write_text(json.dumps(man, indent=1, sort_keys=True) + "\n")
+    with pytest.raises(Refused, match="owner signature"):
+        sw.cmd_check("0.3.0")
+
+
+def test_signature_namespace_profile_and_version_must_match(env):
+    sw = env.switcher()
+    env.release("0.3.0", "full", sign=lambda raw: sshsig.sign(raw, env.priv, sshsig.NS_POLICY))        # signed in the policy namespace (signer allows only release)
+    with pytest.raises(Refused, match="owner signature"):
+        sw.cmd_check("0.3.0")
+    shutil.rmtree(env.base / "releases" / "0.3.0")
+    env.release("0.3.0", "full")
+    sw.cmd_install_first("0.3.0")
+    env.release("0.9.0", "t0")                                                               # a t0 artifact on a full node
+    with pytest.raises(Refused, match="profile mismatch"):
+        sw.cmd_check("0.9.0")
+    shutil.move(env.base / "releases" / "0.9.0", env.base / "releases" / "0.9.9")
+    with pytest.raises(Refused, match="another release|profile mismatch"):
+        sw.cmd_check("0.9.9")
+    for bad in ("../0.3.0", "0.3.0/..", "", "a b", "-rf"):
+        with pytest.raises(Refused, match="invalid version"):
+            sw.cmd_check(bad)
+
+
+def test_install_first_refuses_when_something_is_current_and_switch_refuses_without_current(env):
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    with pytest.raises(Refused, match="no release is current"):
+        sw.cmd_switch("0.3.1")
+    sw.cmd_install_first("0.3.0")
+    with pytest.raises(Refused, match="already current"):
+        sw.cmd_install_first("0.3.1")
+    with pytest.raises(Refused, match="already current"):
+        sw.cmd_switch("0.3.0")
+
+
+def test_policy_schema_newer_than_the_release_supports_blocks_a_rollback(env):
+    env.release("0.3.0", "full")
+    env.release("0.2.0", "full", policy_schema=0)
+    (env.policy_dir / "policy-3.json").write_text(json.dumps({"schema": 1, "serial": 3}))
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    with pytest.raises(Refused, match="installed policy has schema 1"):
+        sw.cmd_check("0.2.0")
+
+
+def test_status_cli_and_usage(env, capsys):
+    env.release("0.3.0", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.out.truncate(0)
+    env.out.seek(0)
+    assert switcher_main(["status"], sw) == 0
+    doc = json.loads(env.out.getvalue())
+    assert doc["current"] == "0.3.0" and doc["profile"] == "full" and doc["releases"] == ["0.3.0"] and doc["switcher_api"] == SWITCHER_API
+    for argv in ([], ["bogus"], ["switch"], ["check", "a", "b"], ["status", "x"]):
+        assert switcher_main(argv, sw) == 2
+    assert switcher_main(["check", "9.9.9"], sw) == 1                                         # refused/failed -> exit 1, message on stderr
+    assert "refused" in capsys.readouterr().err
+
+
+def test_the_switcher_is_stdlib_only_and_independent_of_the_release_tree():
+    tree = ast.parse((SRC_ROOT / "forge_node" / "release" / "switcher.py").read_text())
+    mods = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            mods |= {a.name.split(".")[0] for a in n.names}
+        if isinstance(n, ast.ImportFrom):
+            assert n.level == 0, "relative import: the switcher must not depend on forge_node"
+            mods.add((n.module or "").split(".")[0])
+    assert mods <= {"hashlib", "json", "os", "re", "sqlite3", "stat", "subprocess", "sys", "tempfile"} and "forge_node" not in mods
+    assert len((SRC_ROOT / "forge_node" / "release" / "switcher.py").read_text().splitlines()) < 400        # "a few hundred lines"
+
+
+# --------------------------------------------------------------------------------------------------------------------- policy templates
+def fill(doc):
+    s = json.dumps(doc).replace("__HUB_TLS_PIN__", "ab" * 32).replace("__HUB_GATE_PUB__", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOCnQJdkGAnqC9RpKFPyX3e4R8Y5v0QG9hJmFqQqkG8E")
+    return s.encode()
+
+
+@pytest.mark.parametrize("nid", sorted(policies.NODES))
+def test_policy_templates_are_valid_once_filled_and_invalid_before(nid):
+    from privd_helpers import gates_with
+    prof = policies.NODES[nid]["profile"]
+    kw = dict(expect_node=nid, file_serial=1, now=NOW, gates_map=__import__("forge_node").gates.GATES, table_ops=lambda p: frozenset(), devof=lambda p: 1, protected_devs=lambda: set())
+    doc = policies.template(nid)
+    pol = parse_full(fill(doc), **kw)
+    assert pol.profile == prof and pol.global_mode == "observe" and pol.tiers == (0,) and not pol.ops and pol.workloads_enabled is False
+    assert bool(pol.forge_roots) == (policies.NODES[nid]["forge_root"] is not None)
+    from forge_node.t0.policy import PolicyError
+    with pytest.raises(PolicyError):
+        parse_full(json.dumps(doc).encode(), **kw)                                          # placeholders unfilled: never applicable
+    assert "__" in json.dumps(doc)
+    assert not pol.view.t0.units_for_logs or all(lu.unit.startswith("forge-") for lu in pol.view.t0.units_for_logs)        # no KMU logs by default (OQ-7)
+
+
+def test_t0_templates_have_no_forge_roots_and_g2_g3_values_match_13d():
+    assert "forge_roots" not in policies.template("g1") and "forge_roots" not in policies.template("g4")
+    r2, r3 = policies.template("g2")["forge_roots"][0], policies.template("g3")["forge_roots"][0]
+    assert (r2["path"], r2["size_bytes"], r2["min_free_bytes"]) == ("/srv/forge/node", 107374182400, 214748364800)
+    assert (r3["path"], r3["size_bytes"], r3["min_free_bytes"]) == ("/var/lib/forge-node/data", 53687091200, 161061273600)
+    d = (SRC_ROOT.parent / "docs" / "design" / "FORGE_NODE.md").read_text()
+    assert "107374182400" in d and "53687091200" in d

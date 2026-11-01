@@ -23,7 +23,7 @@ class Clock:
         return self.t
 
 
-def make_specs(base: str, max_file_bytes=64 * 1024 * 1024) -> dict[str, LogSpec]:
+def make_specs(base: str, max_file_bytes=64 * 1024 * 1024, max_age_s=86400) -> dict[str, LogSpec]:
     """priv + agent log layout below `base` exactly as the install creates it (root-owned directories)."""
     d = {}
     os.makedirs(f"{base}/priv", exist_ok=True)
@@ -35,8 +35,8 @@ def make_specs(base: str, max_file_bytes=64 * 1024 * 1024) -> dict[str, LogSpec]
     os.chmod(f"{base}/agent", 0o755)
     os.chown(f"{base}/locks", 0, 0)
     os.chmod(f"{base}/locks", 0o700)
-    d["priv"] = LogSpec("priv", "priv", f"{base}/priv", f"{base}/locks/priv.log.lock", AGENT_GID, 0, 0o640, 0o750, 0o600, base, max_file_bytes)
-    d["agent"] = LogSpec("agent", "audit", f"{base}/agent", f"{base}/agent/audit.lock", AGENT_GID, 0, 0o660, 0o755, 0o660, base, max_file_bytes)
+    d["priv"] = LogSpec("priv", "priv", f"{base}/priv", f"{base}/locks/priv.log.lock", AGENT_GID, 0, 0o640, 0o750, 0o600, base, max_file_bytes, max_age_s)
+    d["agent"] = LogSpec("agent", "audit", f"{base}/agent", f"{base}/agent/audit.lock", AGENT_GID, 0, 0o660, 0o755, 0o660, base, max_file_bytes, max_age_s)
     return d
 
 

@@ -86,7 +86,7 @@ class PrivdEnv:
         os.environ.update({"FN_TEST_SRC": SRC, "FN_TEST_POLICY_DIR": self.paths.policy_dir, "FN_TEST_SIGNERS": self.paths.allowed_signers, "FN_TEST_SSH_KEYGEN": shutil.which("ssh-keygen"),
                            "FORGE_NODE_NODE_ID": NODE})
         self.worker_script = worker_script
-        self.table = optable_mod.build_optable()
+        self.table = optable_mod.build_optable("full")
         self.ssh_keygen = shutil.which("ssh-keygen")
         self.ctx = self.make_context()
 

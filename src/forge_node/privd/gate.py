@@ -612,16 +612,20 @@ def s_policy_apply(st: State) -> None:
 # ----------------------------------------------------------------------------------------------------------------------- audit.rotate
 def s_audit_rotate(st: State) -> None:
     ctx, b = st.ctx, st.req.body
-    if set(b) != {"log"} or b["log"] not in ("priv", "agent", "both"):
-        raise Deny("DENY_PARAM", "audit.rotate needs {log: priv|agent|both}")
+    if set(b) - {"log", "when"} or "log" not in b or b["log"] not in ("priv", "agent", "both") or b.get("when", "now") not in ("now", "due"):
+        raise Deny("DENY_PARAM", "audit.rotate needs {log: priv|agent|both[, when: now|due]}")
     out = {}
+    due_only = b.get("when", "now") == "due"
     try:
-        if b["log"] in ("priv", "both"):
-            out["priv"] = ctx.priv_log.rotate()
-        if b["log"] in ("agent", "both"):
-            if ctx.agent_log is None:
-                raise Deny("DENY_PARAM", "this node has no agent log")
-            out["agent"] = ctx.agent_log.rotate()
+        for name, log in (("priv", ctx.priv_log), ("agent", ctx.agent_log)):
+            if b["log"] not in (name, "both"):
+                continue
+            if log is None:
+                raise Deny("DENY_PARAM", "this node has no such log")
+            if due_only and not log.due():
+                out[name] = None                                                   # not due: nothing rotated
+            else:
+                out[name] = log.rotate()
     except (AuditDown, AuditCorrupt) as e:
         raise Deny("DENY_AUDIT_DOWN", f"rotation failed ({type(e).__name__}: {e})") from e
     st.reply = {"ok": True, "rotated": out}

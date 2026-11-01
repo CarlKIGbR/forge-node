@@ -28,7 +28,7 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def build(cfg: AgentConfig, *, runner, clock, log, probe, ssh_keygen: str) -> Agent:
+def build(cfg: AgentConfig, *, runner, clock, log, probe, ssh_keygen: str, priv=None) -> Agent:
     """Wire the agent. runner/clock/log/probe are required: main() passes the real ones; the tests pass fakes of the same two-method interfaces. Everything that guards is built here
     from the policy view and the config, never taken from a caller."""
     import os
@@ -43,7 +43,23 @@ def build(cfg: AgentConfig, *, runner, clock, log, probe, ssh_keygen: str) -> Ag
         engine = T0Engine(node=cfg.node_id, env=env, limiter=limiter, probe=probe, spool=spool, node_cert_path=cfg.node_cert, hub_cert_der=client.hub_certificate_der)
         return Runtime(view, client, engine)
 
-    return Agent(cfg, PolicyHolder(cfg, clock, log, ssh_keygen), build_runtime, spool, lambda rt: metrics.Sampler(rt.engine), clock, ssh_keygen, log=log)
+    return Agent(cfg, PolicyHolder(cfg, clock, log, ssh_keygen), build_runtime, spool, lambda rt: metrics.Sampler(rt.engine), clock, ssh_keygen, log=log, priv=priv)
+
+
+def _priv_link(cfg: AgentConfig):
+    """The agent's link to privd and its own audit log. The log is optional at start (a node that has not run `privctl audit-init` yet is T0-only): without it nothing above T0 is
+    relayed."""
+    import os
+    from ..audit.log import Appender
+    from ..audit.spec import AuditDown, agent_spec
+    from ..privd.client import PrivClient
+    from .privlink import PrivLink
+    audit = None
+    try:
+        audit = Appender(agent_spec(gid=os.getegid()), cfg.node_id, _now)
+    except AuditDown as e:
+        _log(f"audit log not available ({e}): relaying nothing above T0")
+    return PrivLink(client=PrivClient(cfg.priv_socket, cfg.owner_uid, 150), audit=audit, log=_log)
 
 
 def main(argv=None) -> int:
@@ -64,7 +80,7 @@ def main(argv=None) -> int:
     except RunnerError as e:
         sys.stderr.write(f"cannot start: {e}\n")
         return 2
-    agent = build(cfg, runner=ReadOnlyRunner(), clock=_now, log=_log, probe=SocketProbeClient(cfg.priv_socket, expect_uid=cfg.owner_uid), ssh_keygen=ssh_keygen)
+    agent = build(cfg, runner=ReadOnlyRunner(), clock=_now, log=_log, probe=SocketProbeClient(cfg.priv_socket, expect_uid=cfg.owner_uid), ssh_keygen=ssh_keygen, priv=_priv_link(cfg))
     signal.signal(signal.SIGTERM, lambda *_: agent.stop())
     signal.signal(signal.SIGINT, lambda *_: agent.stop())
     agent.run()

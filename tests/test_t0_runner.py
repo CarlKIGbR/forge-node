@@ -235,7 +235,9 @@ def test_subprocess_is_imported_only_by_runner_and_sshsig():
     importers = sorted(str(p.relative_to(root)) for p in root.rglob("*.py") if any(
         (isinstance(n, ast.Import) and any(a.name.split(".")[0] == "subprocess" for a in n.names)) or (isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == "subprocess")
         for n in ast.walk(ast.parse(p.read_text()))))
-    assert importers == ["sshsig.py", "t0/runner.py"]
+    # N2: the closed read-only command table and ssh-keygen. N3 adds exactly the places that start transient units or build the release: the systemd backend and the local-process test
+    # double (privd/units.py), privd's trusted command wrapper (privd/main.py) and the switcher (release/switcher.py). The release BUILDER starts nothing (it only writes files).
+    assert importers == ["privd/main.py", "privd/units.py", "release/switcher.py", "sshsig.py", "t0/runner.py"]
     for p in root.rglob("*.py"):
         t = p.read_text()
         assert not re.search(r"\bos\.(system|popen|exec[lv]p?e?|spawn\w*)\(", t), p

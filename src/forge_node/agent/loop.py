@@ -98,7 +98,9 @@ class PolicyHolder:
 
 
 class Agent:
-    def __init__(self, cfg, holder: PolicyHolder, build_runtime, spool, sampler_factory, clock, ssh_keygen, sleep=time.sleep, log=None, rng=None):
+    def __init__(self, cfg, holder: PolicyHolder, build_runtime, spool, sampler_factory, clock, ssh_keygen, sleep=time.sleep, log=None, rng=None, priv=None):
+        """`priv` (PrivLink) is the only way to anything privileged. Without it this agent is the N2 agent: tier 0 only, everything above is denied DENY_TIER_DISABLED."""
+        self.priv = priv
         self.cfg, self.holder, self.build_runtime, self.spool, self.sampler_factory = cfg, holder, build_runtime, spool, sampler_factory
         self.clock, self.sleep, self.ssh_keygen = clock, sleep, ssh_keygen
         self.log = log or (lambda m: None)
@@ -138,8 +140,18 @@ class Agent:
         if rt is None:
             return "no_policy"
         now = self.clock()
+        heads, open_jobs = {}, []
+        if self.priv is not None:
+            st = self.priv.status()
+            if st is not None:
+                if isinstance(st.get("audit_heads", {}).get("priv"), dict) and "seq" in st["audit_heads"]["priv"]:
+                    heads["priv"] = st["audit_heads"]["priv"]
+                open_jobs = [j for j in st.get("open_jobs", []) if isinstance(j, dict)][:64]
+            ah = self.priv.audit_head()
+            if ah is not None:
+                heads["agent"] = ah
         body = {"v": PROTOCOL_VERSION, "version": __version__, "policy": {"serial": rt.policy.serial, "sha256": rt.policy.sha256}, "clock": protocol.fmt_ts(now),
-                "spool_depth": self.spool.depth(), "audit_heads": {}, "open_jobs": [], "wait_s": wait_s}
+                "spool_depth": self.spool.depth(), "audit_heads": heads, "open_jobs": open_jobs, "wait_s": wait_s}
         try:
             resp = rt.client.poll(body)
             self._fail = 0
@@ -165,8 +177,12 @@ class Agent:
         except ProtoError as e:
             self.log(f"hub response discarded: {e.code} {e.detail[:80]}")
             return "bad_response"
-        if resp["reconcile"]:
-            self.log(f"hub asked to reconcile {len(resp['reconcile'])} job(s): this release has no ledger (N3)")
+        if self.priv is not None:
+            self.priv.put_lease(resp["lease"])                       # privd verifies it itself; the agent merely carries it
+        elif resp["reconcile"]:
+            self.log(f"hub asked to reconcile {len(resp['reconcile'])} job(s): this agent has no link to privd")
+        for job_id in resp["reconcile"][:16]:
+            self._reconcile(rt, job_id)
         latest = resp["policy_serial_latest"]
         if isinstance(latest, int) and not isinstance(latest, bool) and latest > rt.policy.serial:
             self._maybe_stage_policy(rt, latest)
@@ -185,13 +201,16 @@ class Agent:
             self.log(f"job rejected: {e.code} {e.detail[:80]}")           # unverifiable: nothing is posted for an id we cannot trust
             return
         if job["tier"] != 0:
-            outcome = Outcome("denied", "DENY_TIER_DISABLED", "this release executes tier 0 only")
+            self._relay(rt, env, job)
+            return
         else:
             try:
                 outcome = rt.engine.execute(job["op"], job["tier"], job["params"])
             except Exception as e:  # noqa: BLE001 - the engine reports its own failures as outcomes; this is the last line of defence for the loop
                 self.log(f"engine: unexpected {type(e).__name__}")
                 outcome = Outcome("failed", "FAIL_EXEC", type(e).__name__)
+        if self.priv is not None:
+            self.priv.record("t0", {"job_id": job["job_id"], "op": job["op"], "status": outcome.status, "reason_code": outcome.reason_code})        # T0 continues if the log is down
         status = outcome.status if outcome.status != "committed" or not job["dry_run"] else "dry_run"
         text = outcome.output if outcome.status == "committed" else redact_light(outcome.output)[:512]
         result = {"attempt": min(job["delivery_seq"], 1000), "status": status, "reason_code": outcome.reason_code, "output": text, "audit_seq_range": None, "plan_hash": None}
@@ -201,6 +220,52 @@ class Agent:
             self.log(f"internal: result for {job['job_id']} invalid ({e.detail})")
             result = {**result, "status": "failed", "reason_code": "FAIL_EXEC", "output": "result could not be encoded"}
         self._post(rt, job["job_id"], result)
+
+    def _relay(self, rt: Runtime, env: dict, job: dict):
+        """Tiers 1-3: the agent executes nothing. It records the relay in its own audit log FIRST (if that is impossible nothing is relayed), hands the hub-signed envelope to privd and
+        posts what privd answers."""
+        attempt = min(job["delivery_seq"], 1000)
+        if self.priv is None:
+            self._post(rt, job["job_id"], self._result(attempt, "denied", "DENY_TIER_DISABLED", "this agent has no link to privd"))
+            return
+        seq = self.priv.record("relay", {"job_id": job["job_id"], "op": job["op"], "tier": job["tier"], "delivery_seq": job["delivery_seq"], "phase": "relay"})
+        if seq is None:
+            self._post(rt, job["job_id"], self._result(attempt, "denied", "DENY_AUDIT_DOWN", "the agent's audit log cannot be written: nothing above T0 is relayed"))
+            return
+        reply = self.priv.execute(env)
+        if reply is None:
+            self._post(rt, job["job_id"], self._result(attempt, "denied", "DENY_STALE_LEASE", "privd is not reachable"))
+            return
+        if reply.get("in_progress"):
+            return                                                    # the result follows (re-attach / reconcile); the hub asks via open_jobs
+        if reply.get("ok") and isinstance(reply.get("result"), dict):
+            r = {k: v for k, v in reply["result"].items() if k != "job_id"}
+            self.priv.record("relay", {"job_id": job["job_id"], "op": job["op"], "tier": job["tier"], "phase": "result", "status": r.get("status"), "reason_code": r.get("reason_code")})
+            self._post_validated(rt, job["job_id"], r)
+            return
+        code = reply.get("code") if reply.get("code") in protocol.REASON_CODES else "DENY_STALE_LEASE"
+        self.priv.record("denial", {"job_id": job["job_id"], "op": job["op"], "tier": job["tier"], "reason_code": code})
+        self._post(rt, job["job_id"], self._result(attempt, "denied", code, str(reply.get("detail", ""))[:300]))
+
+    @staticmethod
+    def _result(attempt: int, status: str, code: str | None, output: str) -> dict:
+        return {"attempt": attempt, "status": status, "reason_code": code, "output": redact_light(output)[:512], "audit_seq_range": None, "plan_hash": None}
+
+    def _post_validated(self, rt: Runtime, job_id: str, result: dict):
+        try:
+            protocol.validate_result(result)
+        except ProtoError as e:
+            self.log(f"privd result for {job_id} invalid ({e.detail})")
+            result = self._result(1, "failed", "FAIL_EXEC", "result could not be encoded")
+        self._post(rt, job_id, result)
+
+    def _reconcile(self, rt: Runtime, job_id: str):
+        """The hub asked about a job it believes is open: privd answers from its ledger (and, if the row is interrupted, runs the serialized reconciliation) - never from agent memory."""
+        if self.priv is None:
+            return
+        reply = self.priv.reconcile(job_id)
+        if reply and reply.get("ok") and isinstance(reply.get("result"), dict):
+            self._post_validated(rt, job_id, {k: v for k, v in reply["result"].items() if k != "job_id"})
 
     def _post(self, rt: Runtime, job_id: str, result: dict):
         try:
@@ -244,7 +309,12 @@ class Agent:
         except Exception as e:  # noqa: BLE001 - staging is best effort; whatever goes wrong must not abort the handling of this response (its jobs)
             self.log(f"policy {serial} not staged: {type(e).__name__}")
             return
-        self.log(f"policy {serial}: signature verified, staged for privd/privctl (not active)")
+        if self.priv is None:
+            self.log(f"policy {serial}: signature verified, staged for privctl (not active)")
+            return
+        import base64
+        r = self.priv.apply_policy(base64.b64encode(doc["policy"].encode("utf-8")).decode("ascii"), doc["sig"])        # privd re-verifies EVERYTHING from the bytes it is given
+        self.log(f"policy {serial}: handed to privd ({'applied' if r and r.get('ok') else 'refused: ' + str(None if r is None else r.get('code'))})")
 
     def _write_staged(self, serial: int, doc: dict):
         """Staged policy blobs: written through descriptors (state dir -> staging dir), names built from the validated integer serial only, temp file O_EXCL, rename inside the

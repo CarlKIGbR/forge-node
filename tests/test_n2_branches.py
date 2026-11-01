@@ -559,7 +559,7 @@ def test_selfcheck_ok_when_everything_required_is_present(tmp_path):
     assert r["missing_required_commands"] == [] and r["cgroup_v2_system_slice"] is True and r["ok"] is True
 
 
-def test_reconcile_requests_are_logged_not_acted_on_and_invalid_results_become_failures(tmp_path, monkeypatch):
+def test_reconcile_requests_without_a_privd_link_are_logged_not_acted_on_and_invalid_results_become_failures(tmp_path, monkeypatch):
     resp_holder = {}
     client = StubClient()
     ag = stub_agent(tmp_path, client)
@@ -567,7 +567,7 @@ def test_reconcile_requests_are_logged_not_acted_on_and_invalid_results_become_f
     from conftest import lease_payload, job_payload
     monkeypatch.setattr(L.protocol, "verify_lease", lambda env, keys, node, now, last, kg: lease_payload(node="g2", seq=last + 1))
     resp = {"v": 1, "lease": {}, "jobs": [], "reconcile": ["x"], "policy_serial_latest": 0, "server_time": "2026-10-31T13:40:10Z"}
-    assert ag._handle(rt, resp) == "idle" and any("no ledger" in m for m in ag.logs)
+    assert ag._handle(rt, resp) == "idle" and any("no link to privd" in m for m in ag.logs)
 
     class Weird:
         env = None
