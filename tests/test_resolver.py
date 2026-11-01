@@ -92,17 +92,23 @@ def test_stop_closure_of_conflicted_unit_checked():
     assert "kmu-app.service" in hit_units(r) and "kmu-app.service" in r.S
 
 
-def test_stop_action_reverse_closure_and_partof_restart_propagation():
+def test_stop_action_reverse_closure_is_checked():
     g = graph(U("forge-x.service", RequiredBy="kmu-a.service"), U("kmu-a.service"))
     assert "kmu-a.service" in hit_units(res(g, action="stop"))
+
+
+def test_partof_restart_propagation_detected():
     g = graph(U("forge-x.service", ConsistsOf="kmu-part.service"), U("kmu-part.service", PartOf="forge-x.service"))
     r = res(g, action="restart")
     assert "kmu-part.service" in hit_units(r) and "kmu-part.service" in r.members
 
 
-def test_reload_propagation_and_enable_disable_boot_effect():
+def test_reload_propagation_is_checked():
     g = graph(U("forge-x.service", PropagatesReloadTo="kmu-r.service"), U("kmu-r.service"))
     assert "kmu-r.service" in hit_units(res(g, action="reload"))
+
+
+def test_enable_disable_wantedby_boot_effect_checked():
     g = graph(U("forge-x.service", WantedBy="kmu-boot.target"), U("kmu-boot.target"))
     for a in ("enable", "disable", "mask", "unmask"):
         assert "kmu-boot.target" in hit_units(res(g, action=a)), a
@@ -117,7 +123,7 @@ def test_socket_timer_triggers_included():
     assert "forge-x.service" in r.F and "kmu-db.service" in hit_units(r)
 
 
-def test_protected_fragment_path_and_dropin_denied():
+def test_protected_unit_fragmentpath_denied():
     g = graph(U("forge-x.service", Wants="odd.service"), U("odd.service", FragmentPath="/opt/kmu-ai/units/odd.service", ActiveState="inactive"))
     assert "odd.service" in hit_units(res(g))
     g = graph(U("forge-x.service", DropInPaths="/srv/models/override.conf"))

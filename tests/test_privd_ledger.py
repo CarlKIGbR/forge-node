@@ -201,7 +201,7 @@ def test_reconcile_stops_worker_and_confirms_dead_before_probe(privd_env, fifo, 
     assert not (wd / "effect.mark").exists() and not active(e, job)
 
 
-def test_unconfirmable_worker_death_is_indeterminate_and_locks_the_target(privd_env, fifo, monkeypatch):
+def test_unconfirmable_worker_death_is_indeterminate(privd_env, fifo, monkeypatch):
     e = privd_env.ready()
     body, job = apply_job(e)
     monkeypatch.setenv("FN_TEST_BLOCK", "before")
@@ -235,27 +235,56 @@ def test_unconfirmable_worker_death_is_indeterminate_and_locks_the_target(privd_
     fresh.backend.stop(op_unit_name(job["job_id"], 1))
 
 
-def test_crash_midway_probe_unknown_and_opaque_are_indeterminate(privd_env):
-    """A worker that died without status.json whose probe cannot tell (unknown/partial), and an `opaque` op that crashed at all: never retried automatically, the target is locked."""
+def _died_without_status(e, entry_changes):
+    """A started row whose unit is gone and which left no status.json: what a worker that died mid-effect looks like. Returns the reconciliation outcome and the audit trail."""
     import uuid
+    e.ctx.optable = optable_mod.OpTable([dataclasses.replace(e.table.get("selftest.noop"), **entry_changes)])
+    jid = str(uuid.uuid4())
+    e.ledger.claim(jid, 1, "selftest.noop", "selftest.noop", "0" * 64, False, "meta", e.clock())
+    wd = Path(e.paths.work) / f"{jid}-1"
+    wd.mkdir(mode=0o700)
+    e.ledger.mark_started(jid, 1, op_unit_name(jid, 1), str(wd), None, None, False, e.clock())
+    kind, res = reconcile.reconcile_job(e.ctx, jid)
+    return jid, kind, res
+
+
+def test_crash_midway_probe_unknown_is_indeterminate(privd_env):
+    """The probe cannot tell (unknown, or partial): never retried automatically, the target is locked, a `recovery` record says so."""
     e = privd_env.ready()
-    entry = e.table.get("selftest.noop")
-    for name, repl in (("unknown", dict(probe=lambda wd: "unknown")), ("partial", dict(probe=lambda wd: "partial")), ("opaque", dict(idempotency="opaque", probe=None))):
-        e.ctx.optable = optable_mod.OpTable([dataclasses.replace(entry, **repl)])
-        jid = str(uuid.uuid4())
-        e.ledger.claim(jid, 1, "selftest.noop", "selftest.noop", "0" * 64, False, "meta", e.clock())
-        wd = Path(e.paths.work) / f"{jid}-1"
-        wd.mkdir(mode=0o700)
-        e.ledger.mark_started(jid, 1, op_unit_name(jid, 1), str(wd), None, None, False, e.clock())          # the unit never existed / is gone
-        kind, res = reconcile.reconcile_job(e.ctx, jid)
-        assert kind == "indeterminate" and res["reason_code"] == "INDETERMINATE", name
+    for verdict in ("unknown", "partial"):
+        jid, kind, res = _died_without_status(e, dict(probe=lambda wd, v=verdict: v))
+        assert kind == "indeterminate" and res["reason_code"] == "INDETERMINATE", verdict
         assert e.ledger.get(jid).state == "indeterminate" and e.ledger.target_lock("selftest.noop")["job_id"] == jid
         recs = [r for r in e.priv_records() if r.get("job_id") == jid]
         assert [r["type"] for r in recs] == ["recovery"] and recs[0]["verdict"] == "indeterminate"
         e.ledger.unlock_target("selftest.noop", jid)
 
 
-def test_delegated_effects_must_settle_before_any_probe(privd_env):
+def test_opaque_crash_always_indeterminate(privd_env):
+    """Idempotency class `opaque`: effects unknown, so a crash is indeterminate even when a probe would say 'not applied'."""
+    e = privd_env.ready()
+    jid, kind, res = _died_without_status(e, dict(idempotency="opaque", probe=None))
+    assert kind == "indeterminate" and e.ledger.get(jid).state == "indeterminate"
+    jid2, kind2, _ = _died_without_status(e, dict(idempotency="probe", probe=lambda wd: "not_applied"))
+    assert kind2 == "aborted_safe"                                                          # the same crash with an observable effect IS safely retryable
+
+
+def test_indeterminate_locks_target_until_resolved(privd_env):
+    e = privd_env.ready()
+    jid, kind, _ = _died_without_status(e, dict(probe=lambda wd: "unknown"))
+    assert kind == "indeterminate" and e.ledger.target_lock("selftest.noop")
+    e.put_lease(seq=300)
+    res = result(e.exec(dry_run=True)[0])
+    assert res["status"] == "denied" and res["reason_code"] == "DENY_TARGET_LOCKED" and "DENY_TARGET_LOCKED" in __import__("forge_node.protocol", fromlist=["x"]).RETRYABLE_DENIALS
+    # (a) the agent identity cannot resolve it, (b) root can, with the inspection attached; (c) the lock is gone afterwards
+    body = {"job_id": jid, "resolve": {"verdict": "aborted_safe", "inspection": "inspected the work directory: no effect.mark, unit gone"}}
+    assert e.call("reconcile", body, uid=1001)["code"] == "DENY_NEEDS_OWNER_SIG" and e.ledger.target_lock("selftest.noop")
+    assert result(e.call("reconcile", body))["status"] == "aborted_safe" and e.ledger.target_lock("selftest.noop") is None
+    e.put_lease(seq=301)
+    assert result(e.exec(dry_run=True)[0])["status"] == "dry_run"
+
+
+def test_delegated_pending_systemd_job_settles_before_probe(privd_env):
     e = privd_env.ready()
     entry = e.table.get("selftest.noop")
     import uuid
@@ -274,7 +303,7 @@ def test_delegated_effects_must_settle_before_any_probe(privd_env):
     assert calls == [("settle", False), ("settle", True), ("probe",)]                     # no probe ran for the unsettled one
 
 
-def test_orphan_op_unit_without_row_is_stopped_and_recorded(privd_env, tmp_path):
+def test_orphan_op_unit_without_row_stopped_and_alerted(privd_env, tmp_path):
     e = privd_env.ready()
     import uuid
     jid = str(uuid.uuid4())
@@ -303,22 +332,26 @@ def test_lost_result_returns_ledger_result_without_reexecution(privd_env):
     assert r3["ok"] is False and r3["code"] == "DENY_PARAM" and len(marks(e)) == n_marks and e.ledger.get(job["job_id"]).state == "committed"
 
 
-def test_terminal_denial_does_not_allow_a_new_delivery_retryable_does(privd_env):
+def test_terminal_denial_does_not(privd_env):
+    """A terminal denial (DENY_PARAM) is the job's answer for good: a re-delivery gets the stored denial, nothing new is audited."""
     e = privd_env.ready()
     env, job = e.job_env(params={"bogus": 1}, dry_run=True)
-    assert result(e.call("exec", {"job": env}))["reason_code"] == "DENY_PARAM"
-    assert e.ledger.get(job["job_id"]).state == "denied"
+    first = result(e.call("exec", {"job": env}))
+    assert first["reason_code"] == "DENY_PARAM" and e.ledger.get(job["job_id"]).state == "denied"
+    n = len(e.priv_records())
     env2, _ = e.job_env(job_id=job["job_id"], params={"bogus": 1}, dry_run=True, delivery_seq=2)
-    again = result(e.call("exec", {"job": env2}))
-    assert again["reason_code"] == "DENY_PARAM" and again["audit_seq_range"] == result(e.call("exec", {"job": env}))["audit_seq_range"]      # the stored denial
-    # retryable
+    assert result(e.call("exec", {"job": env2})) == first and len(e.priv_records()) == n
+
+
+def test_retryable_denial_allows_new_delivery_same_job_id(privd_env):
+    e = privd_env.ready()
     open(e.paths.local_stop, "w").close()
     env3, job3 = e.job_env(dry_run=True)
     assert result(e.call("exec", {"job": env3}))["reason_code"] == "DENY_LOCAL_STOP"
     assert e.ledger.get(job3["job_id"]).state == "denied_retryable"
     os.unlink(e.paths.local_stop)
     env4, _ = e.job_env(job_id=job3["job_id"], dry_run=True, delivery_seq=2)
-    assert result(e.call("exec", {"job": env4}))["status"] == "dry_run"
+    assert result(e.call("exec", {"job": env4}))["status"] == "dry_run" and e.ledger.get(job3["job_id"]).state == "committed"
 
 
 def test_replayed_old_delivery_rejected_after_expiry(privd_env):
@@ -378,7 +411,7 @@ def test_stale_received_row_of_a_dead_handler_is_picked_up_by_the_next_delivery(
     assert result(e.call("exec", {"job": env}))["status"] == "dry_run"
 
 
-def test_fence_mismatch_worker_exits_without_effect_unit(privd_env, tmp_path):
+def test_fence_mismatch_worker_exits_without_effect(privd_env, tmp_path):
     """worker.run() on its own: row.fence != request.fence => FAIL_FENCED, nothing done, status.json says why."""
     from forge_node.privd import ops, worker
     e = privd_env

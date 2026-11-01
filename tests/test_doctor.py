@@ -89,7 +89,7 @@ def test_a_healthy_node_passes_every_check_including_the_selfchecks_in_the_units
     assert d._failed == []
 
 
-def test_op_selfchecks_run_in_the_op_class_and_fail_when_a_path_is_denied(served, tmp_path, monkeypatch):
+def test_doctor_fails_on_denied_selfcheck_path(served, tmp_path, monkeypatch):
     """test_ops_run_in_real_transient_units_selfcheck / test_doctor_fails_on_denied_selfcheck_path: the selfcheck of selftest.noop is run by privd in its unit class; when the unit
     cannot write its work directory (here: run as an unprivileged uid) doctor says FAIL and the exit status is non-zero."""
     monkeypatch.setattr(D, "HubClient", FakeHub)

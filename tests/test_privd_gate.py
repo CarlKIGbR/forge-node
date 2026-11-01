@@ -330,7 +330,7 @@ def test_intent_fsynced_before_effect_else_refused(privd_env):
     assert row is None or row.state in ("denied_retryable",)
 
 
-def test_op_unit_properties_come_from_a_fixed_table_not_params(privd_env):
+def test_op_unit_properties_come_from_fixed_table_not_params(privd_env):
     from forge_node.privd import classes
     e = privd_env.ready()
     captured = []

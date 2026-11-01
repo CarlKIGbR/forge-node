@@ -67,6 +67,28 @@ class OpTable:
         return len(self._d)
 
 
+def path_not_protected(param: str):
+    """Pipeline step 10 for ops that act on a path (N5 dir/file ops use it): the path is resolved with realpath (symlinks followed, `..` applied) and must not be, or lie below, a
+    protected path - tested on the resolved object, so a symlink that points into /srv/models does not help. The unresolved spelling is checked too."""
+    import os
+
+    def check(policy, params: dict) -> None:
+        raw = params[param]
+        for cand in (os.path.normpath(raw), os.path.realpath(raw)):
+            for pp in policy.protected_paths:
+                if cand == pp or cand.startswith(pp.rstrip("/") + "/"):
+                    raise ProtoError("DENY_PROTECTED", f"{raw!r} resolves into the protected path {pp}")
+    return check
+
+
+def target_allowed(param: str):
+    """Pipeline step 11: the parameter must be one of the targets the signed policy bound to this op."""
+    def check(op_policy, params: dict) -> None:
+        if params[param] not in {t["name"] for t in op_policy.targets}:
+            raise ProtoError("DENY_NOT_ALLOWLISTED", f"{params[param]!r} is not a target of this op in the policy")
+    return check
+
+
 def noop_params(p: dict) -> dict:
     if not isinstance(p, dict) or set(p) - {"note"}:
         raise ProtoError("DENY_PARAM", "selftest.noop takes only {note}")

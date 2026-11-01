@@ -124,7 +124,7 @@ def test_g27_the_static_check_fails_on_a_new_unguarded_entry_point_even_a_condit
     assert not rep.ok and any("counted 10" in p for p in rep.problems)                      # a new guarded entry point still has to be counted by a reviewer
 
 
-def test_g27_op_table_entries_execute_only_through_gate():
+def test_every_op_table_entry_dispatches_through_gate():
     """No code path from the socket to an op script that skips gate(): the only callers of the unit start for an op are in gate.py, and `reconcile.py` never starts a worker."""
     import ast
     starters = {}
@@ -351,7 +351,7 @@ def test_g28_reconcile_reobserves_the_world_after_the_fence_bump(privd_env, tmp_
     assert not e.backend.show(unit).is_active
 
 
-def test_g28_reconcile_and_retry_claims_are_serialized_by_the_job_lock(privd_env):
+def test_reconcile_and_retry_claims_serialized(privd_env):
     import uuid
     from forge_node.privd.units import op_unit_name
     e = privd_env.ready()

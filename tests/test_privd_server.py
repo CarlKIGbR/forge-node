@@ -85,7 +85,7 @@ def test_peer_credentials_come_from_the_kernel_not_from_the_request(served):
     assert run_as_agent(uid_seen) == 0                                               # the PEER of the agent is root (privd): what the agent client verifies
 
 
-def test_agent_cannot_forge_lease_or_job_over_the_socket(served):
+def test_agent_cannot_forge_lease_or_job(served):
     env = served.lease_env(seq=500)                                                       # signed here, by the hub's key, then tampered with by the "agent"
     env["payload"] = env["payload"].replace('"stop":false', '"stop":true')
     jenv, _ = served.job_env(dry_run=True)

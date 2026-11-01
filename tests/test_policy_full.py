@@ -54,7 +54,7 @@ def test_unknown_keys_are_rejected_at_every_level():
     bad("unknown keys", t1_ops=[{"op": "selftest.noop", "sudo": True}])
 
 
-def test_apt_apply_and_upgrade_anywhere_reject_the_whole_policy():
+def test_policy_schema_rejects_apt_apply_op_or_flag():
     for patch in ({"apt_apply": True}, {"t1": {"workloads_enabled": False, "ops": [], "apt.upgrade": 1}}, {"t3": {"manifests_enabled": ["apt.upgrade"], "opaque_enabled": False}}):
         with pytest.raises(PolicyError) as e:
             parse(**patch)
@@ -242,7 +242,7 @@ def test_policy_signature_not_valid_as_approval_and_fail_closed_loading(privd_en
     assert e.ctx.policies.current().serial == 1
 
 
-def test_an_older_gate_key_is_dead_once_serial_plus_one_removes_it(privd_env):
+def test_old_gate_key_signatures_rejected_after_policy_serial_plus_one(privd_env):
     e = privd_env
     e.ready()
     assert e.call("exec", {"job": e.job_env(dry_run=True)[0]})["result"]["status"] == "dry_run"
