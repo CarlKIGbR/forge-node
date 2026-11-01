@@ -540,3 +540,42 @@ def test_effect_lock_blocks_a_worker_until_it_is_released(privd_env):
             p.kill()
     st = worker.read_status(str(wd))
     assert st["outcome"] == "done" and (wd / "effect.mark").exists()
+
+
+def test_retention_prunes_only_old_terminal_rows_with_their_work_dirs_and_locks(privd_env):
+    from datetime import timedelta
+    from forge_node.privd import maintenance
+    e = privd_env.ready()
+    old_ok = result(e.exec(dry_run=True)[0])["job_id"]                                           # committed (dry_run)
+    e.clock.advance(seconds=61)
+    e.put_lease(seq=50)
+    keep_recent = result(e.exec(dry_run=True)[0])["job_id"]
+    # a retryable and an indeterminate row must survive any age
+    open(e.paths.local_stop, "w").close()
+    retry = result(e.exec(dry_run=True)[0])["job_id"]
+    os.unlink(e.paths.local_stop)
+    import uuid
+    ind = str(uuid.uuid4())
+    e.ledger.claim(ind, 1, "selftest.noop", "selftest.noop", "0" * 64, False, "meta", e.clock())
+    e.ledger.finish(ind, 1, "indeterminate", {"attempt": 1, "status": "indeterminate", "reason_code": "INDETERMINATE", "output": "", "audit_seq_range": None, "plan_hash": None}, e.clock(), frm=("received",))
+    assert maintenance.prune(e.ctx) == {"rows": 0, "work_dirs": 0, "locks": 0, "plans": 0}          # nothing is 90 days old yet
+    e.clock.advance(seconds=1)
+    for jid in (old_ok, keep_recent):
+        e.ledger._c.execute("UPDATE exec SET updated_at=? WHERE job_id=?", ("2026-06-01T00:00:00Z" if jid == old_ok else "2026-10-31T13:40:00Z", jid))
+    e.ledger._c.execute("UPDATE exec SET updated_at='2026-01-01T00:00:00Z' WHERE job_id IN (?,?)", (retry, ind))
+    wd_old = Path(e.paths.work) / f"{old_ok}-1"
+    assert wd_old.is_dir() and os.path.exists(f"{e.paths.locks}/job-{old_ok}.lock")
+    rep = maintenance.prune(e.ctx)
+    assert rep["rows"] == 1 and rep["work_dirs"] == 1 and rep["locks"] == 1
+    assert e.ledger.get(old_ok) is None and not wd_old.exists() and not os.path.exists(f"{e.paths.locks}/job-{old_ok}.lock")
+    for jid in (keep_recent, retry, ind):
+        assert e.ledger.get(jid) is not None
+    assert os.path.exists(f"{e.paths.locks}/job-{keep_recent}.lock")
+    # a lock somebody holds is not unlinked
+    import fcntl
+    fd = os.open(f"{e.paths.locks}/job-{keep_recent}.lock", os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    e.ledger._c.execute("UPDATE exec SET updated_at='2026-06-01T00:00:00Z' WHERE job_id=?", (keep_recent,))
+    rep = maintenance.prune(e.ctx)
+    os.close(fd)
+    assert rep["rows"] == 1 and rep["locks"] == 0 and os.path.exists(f"{e.paths.locks}/job-{keep_recent}.lock")

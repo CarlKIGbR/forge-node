@@ -13,6 +13,7 @@ from .gate import gate
 MAX_REQUEST_BYTES = 512 * 1024
 READ_TIMEOUT_S = 10.0
 MAX_CONNECTIONS = 32
+MAINTENANCE_EVERY_S = 3600.0
 HANDLERS = {"exec": "handle_exec", "lease.put": "handle_lease_put", "t0": "handle_t0", "status": "handle_status", "selfcheck": "handle_selfcheck", "reconcile": "handle_reconcile",
             "policy.apply": "handle_policy_apply", "audit.rotate": "handle_audit_rotate", "lockdown": "handle_lockdown"}
 assert set(HANDLERS) == set(KINDS)
@@ -104,8 +105,16 @@ class Server:
                 self._sem.release()
 
     def serve(self, listener: socket.socket) -> None:
+        from . import maintenance
         listener.settimeout(0.5)
+        next_prune = self.ctx.monotonic() + MAINTENANCE_EVERY_S
         while not self._stop.is_set():
+            if self.ctx.monotonic() >= next_prune:
+                next_prune = self.ctx.monotonic() + MAINTENANCE_EVERY_S
+                try:
+                    maintenance.prune(self.ctx)
+                except Exception:  # noqa: BLE001 - housekeeping must never take the socket down
+                    pass
             try:
                 conn, _ = listener.accept()
             except socket.timeout:

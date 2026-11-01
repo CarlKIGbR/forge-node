@@ -80,7 +80,7 @@ def build_context(node: str, agent_user: str = "forgenode") -> Context:
     ledger = Ledger(PATHS.ledger)
     priv_log = AuditAdmin(priv_spec(gid=pw.pw_gid, trust_anchor="/"), node, now)
     agent_log = AuditAdmin(agent_spec(gid=pw.pw_gid, trust_anchor="/"), node, now)
-    backend = SystemdBackend(systemd_run=trusted_binary("systemd-run"), systemctl=trusted_binary("systemctl"), run=run_process)
+    backend = SystemdBackend(systemd_run=trusted_binary("systemd-run"), systemctl=trusted_binary("systemctl"), run=run_process, sleep=time.sleep, monotonic=time.monotonic)
     policies = PolicyStore(policy_dir=PATHS.policy_dir, allowed_signers=PATHS.allowed_signers, serial_file=PATHS.serial_file, node=node, owner_uid=0, ssh_keygen=ssh_keygen, clock=now,
                            gates_map=gates.GATES, table_ops=table.names, devof=devof, protected_devs=protected_devs)
     leases = LeaseStore(path=PATHS.lease_file, ledger=ledger, node=node, ssh_keygen=ssh_keygen, clock=now, owner_uid=0)

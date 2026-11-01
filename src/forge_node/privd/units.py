@@ -81,17 +81,25 @@ class SystemdBackend:
 
     SHOW_PROPS = ("ActiveState", "SubState", "InvocationID", "Result", "ControlGroup")
 
-    def __init__(self, *, systemd_run: str, systemctl: str, run: Callable):
-        self.systemd_run, self.systemctl, self.run = systemd_run, systemctl, run
+    INVOCATION_WAIT_S = 10.0
+
+    def __init__(self, *, systemd_run: str, systemctl: str, run: Callable, sleep: Callable, monotonic: Callable):
+        self.systemd_run, self.systemctl, self.run, self.sleep, self.monotonic = systemd_run, systemctl, run, sleep, monotonic
 
     def start(self, name: str, props: Mapping[str, str], argv: Sequence[str]) -> str:
+        """Start the transient unit (--no-block, no --collect) and return its InvocationID. systemd allocates the invocation id when the start JOB begins, which is after
+        systemd-run returned: poll briefly for it. A unit that already ended (a very short worker) still carries the id of its run."""
         rc, out, err = self.run(systemd_run_argv(self.systemd_run, name, props, argv, pipe_wait=False), None, 30)
         if rc != 0:
             raise UnitError(f"systemd-run failed: {err[:200]!r}")
-        info = self.show(name)
-        if info is None or not info.invocation_id:
-            raise UnitError("started unit has no InvocationID")
-        return info.invocation_id
+        deadline = self.monotonic() + self.INVOCATION_WAIT_S
+        while True:
+            info = self.show(name)
+            if info is not None and info.invocation_id:
+                return info.invocation_id
+            if self.monotonic() >= deadline:
+                raise UnitError("the started unit has no InvocationID (the start job did not begin)")
+            self.sleep(0.05)
 
     def run_pipe(self, name: str, props: Mapping[str, str], argv: Sequence[str], stdin: bytes, timeout_s: int):
         return self.run(systemd_run_argv(self.systemd_run, name, props, argv, pipe_wait=True), stdin, timeout_s)

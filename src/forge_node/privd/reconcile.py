@@ -216,7 +216,8 @@ def attach_monitor(ctx: Context, row: Row) -> threading.Thread:
 
 def recover_all(ctx: Context) -> dict:
     """Startup recovery: audit logs first (rotation roll-forward, tail repair), then every unit and every open row (Design 9.4 'Startup recovery')."""
-    report = {"audit": {}, "attached": [], "reconciled": [], "orphans": []}
+    from . import maintenance
+    report = {"audit": {}, "attached": [], "reconciled": [], "orphans": [], "pruned": maintenance.prune(ctx)}
     for name, log in (("priv", ctx.priv_log), ("agent", ctx.agent_log)):
         if log is not None:
             report["audit"][name] = log.recover()

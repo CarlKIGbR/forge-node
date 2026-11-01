@@ -229,6 +229,20 @@ class Ledger:
         with self._lock:
             return _row(self._c.execute("SELECT * FROM exec WHERE effect_key=? AND state IN ('started','effect_done','reconciling') AND job_id<>? LIMIT 1", (effect_key, job_id)).fetchone())
 
+    def prune_terminal(self, cutoff_ts: str) -> list[tuple[str, int]]:
+        """Remove terminal rows (committed, denied, failed) last updated before `cutoff_ts` (Design 9.4: terminal rows are kept >= 90 days; a re-delivery of such a job is rejected by
+        expiry anyway). Rows that can still change (received, started, effect_done, reconciling, denied_retryable, aborted_safe, indeterminate) are never touched. The condition is part of
+        the DELETE itself, so a row that moved on in between is not removed."""
+        with self._tx() as c:
+            rows = c.execute("SELECT job_id, attempt FROM exec WHERE state IN ('committed','denied','failed') AND updated_at < ?", (cutoff_ts,)).fetchall()
+            for r in rows:
+                c.execute("DELETE FROM exec WHERE job_id=? AND state IN ('committed','denied','failed') AND updated_at < ?", (r["job_id"], cutoff_ts))
+            return [(r["job_id"], r["attempt"]) for r in rows]
+
+    def prune_plans(self, now_ts: float) -> int:
+        with self._tx() as c:
+            return c.execute("DELETE FROM plans WHERE expires_at <= ?", (now_ts,)).rowcount
+
     # ------------------------------------------------------------------------------------------------------------ target locks
     def lock_target(self, effect_key: str, job_id: str, reason: str, now) -> None:
         with self._tx() as c:

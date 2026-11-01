@@ -21,6 +21,7 @@ import base64
 import binascii
 import hashlib
 import os
+import shutil
 import stat
 from dataclasses import dataclass, field
 
@@ -498,6 +499,9 @@ def s_selfcheck_run(st: State) -> None:
         rc, out, err = ctx.backend.run_pipe(unit, props, argv, b"{}\n", 90)
     except UnitError as ex:
         raise Deny("FAIL_EXEC", f"selfcheck unit failed: {ex}") from ex
+    finally:
+        if st.extra.get("selfcheck_dir"):
+            shutil.rmtree(st.extra["selfcheck_dir"], ignore_errors=True)
     try:
         doc = canon.loads(out.split(b"\n", 1)[0])
     except canon.CanonError:
