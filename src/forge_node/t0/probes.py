@@ -3,7 +3,9 @@ class `ro-probe` (see hardening.py); the agent never runs these itself. In N2 th
 
 A probe takes ONLY a name and a small parameter object. Everything that decides what may be read - log units, cert paths, repositories, model directories, the protected set, the
 window - comes from the root-installed, signature-checked policy loaded by the probe process, never from the request: whatever the agent sends is untrusted input."""
+import os
 import re
+import shutil
 from . import parse
 from .env import Env, failed, ok, run_failure, run_slots, unavailable
 from .fsread import FsError, norm_abs, under
@@ -232,44 +234,64 @@ def _probe_certs(params: dict, env: Env) -> dict:
 
 
 # -------------------------------------------------------------------------------------------------------------------------------- git
-_SAFE_CONFIG = {
-    "core": {"repositoryformatversion", "filemode", "bare", "logallrefupdates", "ignorecase", "precomposeunicode", "symlinks", "autocrlf", "eol", "safecrlf", "sharedrepository", "trustctime", "checkstat", "ignorestat"},
-    "remote": {"url", "fetch", "pushurl", "tagopt", "prune"},
-    "branch": {"remote", "merge", "rebase", "description"},
-    "user": {"name", "email"},
-    "gc": {"auto", "autopacklimit", "reflogexpire", "reflogexpireunreachable", "pruneexpire"},
-    "pack": {"threads", "windowmemory", "deltacachesize"},
-    "receive": {"denycurrentbranch", "fsckobjects"},
-    "fetch": {"prune", "fsckobjects"},
-    "pull": {"rebase", "ff"},
-    "push": {"default"},
-    "init": {"defaultbranch"},
-    "submodule": {"active", "url", "branch", "ignore", "fetchrecursesubmodules"},       # inert: `git status` runs with --ignore-submodules=all and never reads a submodule's own config
-}
+# Git runs NO repository-controlled program here, by construction: the repository's own config is never read by git. The probe builds a private snapshot git directory (HEAD,
+# refs/heads/<branch>, an empty objects dir, and a config WRITTEN BY THE PROBE) and points git at it (GIT_DIR=GIT_COMMON_DIR=<snapshot>, GIT_WORK_TREE=<repo>, GIT_INDEX_FILE and
+# GIT_OBJECT_DIRECTORY inside <repo>/.git as data). Everything that can name a program (core.fsmonitor, filter.*, diff/merge drivers, hooks, includes, aliases, `commondir`,
+# `config.worktree`, submodule configs) lives in files the snapshot does not contain, so replacing <repo>/.git/config - before, at or after the scan - changes nothing.
+# Only a handful of inert core.* switches that decide what "modified" means are copied over, value-checked, from the repository config bytes read once.
+_INERT_CORE = frozenset({"filemode", "ignorecase", "symlinks", "autocrlf", "eol", "safecrlf", "precomposeunicode", "trustctime", "checkstat", "ignorestat"})
+_INERT_VALUE = re.compile(r"^[A-Za-z0-9_.-]{1,16}\Z")
 
 
-def git_config_is_safe(text: str) -> tuple[bool, str]:
-    """`git status` runs programs named in the repository's own config (core.fsmonitor, filter.*.clean, diff drivers, hooks, includes). Only a closed set of inert settings
-    passes; anything else - or anything the tiny parser does not understand - means `git` is not executed on that repository."""
+def filter_git_config(text: str) -> tuple[str, list[str]]:
+    """(config text for the snapshot, names of everything that was NOT carried over). The result is generated here from validated key/value pairs; nothing of the original text is
+    copied. A key is only taken from a plain `[core]` section line `key = value`; anything the tiny parser does not understand is dropped."""
+    keep: dict[str, str] = {}
+    dropped: list[str] = []
     section = None
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line[0] in "#;":
             continue
-        m = re.match(r'^\[\s*([A-Za-z0-9.-]+)(?:\s+"[^"\n]*")?\s*\]\s*(?:[#;].*)?$', line)
+        m = re.match(r'^\[\s*([A-Za-z0-9.-]+)(\s+"[^"\n]*")?\s*\]\s*(?:[#;].*)?$', line)
         if m:
-            section = m.group(1).lower()
-            if section not in _SAFE_CONFIG:
-                return False, f"section [{section}]"
+            section = m.group(1).lower() if not m.group(2) else "other"
+            if m.group(1).lower() != "core" or m.group(2):
+                dropped.append(f"[{m.group(1).lower()}]")
             continue
-        if section is None:
-            return False, "key outside a section"
-        if line.endswith("\\"):
-            return False, "line continuation"
-        k = re.match(r"^([A-Za-z][A-Za-z0-9-]*)\s*(?:=.*)?$", line)
-        if not k or k.group(1).lower() not in _SAFE_CONFIG[section]:
-            return False, f"key {section}.{(k.group(1) if k else line[:20])!r}"
-    return True, ""
+        k = re.match(r"^([A-Za-z][A-Za-z0-9-]*)\s*=\s*([^\s#;\\]*)\s*(?:[#;].*)?$", line)
+        if section == "core" and k and k.group(1).lower() in _INERT_CORE and _INERT_VALUE.match(k.group(2)):
+            keep[k.group(1).lower()] = k.group(2)
+        elif section == "core":
+            dropped.append("core." + (line.split("=", 1)[0].strip().lower()[:30] or "?"))
+        elif section is None:
+            dropped.append("(outside any section)")
+    cfg = "[core]\n\trepositoryformatversion = 0\n" + "".join(f"\t{k} = {v}\n" for k, v in sorted(keep.items()))
+    return cfg, sorted(set(dropped))[:20]
+
+
+def _git_snapshot(info: dict, config_text: str) -> str | None:
+    """Private snapshot git dir (mode 0700 in the probe's private tmp). Returns its path, or None if the revision is unknown (git then has nothing to compare against)."""
+    import tempfile
+    if not info.get("rev"):
+        return None
+    snap = tempfile.mkdtemp(prefix="fn-git-")
+    os.chmod(snap, 0o700)
+    os.mkdir(os.path.join(snap, "objects"))
+    os.makedirs(os.path.join(snap, "refs", "heads"))
+    if info.get("detached"):
+        head = info["rev"] + "\n"
+    else:
+        branch = info["branch"]
+        os.makedirs(os.path.dirname(os.path.join(snap, "refs", "heads", branch)), exist_ok=True)
+        with open(os.path.join(snap, "refs", "heads", branch), "w") as f:
+            f.write(info["rev"] + "\n")
+        head = f"ref: refs/heads/{branch}\n"
+    with open(os.path.join(snap, "HEAD"), "w") as f:
+        f.write(head)
+    with open(os.path.join(snap, "config"), "w") as f:
+        f.write(config_text)
+    return snap
 
 
 def _git_rev(env: Env, real: str) -> dict:
@@ -309,25 +331,28 @@ def _probe_git(params: dict, env: Env) -> dict:
                 row["error"] = "unsupported_git_layout"
                 rows.append(row)
                 continue
-            row.update(_git_rev(env, real))
-            cfg_before = env.fs.read_exception(f"{real}/.git/config", _SAFE_GIT_FILES)
-            safe, why = git_config_is_safe(cfg_before)
-            for extra in ("commondir", "config.worktree"):          # config from somewhere else than the scanned file: such a layout is not run at all
-                if safe and env.fs.exists_unfiltered(f"{real}/.git/{extra}"):
-                    safe, why = False, f".git/{extra} present"
-            if not safe:
-                row["dirty_tracked"], row["dirty_status"], row["dirty_reason"] = None, "skipped_unsafe_config", why
-            elif env.now().timestamp() >= t_end:
+            info = _git_rev(env, real)
+            row.update(info)
+            cfg_text, dropped = filter_git_config(env.fs.read_exception(f"{real}/.git/config", _SAFE_GIT_FILES))
+            if dropped:
+                row["config_not_used"] = dropped          # e.g. filter.*, core.fsmonitor, includes: the dirty count is computed without them
+            if env.now().timestamp() >= t_end:
                 row["dirty_tracked"], row["dirty_status"] = None, "skipped_budget"
+                rows.append(row)
+                continue
+            snap = _git_snapshot(info, cfg_text)
+            if snap is None:
+                row["dirty_tracked"], row["dirty_status"] = None, "no_revision"
+                rows.append(row)
+                continue
+            try:
+                r = run_slots(env.runner, "git_status_tracked", {"repo": real, "snap": snap}, max(5.0, t_end - env.now().timestamp()))
+            finally:
+                shutil.rmtree(snap, ignore_errors=True)
+            if r.ok:
+                row["dirty_tracked"], row["dirty_status"] = len([l for l in r.text.splitlines() if l.strip()]), "ok"
             else:
-                r = run_slots(env.runner, "git_status_tracked", {"repo": real}, max(5.0, t_end - env.now().timestamp()))
-                # the config is writable by the repository's owner, who is not trusted: read it again AFTER the run and discard the result if it changed in between
-                if env.fs.read_exception(f"{real}/.git/config", _SAFE_GIT_FILES) != cfg_before:
-                    row["dirty_tracked"], row["dirty_status"] = None, "config_changed_during_read"
-                elif r.ok:
-                    row["dirty_tracked"], row["dirty_status"] = len([l for l in r.text.splitlines() if l.strip()]), "ok"
-                else:
-                    row["dirty_tracked"], row["dirty_status"] = None, "failed:" + r.reason
+                row["dirty_tracked"], row["dirty_status"] = None, "failed:" + r.reason
         except FsError as e:
             row["error"] = e.code
         rows.append(row)

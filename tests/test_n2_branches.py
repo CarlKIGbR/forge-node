@@ -246,17 +246,8 @@ def test_git_probe_edge_cases(tmp_path):
     assert g["rev"] is None and g["branch"] == "main"
     env = env_with(tmp_path / "x", r, t0={"repos": ["/opt/missing"]})
     assert probes.run_probe("git", {}, env)["repos"]["repos"][0]["error"] == "unreadable"
-
-
-def test_git_config_changed_while_git_ran_discards_the_result(tmp_path):
-    env_holder = {}
-
-    def status(slots, stdin):
-        (tmp_path / "opt/kmu-ai/.git/config").write_text("[core]\n\tfsmonitor = /tmp/evil\n")
-        return Run(True, "ok", 0, b" M a\n")
-    r = FakeRunner({"git_status_tracked": status})
-    g = probes.run_probe("git", {}, git_env(tmp_path, r))["repos"]["repos"][0]
-    assert g["dirty_status"] == "config_changed_during_read" and g["dirty_tracked"] is None
+    env = git_env(tmp_path / "y", r, ref="not-a-hash\n")                                   # no usable revision: git has nothing to compare, and is not started
+    assert probes.run_probe("git", {}, env)["repos"]["repos"][0]["dirty_status"] == "no_revision" and r.called("git_status_tracked") == 0
 
 
 def test_git_budget_skips_remaining_repos(tmp_path):
@@ -749,3 +740,60 @@ def test_the_policy_serials_remembered_for_staging_are_bounded(tmp_path):
     for serial in range(2, 120):
         ag._maybe_stage_policy(rt, serial)
     assert len(ag._fetched) <= 32 and max(ag._fetched) == 119
+
+
+# ===================================================================================================== rework round 1 (REPORT_BRIEF forge-n2verify, 6 MAJOR)
+def _holder(tmp_path, owner):
+    from forge_node.agent.config import AgentConfig
+    from n2_helpers import install_policy, signers_text
+    pol = tmp_path / "policy"
+    install_policy(pol, policy_doc(), owner["priv"])
+    signers = tmp_path / "as"
+    signers.write_text(signers_text(owner["pub"]))
+    os.chmod(signers, 0o644)
+    cfg = AgentConfig("g2", "127.0.0.1", 1, "/c", "/k", "/ca", str(pol), str(signers), str(tmp_path), "/s", os.getuid(), os.getuid(), "/")
+    logs = []
+    h = L.PolicyHolder(cfg, lambda: NOW, logs.append, "ssh-keygen")
+    assert h.refresh()[0].serial == 1
+    assert h.refresh() == (h.view, False)                       # cache hit while nothing changes
+    return h, pol, signers, logs
+
+
+def test_a_chmod_on_the_verified_policy_forces_reverification_and_the_old_policy_is_gone(tmp_path, owner):
+    """Reviewer's case: load a valid signed policy, chmod its JSON to 0666, refresh. A fresh load_installed() rejects it; the cache must not keep it in force."""
+    h, pol, signers, logs = _holder(tmp_path, owner)
+    os.chmod(pol / "policy-1.json", 0o666)
+    assert h.refresh() == (None, True) and h.view is None
+    assert any("not a regular root-owned, non-writable file" in m for m in logs)
+    os.chmod(pol / "policy-1.json", 0o644)
+    assert h.refresh()[0].serial == 1                            # fixing it brings the policy back by full verification
+
+
+@pytest.mark.parametrize("what", ["sig-mode", "hardlink", "chown", "dir-mode", "signers-mode", "signers-hardlink", "signers-dir-mode"])
+def test_every_trust_relevant_attribute_is_part_of_the_cache_key(tmp_path, owner, what):
+    h, pol, signers, logs = _holder(tmp_path, owner)
+    if what == "sig-mode":
+        os.chmod(pol / "policy-1.json.sig", 0o662)
+    elif what == "hardlink":
+        os.link(pol / "policy-1.json", tmp_path / "second-name")
+    elif what == "chown":
+        os.chown(pol / "policy-1.json", 1234, 1234)
+    elif what == "dir-mode":
+        os.chmod(pol, 0o777)
+    elif what == "signers-mode":
+        os.chmod(signers, 0o666)
+    elif what == "signers-hardlink":
+        os.link(signers, tmp_path / "signers-alias")
+    elif what == "signers-dir-mode":
+        os.chmod(tmp_path, 0o777)
+    view_, changed = h.refresh()
+    assert view_ is None and changed is True and h.view is None, what
+
+
+def test_unchanged_policy_files_are_not_reverified_every_cycle(tmp_path, owner, monkeypatch):
+    h, pol, signers, logs = _holder(tmp_path, owner)
+    calls = []
+    monkeypatch.setattr(L, "load_installed", lambda *a, **k: calls.append(1))
+    for _ in range(5):
+        assert h.refresh() == (h.view, False)
+    assert calls == []

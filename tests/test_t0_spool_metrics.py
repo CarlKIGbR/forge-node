@@ -277,7 +277,7 @@ def test_usage_window_aggregates_samples_and_joins_probe_names(tmp_path):
                        "activity": {"activity": {"status": "ok", "units": []}}, "container_net": {"container_net": {"status": "ok", "containers": {"a" * 12: {"rx_bytes": 5, "tx_bytes": 6}}}}})
     u = usage_mod.usage(env, spool, probe, {"window_h": 72})
     w = u["window"]
-    assert w["samples"] == 5 and w["covered_hours"] == 4 and w["per_cgroup"][key] == {"samples": 5, "cpu_seconds": 40, "rss_max": 5000, "io_read_bytes": 400, "io_write_bytes": 200}
+    assert w["samples"] == 5 and w["covered_hours"] == 4 and {k: v for k, v in w["per_cgroup"][key].items() if not k.startswith("net_")} == {"samples": 5, "cpu_seconds": 40, "rss_max": 5000, "io_read_bytes": 400, "io_write_bytes": 200}
     assert w["gpu"]["0"] == {"mem_used_max": 5000, "mem_free_min": 24564 - 5000, "util_max": 40, "temp_max": 44, "total": 24564} and w["gpu_vram_by_owner_mib"] == {key: 2500}
     assert w["swap_used_max"] == 4 and w["load1_milli_max"] == 400 and u["containers"]["containers"][0]["name"] == "pg" and u["container_net"]["containers"]["a" * 12]["rx_bytes"] == 5
     assert u["now"]["cgroups"][key]["rss"] == 1048576
@@ -314,3 +314,62 @@ def test_usage_never_materialises_the_spool_window(tmp_path, monkeypatch):
     u = usage_mod.usage(env, spool, FakeProbe(ProbeUnavailable("down")), {"window_h": 1})
     assert u["window"]["samples"] == 1
 
+
+
+# ===================================================================================== rework 1, MAJOR 6: windowed per-container / per-unit network accounting
+def net_tree(tmp_path, procs=None, extra=None):
+    """A host with two containers: A in its own network namespace (eth0), B in the host namespace (shows the host's interfaces incl. docker0/veth)."""
+    host_dev = "h\nh\n    lo: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0\n  eno1: 5000 5 0 0 0 0 0 0 7000 7 0 0 0 0 0 0\ndocker0: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0\nveth9: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0\n"
+    a_dev = "h\nh\n    lo: 9 1 0 0 0 0 0 0 9 1 0 0 0 0 0 0\n  eth0: 4000 4 0 0 0 0 0 0 6000 6 0 0 0 0 0 0\n"
+    base = "/sys/fs/cgroup/system.slice/docker-"
+    files = {"/proc/net/dev": host_dev, "/proc/4001/net/dev": a_dev, "/proc/4002/net/dev": host_dev,
+             f"{base}{'a' * 64}.scope/memory.current": "300\n", f"{base}{'a' * 64}.scope/cgroup.procs": "0\n4001\n", f"{base}{'a' * 64}.scope/cpu.stat": "usage_usec 1\n",
+             f"{base}{'b' * 64}.scope/memory.current": "200\n", f"{base}{'b' * 64}.scope/cgroup.procs": "4002\n", f"{base}{'b' * 64}.scope/cpu.stat": "usage_usec 1\n",
+             f"{base}{'c' * 64}.scope/memory.current": "100\n", f"{base}{'c' * 64}.scope/cgroup.procs": "", f"{base}{'c' * 64}.scope/cpu.stat": "usage_usec 1\n"}
+    return make_env(tmp_path, FakeRunner({"systemctl_show_ipacct": ""} if extra is None else extra), files={**files, **(procs or {})})
+
+
+def test_the_sampler_records_per_container_network_counters_without_privilege(tmp_path):
+    s = metrics.take_sample(net_tree(tmp_path))
+    assert s["cgnet"] == {"d:" + "a" * 12: [4000, 6000]}                      # own namespace: eth0 (the loopback is not traffic)
+    assert s["cgnet_hostns"] == ["d:" + "b" * 12]                            # host namespace: its numbers would be the host's, so none are recorded
+    assert "d:" + "c" * 12 not in s["cgnet"]                                 # no process in the cgroup: nothing to read
+
+
+def test_per_unit_network_counters_come_from_systemd_ip_accounting_where_it_is_on(tmp_path):
+    show = ("Id=a.service\nIPIngressBytes=123\nIPEgressBytes=456\n\nId=b.service\nIPIngressBytes=[not set]\nIPEgressBytes=[not set]\n\n"
+            "Id=c.service\nIPIngressBytes=18446744073709551615\nIPEgressBytes=18446744073709551615\n\nId=bad name.service\nIPIngressBytes=1\nIPEgressBytes=1\n\n")
+    s = metrics.take_sample(net_tree(tmp_path, extra={"systemctl_show_ipacct": show}))
+    assert s["cgnet"]["u:a.service"] == [123, 456] and "u:b.service" not in s["cgnet"] and "u:c.service" not in s["cgnet"] and "u:bad name.service" not in s["cgnet"]
+
+
+def test_inv_usage_reports_windowed_network_bytes_per_container_and_unit(tmp_path):
+    """Reviewer's case (MAJOR 6): samples used to hold host totals only, so per-container/unit network usage over the requested window could not be produced."""
+    env = menv(tmp_path)
+    spool, _ = mk(tmp_path, 1 << 20)
+    a, u = "d:" + "a" * 12, "u:forge-edge.service"
+    for i, (arx, atx, urx, utx) in enumerate([(1000, 2000, 10, 20), (1500, 2600, 15, 25), (400, 500, 17, 26), (900, 1100, 20, 30)]):        # container counters RESET between samples 2 and 3
+        spool.append({"ts": protocol.fmt_ts(NOW - timedelta(hours=3 - i)), "cg": {a: [1, 10, 0, 0], u: [1, 10, 0, 0]}, "cgnet": {a: [arx, atx], u: [urx, utx], "u:small.service": [i, i]},
+                      "cgnet_hostns": ["d:" + "b" * 12]})
+    w = usage_mod.usage(env, spool, FakeProbe({"containers": {"containers": {"status": "ok"}}, "activity": {"activity": {"status": "ok"}}, "container_net": {"container_net": {"status": "ok"}}}), {"window_h": 72})["window"]
+    pc = w["per_cgroup"]
+    assert (pc[a]["net_rx_bytes"], pc[a]["net_tx_bytes"], pc[a]["net_basis"], pc[a]["net_samples"]) == (500 + 400 + 500, 600 + 500 + 600, "container network namespace", 4)      # growth, reset counted from 0
+    assert (pc[u]["net_rx_bytes"], pc[u]["net_tx_bytes"], pc[u]["net_basis"]) == (10, 10, "systemd IP accounting")
+    assert pc["u:small.service"]["net_rx_bytes"] == 3 and pc["u:small.service"]["net_basis"] == "systemd IP accounting"          # not among the memory top list, still reported
+    assert w["net_host_namespace"] == ["d:" + "b" * 12]
+    narrow = usage_mod.usage(env, spool, FakeProbe({"containers": {"containers": {"status": "ok"}}, "activity": {"activity": {"status": "ok"}}, "container_net": {"container_net": {"status": "ok"}}}), {"window_h": 2})["window"]
+    assert (narrow["per_cgroup"][a]["net_rx_bytes"], narrow["per_cgroup"][a]["net_tx_bytes"], narrow["per_cgroup"][a]["net_samples"]) == (400 + 500, 500 + 600, 3)      # a narrower window counts less
+
+
+def test_counter_growth_treats_a_decrease_as_a_reset():
+    assert usage_mod._grow(5, 9) == 4 and usage_mod._grow(9, 5) == 5 and usage_mod._grow(5, 5) == 0 and usage_mod._grow("x", 5) == 0
+
+
+def test_cpu_and_io_totals_survive_counter_resets_too(tmp_path):
+    env = menv(tmp_path)
+    spool, _ = mk(tmp_path, 1 << 20)
+    k = "d:" + "a" * 12
+    for i, (cpu, rb) in enumerate([(5_000_000, 100), (9_000_000, 300), (1_000_000, 50)]):
+        spool.append({"ts": protocol.fmt_ts(NOW - timedelta(hours=2 - i)), "cg": {k: [cpu, 10, rb, 0]}})
+    w = usage_mod.usage(env, spool, FakeProbe({"containers": {"containers": {"status": "ok"}}, "activity": {"activity": {"status": "ok"}}, "container_net": {"container_net": {"status": "ok"}}}), {"window_h": 72})["window"]
+    assert w["per_cgroup"][k]["cpu_seconds"] == 4 + 1 and w["per_cgroup"][k]["io_read_bytes"] == 200 + 50

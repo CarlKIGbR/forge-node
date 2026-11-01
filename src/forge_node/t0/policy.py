@@ -201,6 +201,21 @@ def _read_root_file(dirfd: int, name: str, limit: int, owner_uid: int) -> bytes:
         os.close(fd)
 
 
+def _chain_trusted(path: str, owner_uid: int) -> bool:
+    """Every directory from `path` up to / belongs to `owner_uid` and is not writable by group/others (a sticky one such as /tmp owned by the same user is tolerated)."""
+    d = os.path.abspath(path)
+    try:
+        while True:
+            st = os.stat(d)
+            if st.st_uid != owner_uid or (st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX):
+                return False
+            if d == "/":
+                return True
+            d = os.path.dirname(d)
+    except OSError:
+        return False
+
+
 def load_installed(policy_dir: str, allowed_signers_path: str, node: str, now: datetime, *, owner_uid: int, ssh_keygen: str) -> PolicyView:
     """The installed policy is the highest serial in `policy_dir`. If that one does not verify there is NO policy (fail closed): falling back to an older file would be the
     downgrade the monotonic serial exists to prevent. Raises PolicyError."""
@@ -210,8 +225,8 @@ def load_installed(policy_dir: str, allowed_signers_path: str, node: str, now: d
         raise PolicyError("DENY_POLICY_INVALID", f"policy directory unreadable ({type(e).__name__})") from e
     try:
         ds = os.fstat(dfd)
-        if ds.st_uid != owner_uid or ds.st_mode & 0o022:
-            raise PolicyError("DENY_POLICY_INVALID", "policy directory must be root-owned and not writable by others")
+        if ds.st_uid != owner_uid or ds.st_mode & 0o022 or not _chain_trusted(os.path.dirname(os.path.abspath(policy_dir)), owner_uid):
+            raise PolicyError("DENY_POLICY_INVALID", "policy directory (and every directory above it) must be root-owned and not writable by others")
         serials = sorted((int(m.group(1)) for n in os.listdir(dfd) if (m := _NAME.match(n))), reverse=True)
         if not serials:
             raise PolicyError("DENY_POLICY_INVALID", "no policy installed")
@@ -234,8 +249,9 @@ def read_signers(path: str, owner_uid: int) -> str:
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != owner_uid or st.st_mode & 0o022 or st.st_size > 64 * 1024:
-            raise OSError("allowed_signers must be a root-owned regular file that others cannot write")
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid != owner_uid or st.st_mode & 0o022 or st.st_nlink != 1 or st.st_size > 64 * 1024
+                or not _chain_trusted(os.path.dirname(os.path.abspath(path)), owner_uid)):
+            raise OSError("allowed_signers must be a root-owned regular file with one link, in a root-owned directory chain nobody else can write")
         return os.read(fd, 64 * 1024 + 1).decode("ascii")
     finally:
         os.close(fd)

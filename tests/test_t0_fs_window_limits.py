@@ -313,3 +313,32 @@ def test_the_walk_itself_never_follows_a_link_even_if_one_appears_after_resoluti
             os.close(f._walk_open(path, want_dir=want_dir))
         assert e.value.code == "escape", path
     os.close(f._walk_open("/proc/meminfo", want_dir=False))
+
+
+def test_clock_rollback_and_return_does_not_replenish_tokens(tmp_path):
+    """Review finding (rework 1): the saved timestamp followed the clock backwards, so T -> T-600 -> T counted 600 s that never elapsed and handed out a second heavy read."""
+    c = Clk()
+    f = str(tmp_path / "rl.json")
+    rl = RateLimiter(f, c)
+    assert rl.take("inv.git", True)
+    t = c.t
+    c.t = t - timedelta(seconds=600)
+    assert not rl.take("inv.git", True)
+    c.t = t
+    assert not rl.take("inv.git", True)
+    # the same through a restart in the middle and for the light bucket
+    c.t = t - timedelta(seconds=600)
+    rl2 = RateLimiter(f, c)
+    assert not rl2.take("inv.git", True)
+    c.t = t
+    assert not RateLimiter(f, c).take("inv.git", True)
+    assert rl.take("inv.host", False) and rl.take("inv.host", False)
+    c.t = t - timedelta(seconds=300)
+    assert not rl.take("inv.host", False)
+    c.t = t
+    assert not rl.take("inv.host", False)
+    import json
+    saved = json.loads(open(f).read())
+    assert saved["inv.git"][1] == t.timestamp() and saved["inv.host"][1] == t.timestamp()          # the stored time never moved backwards
+    c.t = t + timedelta(seconds=601)                                                                 # real time passing still refills
+    assert rl.take("inv.git", True)

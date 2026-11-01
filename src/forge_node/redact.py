@@ -3,7 +3,7 @@ Muster aus dem Secret-Scan der Inventur. Zwei Stufen: `light` (Token-Praefixe, J
 Git-Revisionen erhalten bleiben muessen; `full` (zusaetzlich >= 32 Zeichen lange base64/hex-Folgen) fuer Log-Text. Ueberredaktion ist die sichere Richtung."""
 import re
 
-REDACTION_VERSION = 1
+REDACTION_VERSION = 2          # 2: values under secret-named keys are redacted by key (api_key, forge.api_key, token, ...)
 MARK = "[REDACTED]"
 
 _PEM = re.compile(r"-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|\Z)")
@@ -45,13 +45,33 @@ def redact_full(text: str) -> str:
     return _LONG.sub(_long, redact_light(text))
 
 
+# Secret-named keys: a value whose KEY says what it is needs no recognisable shape (`{"forge.api_key": "hunter2-plain"}`). Matched on the key with separators and case removed, so
+# api_key / api-key / ApiKey / forge.api_key / FORGE_API_KEY / x-auth-token all hit. Over-redaction is the safe direction.
+_SECRET_KEY = re.compile(r"(?:passw(?:or)?d|passwd|pwd|passphrase|secret|token|apikey|accesskey|secretkey|privatekey|signingkey|encryptionkey|bearer|authorization|credential|cookie|sessionid|clientsecret)")
+
+
+def secret_key(key) -> bool:
+    return isinstance(key, str) and bool(_SECRET_KEY.search(re.sub(r"[^a-z0-9]", "", key.lower())))
+
+
+def _blank(v):
+    """Everything below a secret-named key is replaced: strings by the mark, containers leaf by leaf; numbers/booleans/None stay (a count of tokens is not a token)."""
+    if isinstance(v, str):
+        return MARK
+    if isinstance(v, list):
+        return [_blank(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _blank(x) for k, x in v.items()}
+    return v
+
+
 def redact_obj(obj, full: bool = False):
-    """Rekursiv ueber alle Zeichenketten (Werte; Schluessel bleiben unveraendert)."""
+    """Recursively over all strings (values) AND by key: values under secret-named keys are replaced whole. Keys themselves are not rewritten."""
     fn = redact_full if full else redact_light
     if isinstance(obj, str):
         return fn(obj)
     if isinstance(obj, list):
         return [redact_obj(x, full) for x in obj]
     if isinstance(obj, dict):
-        return {k: redact_obj(v, full) for k, v in obj.items()}
+        return {k: (_blank(v) if secret_key(k) else redact_obj(v, full)) for k, v in obj.items()}
     return obj

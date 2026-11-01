@@ -114,7 +114,7 @@ class T0Engine:
             if not self.limiter.take("metrics.collect", False):
                 return None
             self._last_sample = now
-            return self.spool.append(sanitize.clamp_ints(metrics.take_sample(env)))
+            return self.spool.append(sanitize.protect(metrics.take_sample(env)))
 
     def execute(self, op: str, tier: int, params: dict) -> Outcome:
         env = self.env

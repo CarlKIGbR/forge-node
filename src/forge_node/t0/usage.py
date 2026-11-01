@@ -1,4 +1,4 @@
-"""inv.usage (Design 4.1, 14.1): per container and unit - CPU, RSS, block I/O, GPU VRAM per process, network bytes, restarts, last-activity, compose/label attribution with an
+"""inv.usage (Design 4.1, 14.1): per container and unit - CPU, RSS, block I/O, GPU VRAM per process, network bytes (windowed, from per-container/unit counters in every sample), restarts, last-activity, compose/label attribution with an
 `unattributed` flag - over a window (72 h at most) aggregated from the spool plus a live snapshot. Names and labels come from the privileged `containers` probe; without it the
 snapshot reports short ids only (section marked degraded)."""
 from datetime import timedelta
@@ -10,6 +10,13 @@ from .spool import Spool
 from .wire import ProbeDenied, ProbeUnavailable
 
 
+def _grow(prev: int, cur: int) -> int:
+    """Growth of a cumulative counter between two samples; a decrease is a reset (container recreated, unit restarted with accounting) and counts from zero."""
+    if not isinstance(prev, int) or not isinstance(cur, int):
+        return 0
+    return cur - prev if cur >= prev else cur
+
+
 class _Acc:
     """Single-pass aggregation over the spool window: memory is O(cgroups + cards), independent of the number of samples."""
 
@@ -17,6 +24,8 @@ class _Acc:
         self.n = 0
         self.first_ts = self.last_ts = None
         self.cg: dict[str, dict] = {}
+        self.net: dict[str, dict] = {}
+        self.hostns: set[str] = set()
         self.cards: dict[int, dict] = {}
         self.by_owner: dict[str, int] = {}
         self.swap_used_max = None
@@ -27,10 +36,20 @@ class _Acc:
         self.first_ts = self.first_ts or s["ts"]
         self.last_ts = s["ts"]
         for k, v in (s.get("cg") or {}).items():
-            e = self.cg.setdefault(k, {"first": v, "last": v, "mem_max": 0, "n": 0})
-            e["last"] = v
+            e = self.cg.setdefault(k, {"prev": v, "mem_max": 0, "n": 0, "cpu": 0, "rb": 0, "wb": 0})
+            e["cpu"] += _grow(e["prev"][0], v[0])
+            e["rb"] += _grow(e["prev"][2], v[2])
+            e["wb"] += _grow(e["prev"][3], v[3])
+            e["prev"] = v
             e["mem_max"] = max(e["mem_max"], v[1])
             e["n"] += 1
+        for k, v in (s.get("cgnet") or {}).items():
+            e = self.net.setdefault(k, {"prev": v, "rx": 0, "tx": 0, "n": 0})
+            e["rx"] += _grow(e["prev"][0], v[0])
+            e["tx"] += _grow(e["prev"][1], v[1])
+            e["prev"] = v
+            e["n"] += 1
+        self.hostns.update(k for k in (s.get("cgnet_hostns") or []) if isinstance(k, str))
         for g in s.get("gpu") or []:
             c = self.cards.setdefault(g["i"], {"mem_used_max": 0, "mem_free_min": None, "util_max": 0, "temp_max": 0, "total": g["tot"]})
             c["mem_used_max"] = max(c["mem_used_max"], g["mem"] or 0)
@@ -51,8 +70,13 @@ class _Acc:
     def per_cgroup(self) -> dict:
         out = {}
         for k, e in self.cg.items():
-            f, l = e["first"], e["last"]
-            out[k] = {"samples": e["n"], "cpu_seconds": max(0, (l[0] - f[0]) // 1_000_000), "rss_max": e["mem_max"], "io_read_bytes": max(0, l[2] - f[2]), "io_write_bytes": max(0, l[3] - f[3])}
+            n = self.net.get(k)
+            out[k] = {"samples": e["n"], "cpu_seconds": e["cpu"] // 1_000_000, "rss_max": e["mem_max"], "io_read_bytes": e["rb"], "io_write_bytes": e["wb"],
+                      "net_rx_bytes": n["rx"] if n else None, "net_tx_bytes": n["tx"] if n else None, "net_samples": n["n"] if n else 0,
+                      "net_basis": ("systemd IP accounting" if k.startswith("u:") else "container network namespace") if n else ("host network namespace (not separable)" if k in self.hostns else "no counters")}
+        for k, n in self.net.items():            # units with IP accounting that are not among the biggest memory consumers still have their traffic
+            if k not in out:
+                out[k] = {"samples": 0, "net_rx_bytes": n["rx"], "net_tx_bytes": n["tx"], "net_samples": n["n"], "net_basis": "systemd IP accounting"}
         return out
 
     def hours(self) -> int:
@@ -75,7 +99,7 @@ def usage(env: Env, spool: Spool, probe, params: dict) -> dict:
     out_skipped = skipped
     out: dict = {"window": ok(hours=window_h, samples=acc.n, first=acc.first_ts, last=acc.last_ts, covered_hours=acc.hours(), per_cgroup=acc.per_cgroup(),
                               gpu={str(k): v for k, v in sorted(acc.cards.items())}, gpu_vram_by_owner_mib=dict(sorted(acc.by_owner.items(), key=lambda kv: -kv[1])[:40]),
-                              swap_used_max=acc.swap_used_max, load1_milli_max=acc.load_max, skipped_records=out_skipped)}
+                              swap_used_max=acc.swap_used_max, load1_milli_max=acc.load_max, skipped_records=out_skipped, net_host_namespace=sorted(acc.hostns))}
     live = metrics.cgroup_counters(env)
     out["now"] = ok(cgroups={k: {"cpu_usec": v[0], "rss": v[1], "io_read_bytes": v[2], "io_write_bytes": v[3]} for k, v in live.items()})
     try:

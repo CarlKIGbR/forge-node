@@ -42,29 +42,20 @@ def test_property_group_parser_and_cgroup_helpers(s, names):
     parse.cgroup_v2_path(s)
 
 
-@settings(max_examples=150, deadline=None)
-@given(st.text(max_size=500))
-def test_property_git_config_scanner_never_raises_and_rejects_every_unknown_key(s):
-    safe, why = probes.git_config_is_safe(s)
-    assert isinstance(safe, bool)
-    if safe:
-        # whatever passed contains only sections/keys of the inert allowlist
-        import re
-        for raw in s.splitlines():
-            line = raw.strip()
-            if not line or line[0] in "#;" or line.startswith("["):
-                continue
-            assert re.match(r"^[A-Za-z][A-Za-z0-9-]*\s*(=.*)?$", line) and not line.endswith("\\")
-
-
-@settings(max_examples=120, deadline=None)
-@given(st.text(alphabet="\t[]\"'= \\#;abcdefgilmnopsrtuyz.\n", max_size=200))
-def test_property_git_config_scanner_cannot_be_smuggled_past_with_odd_syntax(s):
-    safe, _ = probes.git_config_is_safe(s)
-    if safe:
-        low = s.lower().replace(" ", "").replace("\t", "")
-        for bad in ("fsmonitor", "hookspath", "filter", "textconv", "include", "sshcommand", "pager", "editor", "alias", "credential", "extensions", "attributesfile", "askpass", "diff"):
-            assert bad not in low, (bad, s)
+@settings(max_examples=300, deadline=None)
+@given(st.one_of(st.text(max_size=500), st.text(alphabet="\t[]\"'= \\#;abcdefgilmnopsrtuyz.\n\r\x0b\x0c\x85\u2028\ufeff", max_size=200)))
+def test_property_snapshot_config_is_always_the_fixed_inert_shape(s):
+    """Whatever the repository config contains, what git will read is generated: only `[core]`, only the inert keys, only simple values, each on its own line."""
+    cfg, dropped = probes.filter_git_config(s)
+    lines = cfg.split("\n")
+    assert lines[0] == "[core]" and lines[1] == "\trepositoryformatversion = 0" and lines[-1] == ""
+    for l in lines[2:-1]:
+        k, _, v = l.strip().partition(" = ")
+        assert k in probes._INERT_CORE and probes._INERT_VALUE.match(v), l
+    low = cfg.lower()
+    for bad in ("fsmonitor", "hookspath", "filter", "textconv", "include", "sshcommand", "pager", "editor", "alias", "credential", "extensions", "attributesfile", "askpass", "diff", "worktree"):
+        assert bad not in low, (bad, s)
+    assert len(dropped) <= 20
 
 
 @settings(max_examples=100, deadline=None)

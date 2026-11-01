@@ -32,7 +32,7 @@ def test_table_is_a_closed_snapshot_of_read_only_commands():
     assert shape == sorted([
         ("lsblk", "-J"), ("findmnt", "-J"), ("timedatectl", "show"), ("nvidia-smi", "--query-gpu=index,uuid,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw,power.limit,clocks.sm,clocks.max.sm,"
                                                                               "pcie.link.gen.current,pcie.link.width.current,clocks_throttle_reasons.active"),
-        ("nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory"), ("systemctl", "show"), ("systemctl", "show"), ("systemctl", "list-units"), ("systemctl", "list-timers"),
+        ("nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory"), ("systemctl", "show"), ("systemctl", "show"), ("systemctl", "show"), ("systemctl", "list-units"), ("systemctl", "list-timers"),
         ("systemctl", "is-active"), ("apt-get", "-s"), ("apt-mark", "showhold"), ("apt-config", "dump"), ("dpkg-query", "-W"), ("ip", "-j"), ("ss", "-tulnH"), ("ss", "-tulnpH"),
         ("iptables", "-S"), ("docker", "ps"), ("docker", "inspect"), ("docker", "image"), ("virsh", "-r"), ("virsh", "-r"), ("openssl", "x509"), ("openssl", "x509"),
         ("git", "--no-optional-locks"), ("sshd", "-T"), ("journalctl", "-u"), ("journalctl", "-u"), ("ionice", "-c3"),
@@ -140,10 +140,14 @@ def test_max_wait_can_only_shorten_the_timeout(fakebin):
     assert runner.run("findmnt", max_wait_s=3600).ok and time.monotonic() - t0 < 10        # a huge value does not extend the table's own timeout
 
 
-def test_git_gets_explicit_git_dir_and_common_dir_and_ignores_submodules(fakebin):
-    fakebin("git", '/usr/bin/env | /usr/bin/sort | /usr/bin/grep -E "^GIT_(DIR|COMMON_DIR)="; echo "$*"')
-    r = runner.run("git_status_tracked", {"repo": "/srv/my repo"})
-    assert "GIT_DIR=/srv/my repo/.git" in r.text and "GIT_COMMON_DIR=/srv/my repo/.git" in r.text and "--ignore-submodules=all" in r.text
+def test_git_is_pointed_at_the_probes_snapshot_and_uses_the_repository_only_as_data(fakebin):
+    fakebin("git", '/usr/bin/env | /usr/bin/sort | /usr/bin/grep -E "^GIT_(DIR|COMMON_DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|CONFIG_[A-Z]+)="; echo "$*"')
+    r = runner.run("git_status_tracked", {"repo": "/srv/my repo", "snap": "/tmp/fn-git-abc"})
+    t = r.text
+    for needle in ("GIT_DIR=/tmp/fn-git-abc\n", "GIT_COMMON_DIR=/tmp/fn-git-abc\n", "GIT_WORK_TREE=/srv/my repo\n", "GIT_INDEX_FILE=/srv/my repo/.git/index", "GIT_OBJECT_DIRECTORY=/srv/my repo/.git/objects",
+                   "--git-dir=/tmp/fn-git-abc", "--work-tree=/srv/my repo", "--ignore-submodules=all", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1"):
+        assert needle in t, needle
+    assert "GIT_DIR=/srv/my repo" not in t and "GIT_COMMON_DIR=/srv/my repo" not in t               # never the repository's own git dir
 
 
 def test_every_declared_slot_must_be_used_in_the_argv():
@@ -218,7 +222,7 @@ def test_stdin_command_receives_bytes(fakebin):
 
 def test_git_environment_is_hardened(fakebin):
     fakebin("git", "/usr/bin/env | /usr/bin/sort | /usr/bin/grep -E '^(GIT_|HOME)'; echo \"$*\"")
-    r = runner.run("git_status_tracked", {"repo": "/srv/x"})
+    r = runner.run("git_status_tracked", {"repo": "/srv/x", "snap": "/tmp/s"})
     for needle in ("GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "GIT_EXTERNAL_DIFF=/bin/false", "--no-optional-locks",
                    "core.fsmonitor=false", "core.hooksPath=/dev/null", "-C /srv/x status --porcelain=v1 --untracked-files=no"):
         assert needle in r.text, needle

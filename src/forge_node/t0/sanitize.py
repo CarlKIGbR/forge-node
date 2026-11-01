@@ -62,21 +62,6 @@ def clean_tree(o, _depth: int = 0):
     return clean_text(repr(o), 64)
 
 
-def clamp_ints(o, _depth: int = 0):
-    """For structures that go to the spool unfiltered (samples): bound integers to the canonical-JSON range."""
-    if _depth > _MAX_DEPTH:
-        return None
-    if isinstance(o, bool) or o is None or isinstance(o, str):
-        return o
-    if isinstance(o, int):
-        return max(-canon.MAX_INT, min(canon.MAX_INT, o))
-    if isinstance(o, (list, tuple)):
-        return [clamp_ints(x, _depth + 1) for x in o]
-    if isinstance(o, dict):
-        return {k: clamp_ints(v, _depth + 1) for k, v in o.items()}
-    return None
-
-
 def wire_safe(o, _depth: int = 0):
     """For privileged probe answers on their way to the agent: whatever the host produced must survive canonical JSON (integers clamped, NUL and lone surrogates replaced, absurd
     nesting cut) - one odd value must not turn a whole inventory into FAIL_EXEC. Content is NOT filtered here (the agent's finalize() does that)."""
@@ -150,6 +135,12 @@ def fit(body, limit: int = MAX_ENVELOPE_BYTES):
             continue
         break
     return {"error": "output_too_large"}, ["(root)"]
+
+
+def protect(record: dict) -> dict:
+    """The filter for anything that is PERSISTED on the node (the spool): same charset filtering, key- and value-aware redaction and integer clamp as the outgoing envelope. The
+    sampler used to write raw tool output (process names!) to disk; G27: nothing is stored that has not passed here."""
+    return redact.redact_obj(clean_tree(record))
 
 
 def finalize(node: str, op: str, collected_at: str, sensitivity: str, body: dict, *, full_redaction: bool, limit: int = MAX_ENVELOPE_BYTES) -> str:

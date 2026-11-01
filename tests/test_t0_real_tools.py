@@ -91,32 +91,124 @@ def test_git_probe_with_real_git_counts_tracked_changes_only(tmp_path):
     assert (tmp_path / "repo" / ".git" / "index").stat().st_mtime_ns == before                  # --no-optional-locks: the index was not rewritten
 
 
+PLAIN_ENV = {"PATH": os.environ["PATH"], "HOME": "/nonexistent", "GIT_CONFIG_GLOBAL": "/dev/null"}
+
+
+def plain_git_status(repo):
+    """What the probe used to be / what a naive implementation does: git run directly on the repository."""
+    subprocess.run(["git", "-c", f"safe.directory={repo}", "-C", str(repo), "status", "--porcelain"], env=PLAIN_ENV, capture_output=True)
+
+
+def program(tmp_path, name, marker):
+    p = tmp_path / name
+    p.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n")
+    os.chmod(p, 0o755)
+    return p
+
+
 @need("git")
-def test_a_repository_config_that_runs_a_program_is_never_given_to_git(tmp_path):
+def test_a_repository_config_that_runs_a_program_does_not_run_it_in_the_probe(tmp_path):
     marker = tmp_path / "ran-as-root"
-    hook = tmp_path / "evil.sh"
-    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
-    os.chmod(hook, 0o755)
+    hook = program(tmp_path, "evil.sh", marker)
     make_repo(tmp_path / "repo", config_extra=f"[core]\n\tfsmonitor = {hook}\n")
-    # control: plain `git status` really executes the program named in the repository config (this is the risk the scanner exists for)
-    subprocess.run(["git", "-c", f"safe.directory={tmp_path / 'repo'}", "-C", str(tmp_path / "repo"), "status", "--porcelain"], env={"PATH": os.environ["PATH"], "HOME": "/nonexistent", "GIT_CONFIG_GLOBAL": "/dev/null"}, capture_output=True)
+    plain_git_status(tmp_path / "repo")
     assert marker.exists(), "control failed: git did not run the configured fsmonitor program in this image"
     marker.unlink()
     pol = view(policy_doc(t0={"repos": [str(tmp_path / "repo")]}))
     g = probes.run_probe("git", {}, real_env(pol))["repos"]["repos"][0]
-    assert g["dirty_status"] == "skipped_unsafe_config" and g["rev"] and not marker.exists()
+    assert g["dirty_status"] == "ok" and g["dirty_tracked"] == 1 and g["rev"] and not marker.exists() and "core.fsmonitor" in g["config_not_used"]
+
+
+class RacingRunner:
+    """The reviewer's case: at the runner boundary - after the probe has read the config, before git starts - the repository owner swaps in a config that names programs, and (after
+    git finished) puts the old one back. Wraps the real runner."""
+
+    def __init__(self, real, swap, restore=None):
+        self.real, self.swap, self.restore = real, swap, restore
+        self.ran = 0
+
+    def run(self, cmd_id, slots=None, stdin=None, max_wait_s=None):
+        if cmd_id == "git_status_tracked":
+            self.swap()
+            self.ran += 1
+        r = self.real.run(cmd_id, slots, stdin, max_wait_s)
+        if cmd_id == "git_status_tracked" and self.restore:
+            self.restore()
+        return r
+
+    def available(self, cmd_id):
+        return self.real.available(cmd_id)
 
 
 @need("git")
-def test_even_if_the_scanner_were_wrong_the_command_line_disables_fsmonitor_and_hooks(tmp_path):
-    """Second layer: the argv itself overrides core.fsmonitor/hooksPath, so a config the scanner mis-parsed still cannot start the program through these two settings."""
+def test_replacing_the_repository_config_at_the_runner_boundary_executes_no_external_program(tmp_path):
+    marker = tmp_path / "filter-ran"
+    other = tmp_path / "fsmonitor-ran"
+    third = tmp_path / "include-ran"
+    clean, fsmon, inc = program(tmp_path, "clean.sh", marker), program(tmp_path, "fsmon.sh", other), program(tmp_path, "inc.sh", third)
+    repo = tmp_path / "repo"
+    make_repo(repo)
+    cfg = repo / ".git" / "config"
+    benign = cfg.read_text()
+    included = tmp_path / "included.cfg"
+    included.write_text(f"[core]\n\tfsmonitor = {inc}\n")
+    evil = benign + f'[filter "review"]\n\tclean = {clean}\n[core]\n\tfsmonitor = {fsmon}\n[include]\n\tpath = {included}\n'
+    (repo / ".gitattributes").write_text("* filter=review\n")
+    for n in ("tracked.txt", "other.txt", ".gitattributes"):
+        os.utime(repo / n, (1, 1))                                          # stat data differs from the index: status must hash content, i.e. run the clean filter
+
+    def swap():
+        cfg.write_text(evil)
+    # control 1: with the evil config in place, plain git runs the programs
+    swap()
+    plain_git_status(repo)
+    assert marker.exists() or other.exists(), "control failed: plain git did not run any repository-controlled program"
+    for m in (marker, other, third):
+        m.unlink(missing_ok=True)
+    for n in ("tracked.txt", "other.txt", ".gitattributes"):
+        os.utime(repo / n, (1, 1))
+    cfg.write_text(benign)
+    pol = view(policy_doc(t0={"repos": [str(repo)]}))
+    env = real_env(pol)
+    racing = RacingRunner(env.runner, swap, restore=lambda: cfg.write_text(benign))
+    env.runner = racing
+    g = probes.run_probe("git", {}, env)["repos"]["repos"][0]
+    assert racing.ran == 1 and g["dirty_status"] == "ok", g
+    assert not marker.exists() and not other.exists() and not third.exists(), "a repository-controlled program was executed by the probe"
+    assert cfg.read_text() == benign
+
+
+@need("git")
+def test_a_commondir_that_points_at_an_unscanned_config_cannot_run_a_filter_as_the_probe_user(tmp_path):
+    marker = tmp_path / "filter-ran"
+    evil = program(tmp_path, "evil.sh", marker)
+    repo = make_commondir_repo(tmp_path, evil)
+    plain_git_status(repo)
+    assert marker.exists(), "control failed: this git version did not run the commondir filter"
+    marker.unlink()
+    pol = view(policy_doc(t0={"repos": [str(repo)]}))
+    g = probes.run_probe("git", {}, real_env(pol))["repos"]["repos"][0]
+    assert not marker.exists()
+    assert g["dirty_status"] in ("ok", "no_revision") or g["dirty_status"].startswith("failed:")
+
+
+@need("git")
+def test_a_repository_hook_and_info_attributes_filter_cannot_run_either(tmp_path):
     marker = tmp_path / "ran"
-    hook = tmp_path / "evil.sh"
-    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
-    os.chmod(hook, 0o755)
-    make_repo(tmp_path / "repo", config_extra=f"[core]\n\tfsmonitor = {hook}\n")
-    r = runner.run("git_status_tracked", {"repo": str(tmp_path / "repo")})
-    assert r.ok and not marker.exists() and r.text.count("tracked.txt") == 1
+    prog = program(tmp_path, "evil.sh", marker)
+    repo = tmp_path / "repo"
+    make_repo(repo)
+    hooks = repo / ".git" / "hooks"
+    for h in ("pre-commit", "post-checkout", "fsmonitor-watchman", "post-index-change"):
+        (hooks / h).write_text(f"#!/bin/sh\ntouch {marker}\n")
+        os.chmod(hooks / h, 0o755)
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("* filter=x diff=y\n")
+    with open(repo / ".git" / "config", "a") as f:
+        f.write(f'[filter "x"]\n\tclean = {prog}\n[diff "y"]\n\ttextconv = {prog}\n[core]\n\thooksPath = {hooks}\n\tpager = {prog}\n')
+    pol = view(policy_doc(t0={"repos": [str(repo)]}))
+    g = probes.run_probe("git", {}, real_env(pol))["repos"]["repos"][0]
+    assert g["dirty_status"] == "ok" and not marker.exists()
 
 
 def _git(path, *a, env_extra=None):
@@ -146,28 +238,6 @@ def make_commondir_repo(tmp_path, evil_script):
     for n in ("tracked.txt", "other.txt", ".gitattributes"):
         os.utime(repo / n, (1, 1))                                      # stat data differs from the index: status must hash the content, i.e. run the clean filter
     return repo
-
-
-@need("git")
-def test_a_commondir_that_points_at_an_unscanned_config_cannot_run_a_filter_as_the_probe_user(tmp_path):
-    marker = tmp_path / "filter-ran"
-    evil = tmp_path / "evil.sh"
-    evil.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n")
-    os.chmod(evil, 0o755)
-    repo = make_commondir_repo(tmp_path, evil)
-    # control: plain `git status` on this layout really runs the filter named in the config that `commondir` points to
-    subprocess.run(["git", "-c", f"safe.directory={repo}", "-C", str(repo), "status", "--porcelain"], env={"PATH": os.environ["PATH"], "HOME": "/nonexistent", "GIT_CONFIG_GLOBAL": "/dev/null"}, capture_output=True)
-    assert marker.exists(), "control failed: this git version did not run the commondir filter"
-    marker.unlink()
-    # the probe refuses the layout outright
-    pol = view(policy_doc(t0={"repos": [str(repo)]}))
-    g = probes.run_probe("git", {}, real_env(pol))["repos"]["repos"][0]
-    assert g["dirty_status"] == "skipped_unsafe_config" and "commondir" in g["dirty_reason"] and not marker.exists()
-    # and even if the layout check were missing, the command line pins git to <repo>/.git as common dir, so the filter is not found
-    marker.unlink(missing_ok=True)
-    r = runner.run("git_status_tracked", {"repo": str(repo)})
-    assert not marker.exists(), "the explicit GIT_COMMON_DIR must override the commondir file"
-    assert r.ok or r.reason == "nonzero"
 
 
 @need("git")

@@ -293,3 +293,98 @@ def test_untrusted_envelope_and_customer_label(tmp_path):
     probe.replies["journal"] = lambda p: {"log": {"status": "ok", "unit": p["unit"], "lines": [], "dropped": 0, "sensitivity": "internal"}}
     clk.t += timedelta(minutes=5)
     assert json.loads(eng.execute("logs.unit", 0, {"unit": "kmu-s2-backup.service"}).output)["sensitivity"] == "customer"
+
+
+# ===================================================================================== rework 1: MAJOR 3 (sampler persistence), MAJOR 4 (key-aware redaction)
+def test_a_token_in_a_gpu_process_name_never_reaches_the_spool_file(tmp_path):
+    """Reviewer's case: the basename of a compute process was written verbatim to the spool JSONL by the sampler (which bypassed redaction)."""
+    gpu = "0, GPU-a, X, 1, 100, 1, 1, 1.0, 1.0, 1, 1, 4, 16, 0x0\n"
+    apps = "GPU-a, 77, /opt/x/hf_ReviewCanary123456789, 512\nGPU-a, 78, /usr/bin/ghp_ReviewCanaryABCDEFGH12, 1\nGPU-a, 79, /usr/bin/python3, 1\n"
+    eng, env, clk = make(tmp_path, FakeRunner({"nvidia_gpus": gpu, "nvidia_apps": apps}))
+    assert eng.sample() == 1
+    on_disk = b"".join(p.read_bytes() for p in (tmp_path / "state").glob("seg-*.jsonl")).decode()
+    assert "ReviewCanary" not in on_disk and "[REDACTED]" in on_disk and "python3" in on_disk
+    assert "ReviewCanary" not in json.dumps(eng.spool.read_after(0, 10))
+
+
+def test_secrets_in_every_string_of_a_sample_are_redacted_before_persistence(tmp_path):
+    files = {"/sys/fs/cgroup/system.slice/token=CANARYsecret123456.service/memory.current": "5\n"}
+    eng, env, clk = make(tmp_path, FakeRunner({"nvidia_gpus": "", "nvidia_apps": ""}), files=files)
+    assert eng.sample() == 1
+    raw = b"".join(p.read_bytes() for p in (tmp_path / "state").glob("seg-*.jsonl")).decode()
+    assert "CANARY" not in raw
+
+
+def test_every_entry_point_that_produces_or_persists_t0_data_passes_the_sanitizer(tmp_path, monkeypatch):
+    """The reviewer asked for the entry points to be ENUMERATED and proven: (1) engine.execute for each of the 16 ops -> sanitize.finalize, (2) engine.sample -> sanitize.protect
+    before spool.append, (3) the privileged probes -> wire_safe on the wire and finalize at the agent. Spies, not source greps."""
+    from forge_node.t0 import sanitize as S
+    seen = {"finalize": 0, "protect": 0, "append_after_protect": True, "protected_ids": set()}
+    real_fin, real_prot = S.finalize, S.protect
+    monkeypatch.setattr(S, "finalize", lambda *a, **k: (seen.__setitem__("finalize", seen["finalize"] + 1), real_fin(*a, **k))[1])
+
+    def prot(rec):
+        out = real_prot(rec)
+        seen["protect"] += 1
+        seen["protected_ids"].add(id(out))
+        return out
+    monkeypatch.setattr(S, "protect", prot)
+    eng, env, clk = make(tmp_path)
+    real_append = eng.spool.append
+
+    def append(sample):
+        if id(sample) not in seen["protected_ids"]:
+            seen["append_after_protect"] = False
+        return real_append(sample)
+    eng.spool.append = append
+    committed = 0
+    for op in sorted(E.T0_OPS):
+        clk.t += timedelta(minutes=30)
+        before = seen["finalize"]
+        o = eng.execute(op, 0, {"unit": "forge-postbote.service"} if op == "logs.unit" else {})
+        assert o.status == "committed" and seen["finalize"] == before + 1, op
+        committed += 1
+    assert committed == 16 and eng.sample() == 1 and seen["protect"] == 1 and seen["append_after_protect"] is True
+
+
+def test_nothing_but_the_engine_appends_to_the_spool():
+    import ast
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "src" / "forge_node"
+    callers = set()
+    for p in list((root / "t0").glob("*.py")) + list((root / "agent").glob("*.py")):
+        for n in ast.walk(ast.parse(p.read_text())):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "append" and "spool" in ast.unparse(n.func.value):
+                callers.add(p.name)
+    assert callers == {"engine.py"}
+
+
+@pytest.mark.parametrize("key", ["api_key", "API_KEY", "ApiKey", "forge.api_key", "FORGE_API_KEY", "x-auth-token", "password", "db_passwd", "client_secret", "Authorization", "access_key", "private-key", "forge.secret.value", "session_cookie"])
+def test_values_under_secret_named_keys_are_redacted_whatever_their_shape(key):
+    from forge_node import redact
+    out = redact.redact_obj({key: "review-plain-credential-123", "nested": {key: ["a", {"b": "c"}]}, "keep": "review-plain-credential-123", "count_" + key: 5})
+    assert out[key] == "[REDACTED]" and out["nested"][key] == ["[REDACTED]", {"b": "[REDACTED]"}] and out["keep"] == "review-plain-credential-123" and out["count_" + key] == 5
+
+
+def test_container_labels_with_secret_names_are_redacted_in_the_envelope(tmp_path):
+    """Reviewer's case: {"labels": {"forge.api_key": "review-plain-credential-123"}} survived finalize(); forge.* labels are collected by the containers probe."""
+    containers = {"containers": {"status": "ok", "containers": [{"name": "svc", "labels": {"forge.api_key": "review-plain-credential-123", "forge.project": "p", "forge.db_password": "p4ssw0rd-plain"}}]}}
+    eng, *_ = make(tmp_path, probe=FakeProbe({"containers": containers}))
+    o = eng.execute("inv.containers", 0, {})
+    assert o.status == "committed" and "review-plain-credential-123" not in o.output and "p4ssw0rd-plain" not in o.output
+    labels = json.loads(o.output)["data"]["containers"]["containers"][0]["labels"]
+    assert labels["forge.api_key"] == "[REDACTED]" and labels["forge.db_password"] == "[REDACTED]" and labels["forge.project"] == "p"
+    from forge_node.t0 import sanitize
+    t = sanitize.finalize("g2", "inv.containers", "2026-10-31T13:40:10Z", "internal", {"labels": {"forge.api_key": "review-plain-credential-123"}}, full_redaction=False)
+    assert "review-plain-credential-123" not in t
+
+
+def test_the_real_containers_probe_output_is_key_redacted_end_to_end(tmp_path):
+    from test_t0_probes import CID, env_with, inspect_line
+    from forge_node.t0 import probes as P
+    line = inspect_line(labels={"forge.api_key": "review-plain-credential-123", "forge.project": "p"})
+    r = FakeRunner({"docker_ps_ids": CID + "\n", "docker_inspect": line + "\n"})
+    data = P.run_probe("containers", {}, env_with(tmp_path, r))
+    assert "forge.api_key" in data["containers"]["containers"][0]["labels"]                # the probe reports the label NAME ...
+    eng, *_ = make(tmp_path / "e", probe=FakeProbe({"containers": data}))
+    assert "review-plain-credential-123" not in eng.execute("inv.containers", 0, {}).output          # ... and the agent never lets the value out

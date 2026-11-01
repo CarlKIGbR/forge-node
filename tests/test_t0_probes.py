@@ -173,7 +173,7 @@ def test_git_probe_rev_branch_and_tracked_dirty_count(tmp_path):
     r = FakeRunner({"git_status_tracked": " M a.py\n M b.py\n"})
     g = run_probe("git", {}, git_env(tmp_path, r))["repos"]["repos"][0]
     assert g["rev"] == H1 and g["branch"] == "main" and g["detached"] is False and g["dirty_tracked"] == 2 and g["dirty_status"] == "ok"
-    assert r.calls == [("git_status_tracked", {"repo": "/opt/kmu-ai"})]
+    assert [c[0] for c in r.calls] == ["git_status_tracked"] and r.calls[0][1]["repo"] == "/opt/kmu-ai"
 
 
 def test_git_rev_comes_from_packed_refs_and_detached_head(tmp_path):
@@ -185,22 +185,61 @@ def test_git_rev_comes_from_packed_refs_and_detached_head(tmp_path):
     assert d["detached"] is True and d["rev"] == "d" * 40 and d["branch"] is None
 
 
-@pytest.mark.parametrize("config", [
+EVIL_CONFIGS = [
     "[core]\n\tfsmonitor = /tmp/evil\n", "[core]\n\thooksPath = /tmp/h\n", "[filter \"x\"]\n\tclean = /tmp/evil\n", "[diff \"y\"]\n\ttextconv = /tmp/evil\n", "[include]\n\tpath = /tmp/x\n",
     "[includeIf \"gitdir:/\"]\n\tpath = /tmp/x\n", "[alias]\n\tst = !evil\n", "[core]\n\tsshCommand = evil\n", "[credential]\n\thelper = evil\n", "[extensions]\n\tworktreeConfig = true\n",
     "[core]\n\tfilemode = true \\\n\t, fsmonitor = evil\n", "orphan = key\n", "[core]\n\tpager = evil\n", "[core]\n\tattributesFile = /tmp/a\n", "[core]\n\teditor = evil\n",
-])
-def test_git_is_never_executed_on_a_repository_whose_config_can_run_programs(tmp_path, config):
-    r = FakeRunner({"git_status_tracked": " M a\n"})
+    "[core] fsmonitor = x\n", "[CORE]\n\tFSMONITOR = x\n", "[core]\n\tfilemode = true\n\tfsmonitor = /tmp/evil\n",
+]
+
+
+@pytest.mark.parametrize("config", EVIL_CONFIGS)
+def test_git_runs_against_a_generated_snapshot_never_the_repository_config(tmp_path, config):
+    """Rework 1 (MAJOR 1): there is no scan-then-run. Whatever the repository config says, git is pointed at a private git dir whose config the probe wrote; at the moment git is
+    started (inside the runner call) that directory holds ONLY inert keys, the HEAD and the ref the probe read, and nothing else."""
+    seen = {}
+
+    def status(slots, stdin):
+        snap = slots["snap"]
+        seen["files"] = sorted(os.path.relpath(os.path.join(d, f), snap) for d, _, fs in os.walk(snap) for f in fs)
+        seen["config"] = open(os.path.join(snap, "config")).read()
+        seen["head"] = open(os.path.join(snap, "HEAD")).read()
+        seen["ref"] = open(os.path.join(snap, "refs/heads/main")).read()
+        seen["repo"] = slots["repo"]
+        return Run(True, "ok", 0, b" M a\n")
+    r = FakeRunner({"git_status_tracked": status})
     g = run_probe("git", {}, git_env(tmp_path, r, config=config))["repos"]["repos"][0]
-    assert g["dirty_status"] == "skipped_unsafe_config" and g["dirty_tracked"] is None and g["rev"] == H1 and r.called("git_status_tracked") == 0
+    assert g["dirty_status"] == "ok" and g["dirty_tracked"] == 1 and g["rev"] == H1
+    assert seen["files"] == ["HEAD", "config", "refs/heads/main"] and seen["head"] == "ref: refs/heads/main\n" and seen["ref"] == H1 + "\n"
+    keys = [l.strip() for l in seen["config"].splitlines() if "=" in l]
+    assert set(l.split("=")[0].strip() for l in keys) <= {"repositoryformatversion", *probes._INERT_CORE} and seen["config"].startswith("[core]\n")
+    for forbidden in ("fsmonitor", "evil", "hookspath", "filter", "include", "alias", "textconv", "sshcommand", "helper", "worktreeconfig", "pager", "editor", "attributesfile", "/tmp"):
+        assert forbidden not in seen["config"].lower(), forbidden
+    assert g.get("config_not_used"), "whatever was not carried over is reported"
 
 
-def test_git_config_scanner_accepts_inert_settings_only():
-    assert probes.git_config_is_safe("[core]\n\tbare = false\n# c\n; d\n[user]\n\tname = a\n\temail = b@c\n[remote \"o\"]\n\turl = u\n")[0]
-    assert not probes.git_config_is_safe("[core]\n\tfsMonitor = x\n")[0]
-    assert not probes.git_config_is_safe("[CORE]\n\tFSMONITOR = x\n")[0]
-    assert not probes.git_config_is_safe("[core] fsmonitor = x\n")[0]
+def test_the_snapshot_is_removed_after_the_run_and_even_if_git_fails(tmp_path):
+    import glob
+    before = set(glob.glob("/tmp/fn-git-*"))
+    run_probe("git", {}, git_env(tmp_path, FakeRunner({"git_status_tracked": Run(False, "timeout")})))
+    run_probe("git", {}, git_env(tmp_path / "b", FakeRunner({"git_status_tracked": " M x\n"})))
+    assert set(glob.glob("/tmp/fn-git-*")) == before
+
+
+def test_inert_core_settings_are_carried_into_the_snapshot_and_dropped_ones_are_reported(tmp_path):
+    seen = {}
+    r = FakeRunner({"git_status_tracked": lambda s, _: (seen.setdefault("c", open(os.path.join(s["snap"], "config")).read()), Run(True, "ok", 0, b""))[1]})
+    cfg = "[core]\n\tfilemode = false\n\tautocrlf = input\n\tignorecase = true\n\tfsmonitor = /x\n\tsymlinks = $(id)\n[filter \"lfs\"]\n\tclean = git-lfs clean\n[user]\n\tname = a\n"
+    g = run_probe("git", {}, git_env(tmp_path, r, config=cfg))["repos"]["repos"][0]
+    assert seen["c"] == "[core]\n\trepositoryformatversion = 0\n\tautocrlf = input\n\tfilemode = false\n\tignorecase = true\n"
+    assert set(g["config_not_used"]) == {"core.fsmonitor", "core.symlinks", "[filter]", "[user]"}
+
+
+def test_filter_git_config_output_is_generated_never_copied():
+    for text in ("[core]\n\tfilemode = true # c\n", "\ufeff[core]\n\tfilemode = true\n", "[core]\r\n\tfilemode = true\r\n", "[core]\n\tfilemode = tr\nue\n"):
+        cfg, _ = probes.filter_git_config(text)
+        assert cfg.startswith("[core]\n\trepositoryformatversion = 0\n") and "#" not in cfg and "\r" not in cfg and "\ufeff" not in cfg
+    assert probes.filter_git_config("[core]\n\tfilemode = true\n[remote \"o\"]\n\turl = u\n")[1] == ["[remote]"]
 
 
 def test_git_head_with_dotdot_branch_or_non_hex_rev_is_not_followed(tmp_path):
@@ -473,3 +512,19 @@ def test_activity_probe_stops_at_its_time_budget(tmp_path):
     env.now = lambda: state["t"]
     rows = run_probe("activity", {}, env)["activity"]["units"]
     assert any(r.get("skipped") == "budget" for r in rows) and rows[0].get("skipped") is None
+
+
+def test_the_git_snapshot_is_private_and_nothing_else_is_written(tmp_path):
+    seen = {}
+
+    def status(slots, stdin):
+        st = os.stat(slots["snap"])
+        seen["mode"], seen["uid"], seen["parent"] = st.st_mode & 0o777, st.st_uid, os.path.dirname(slots["snap"])
+        seen["repo_before"] = sorted(str(p) for p in (tmp_path / "opt/kmu-ai").rglob("*"))
+        return Run(True, "ok", 0, b"")
+    env = git_env(tmp_path, FakeRunner({"git_status_tracked": status}))
+    before = sorted(str(p) for p in (tmp_path / "opt/kmu-ai").rglob("*"))
+    run_probe("git", {}, env)
+    after = sorted(str(p) for p in (tmp_path / "opt/kmu-ai").rglob("*"))
+    assert seen["mode"] == 0o700 and seen["uid"] == os.getuid() and seen["parent"] == __import__("tempfile").gettempdir()
+    assert before == after == seen["repo_before"]                           # the repository tree is neither written nor given extra files

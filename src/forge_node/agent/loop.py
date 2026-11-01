@@ -39,19 +39,39 @@ class PolicyHolder:
         self._last_err = None
         self.view: PolicyView | None = None
 
+    @staticmethod
+    def _stat_key(st) -> tuple:
+        return (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_mode, st.st_uid, st.st_gid, st.st_nlink)
+
+    @staticmethod
+    def _chain_key(path: str) -> tuple:
+        """Identity, owner and mode of every directory from `path` up to / (directory trust is part of what load_installed() demands). No times: they change with every entry
+        created or removed in the directory and would force a re-verification all the time."""
+        out, d = [], os.path.abspath(path)
+        while True:
+            try:
+                st = os.stat(d)
+                out.append((d, st.st_ino, st.st_mode, st.st_uid, st.st_gid))
+            except OSError:
+                out.append((d, None))
+            if d == "/":
+                return tuple(out)
+            d = os.path.dirname(d)
+
     def _signature(self):
-        """Identity of everything the decision rests on: the policy files AND the owner key file (a rotated or revoked owner key must be noticed without a policy change)."""
+        """Everything the decision rests on, down to what load_installed() checks on the descriptor: for each policy file inode, times (incl. ctime), size, MODE, uid, gid and LINK
+        COUNT; the same for the owner key file; owner/mode of the directory chains of both. Any difference forces a full re-verification (review: a chmod 0666 on a verified policy
+        used to leave it in force)."""
         try:
             names = sorted(n for n in os.listdir(self.cfg.policy_dir) if n.startswith("policy-"))
-            st = [os.stat(os.path.join(self.cfg.policy_dir, n), follow_symlinks=False) for n in names]
-            files = tuple((n, s.st_ino, s.st_mtime_ns, s.st_size) for n, s in zip(names, st))
+            files = tuple((n, *self._stat_key(os.stat(os.path.join(self.cfg.policy_dir, n), follow_symlinks=False))) for n in names)
         except OSError:
             return None
         try:
-            a = os.stat(self.cfg.allowed_signers, follow_symlinks=False)
-            return files + (("allowed_signers", a.st_ino, a.st_mtime_ns, a.st_size),)
+            signers = ("allowed_signers", *self._stat_key(os.stat(self.cfg.allowed_signers, follow_symlinks=False)))
         except OSError:
-            return files + (("allowed_signers", None),)
+            signers = ("allowed_signers", None)
+        return (files, signers, self._chain_key(self.cfg.policy_dir), self._chain_key(os.path.dirname(self.cfg.allowed_signers)))
 
     def refresh(self) -> tuple[PolicyView | None, bool]:
         """(view, changed)"""

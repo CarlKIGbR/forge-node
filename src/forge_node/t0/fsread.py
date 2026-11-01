@@ -165,14 +165,6 @@ class Fs:
         os.close(fd)
         return True
 
-    def exists_unfiltered(self, logical: str) -> bool:
-        """lstat existence of a policy-derived path (no allowlist: used for layout checks like .git/commondir). Never opens it."""
-        try:
-            os.lstat(self._actual(norm_abs(logical)))
-            return True
-        except (OSError, FsError):
-            return False
-
     # ----------------------------------------------------------------------------------------------------------------- metadata
     def resolve_dir(self, logical: str) -> str:
         """Logical realpath of a policy-named directory/file, computed on the (relocated) tree and checked to stay below the root. Symlinks ARE followed here (policy paths such as

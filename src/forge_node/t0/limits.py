@@ -42,10 +42,13 @@ class RateLimiter:
         now = self.clock().timestamp()
         with self._lock:
             tokens, last = self._b.get(op, (cap, now))
-            tokens = min(cap, tokens + max(0.0, now - last) * rate)       # clock steps backwards never mint tokens; forward jumps are capped by the capacity
+            # Time only moves forward here: a clock that steps back neither refills (elapsed is clamped at 0) NOR drags the saved timestamp back - otherwise the step back
+            # followed by the return to the true time would be counted as elapsed time (T -> T-600 -> T replenished a heavy token).
+            tokens = min(cap, tokens + max(0.0, now - last) * rate)
+            last = max(last, now)
             ok = tokens >= 1.0
             if ok:
                 tokens -= 1.0
-            self._b[op] = (tokens, now)
+            self._b[op] = (tokens, last)
             self._save()
             return ok

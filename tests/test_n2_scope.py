@@ -122,10 +122,11 @@ def test_writes_are_confined_to_the_agent_state_modules():
                     hits.add("open-for-write")
         if obj := hits:
             writers[m.name] = sorted(hits)
-    assert set(writers) == {"spool.py", "limits.py", "loop.py", "__main__.py"}, writers
+    # probes.py: the git probe's private snapshot directory (mkdtemp in the unit's PrivateTmp, 0700, removed after the run) is the only thing a probe creates
+    assert set(writers) == {"spool.py", "limits.py", "loop.py", "__main__.py", "probes.py"}, writers
     # the agent never changes permissions or ownership of anything except its own spool directory
     for name, hits in writers.items():
-        if name != "spool.py":
+        if name not in ("spool.py", "probes.py"):
             assert not ({"chmod", "fchmod", "chown", "symlink", "link", "unlink", "remove", "rmdir"} & set(hits)), (name, hits)
 
 
