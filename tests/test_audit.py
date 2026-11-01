@@ -422,8 +422,8 @@ def test_purge_refuses_unacked_rotated_files(specs, priv):
     last_seq_gen1 = records(live_path(s, 1))[-1]["seq"]
     assert priv.purge(acked_seq=last_seq_gen1 - 1, now=now) == []        # acknowledged short of the file's last seq
     young = Clock()()
-    assert priv.purge(acked_seq=10 ** 6, now=young) == []                # acknowledged but younger than 90 days
-    removed = priv.purge(acked_seq=10 ** 6, now=now)
+    assert priv.purge(acked_seq=priv.head()[0], now=young) == []                # acknowledged but younger than 90 days
+    removed = priv.purge(acked_seq=priv.head()[0], now=now)
     assert removed == ["priv.000001", "priv.000002"]                      # never the active generation (4) nor its direct predecessor (3)
     assert sorted(x for x in os.listdir(s.dir) if x.startswith("priv.")) == ["priv.000003", "priv.000004"]
     assert priv.verify() == []                                            # the chain continues from the oldest remaining file

@@ -34,7 +34,7 @@ from typing import Callable
 
 from .. import canon, chain, protocol
 from . import fsflags
-from .scan import Tail, file_summary, last_record, parse_record, tail_state, verify_file
+from .scan import Tail, file_summary, follow, last_record, parse_record, region_digest, tail_state, verify_file
 from .spec import (CURRENT_NAME, CURRENT_TMP, LOCK_TIMEOUT_S, MAX_CURRENT_BYTES, MIN_AGE_PURGE_S, AuditCorrupt, AuditDown, AuditNotInitialised, LogSpec, gen_file, gen_name, gen_re)
 
 Clock = Callable[[], datetime]
@@ -258,13 +258,16 @@ class Appender:
                     pass
 
     def _refresh_tail(self) -> Tail:
-        """Head of the live file; the cached value is used only while (inode, size) are unchanged since our own last write (another writer, e.g. root recovery, changes the size)."""
+        """Head of the live file. The cached head is trusted only as a STARTING POINT: the chain is followed forward from it over whatever was appended since (our own last write ends exactly
+        at the cached end; anything beyond is another writer's - root recovery or a hostile agent-uid append - and is read, never assumed). A different inode starts from the file's beginning."""
         st = os.fstat(self._fd)
         key = (st.st_ino, st.st_size)
         if self._tail is None or self._key != key:
-            self._tail = tail_state(self._fd, self.node, self.spec.source)
+            base = self._tail if (self._tail is not None and self._key is not None and self._key[0] == st.st_ino and st.st_size >= self._tail.end) else None
+            self._tail = follow(self._fd, self.node, self.spec.source, base)
             self._key = key
             if self._tail.seq is None:
+                self._tail = self._key = None
                 raise AuditCorrupt("live log file has no valid record (no chain_link)")
         return self._tail
 
@@ -291,18 +294,24 @@ class Appender:
         except (OSError, AuditDown) as e:
             self._tail = self._key = None
             raise AuditDown(f"append failed ({type(e).__name__})") from e
-        st = os.fstat(self._fd)
-        self._tail = Tail(rec["seq"], rec["hash"], st.st_size, st.st_size, 0)
-        self._key = (st.st_ino, st.st_size)
+        self._cache_after_write(rec)
         return rec
+
+    def _cache_after_write(self, rec: dict) -> None:
+        """The head is cached at the offset where OUR write ended (an O_APPEND write leaves the descriptor's offset there, whatever another writer appends afterwards), not at the current size:
+        bytes a hostile writer appended in between stay visible to the next refresh instead of being swallowed into the cache."""
+        end = os.lseek(self._fd, 0, os.SEEK_CUR)
+        st = os.fstat(self._fd)
+        self._tail = Tail(rec["seq"], rec["hash"], end, end, 0)
+        self._key = (st.st_ino, end)
 
     def _repair_tail_locked(self) -> dict | None:
         t = self._refresh_tail()
         if t.clean:
             return None
-        damaged = os.pread(self._fd, t.damaged, t.end)                      # the bytes OBSERVED now; a hostile writer may still append before our write lands: the verifier tolerates that
-        ins = not damaged.endswith(b"\n")
-        rec = chain.seal_record({"ts": self._ts(), "node": self.node, "type": "tail_repair", "bytes": len(damaged), "inserted_newline": ins, "sha256": hashlib.sha256(damaged).hexdigest()},
+        # the bytes OBSERVED now (streamed: the damage can be arbitrarily large); a hostile writer may still append before our write lands: the verifier tolerates that
+        ins = os.pread(self._fd, 1, t.end + t.damaged - 1) != b"\n"
+        rec = chain.seal_record({"ts": self._ts(), "node": self.node, "type": "tail_repair", "bytes": t.damaged, "inserted_newline": ins, "sha256": region_digest(self._fd, t.end, t.damaged)},
                                 t.seq + 1, t.hash)
         chain.validate_record(rec, self.node, self.spec.source)
         try:
@@ -311,9 +320,7 @@ class Appender:
         except (OSError, AuditDown) as e:
             self._tail = self._key = None
             raise AuditDown(f"tail repair failed ({type(e).__name__})") from e
-        st = os.fstat(self._fd)
-        self._tail = Tail(rec["seq"], rec["hash"], st.st_size, st.st_size, 0)
-        self._key = (st.st_ino, st.st_size)
+        self._cache_after_write(rec)
         return rec
 
     def _append_locked(self, type_: str, fields: dict) -> dict:
@@ -462,7 +469,13 @@ class AuditAdmin(Appender):
         with self._mutex:
             self._lock()
             try:
-                if self._read_current() is not None or self._list_gens():
+                gens = self._list_gens()
+                if self._read_current() is None and set(gens) == {1}:
+                    # an init that died before CURRENT was written: generation 1 is unreachable (0700) or was never used, so it is finished or rebuilt, never quarantined
+                    self._complete_successor(1, None)
+                    self._write_current(1)
+                    return 1
+                if self._read_current() is not None or gens:
                     self._recover_locked()
                     return self._read_current()
                 self._build_generation(1, None)
@@ -476,7 +489,8 @@ class AuditAdmin(Appender):
         with self._mutex:
             self._lock()
             try:
-                self._recover_locked()
+                if any(a.startswith("rotation to generation") for a in self._recover_locked()):
+                    return self._read_current()                                # an interrupted rotation was just completed: that IS the rotation that was asked for
                 return self._rotate_locked()
             finally:
                 self._unlock()
@@ -502,6 +516,7 @@ class AuditAdmin(Appender):
         fl = fsflags.add_flags(fd, fsflags.IMMUTABLE)
         if not fsflags.is_sealed(fl):
             raise AuditCorrupt("could not seal the log file")
+        os.fsync(fd)                                                          # what we hash is what survives a power loss
         return self._sealed_description(fd)
 
     def _sealed_description(self, fd: int) -> dict:
@@ -509,8 +524,7 @@ class AuditAdmin(Appender):
         t = tail_state(fd, self.node, self.spec.source)
         if t.seq is None:
             raise AuditCorrupt("sealed log file has no valid record")
-        dmg = os.pread(fd, t.damaged, t.end) if t.damaged else b""
-        return {"seq": t.seq, "hash": t.hash, "sha256": sha, "bytes": size, "damaged": len(dmg), "damaged_sha256": hashlib.sha256(dmg).hexdigest() if dmg else None}
+        return {"seq": t.seq, "hash": t.hash, "sha256": sha, "bytes": size, "damaged": t.damaged, "damaged_sha256": region_digest(fd, t.end, t.damaged) if t.damaged else None}
 
     def _rotate_locked(self) -> int:
         cur = self._read_current()
@@ -584,6 +598,7 @@ class AuditAdmin(Appender):
         newest = max(gens)
         if newest > cur + 1:
             raise AuditCorrupt("generations newer than CURRENT + 1 exist")
+        actions += self._recover_old_generations(cur, gens)
         st = self._gen_state(cur)
         if not st["file"]:
             raise AuditCorrupt("CURRENT names a generation without a log file")
@@ -616,12 +631,50 @@ class AuditAdmin(Appender):
             os.close(fd)
         return actions
 
-    def _complete_successor(self, n: int, prev: dict) -> list[str]:
+    def _recover_old_generations(self, cur: int, gens: dict) -> list[str]:
+        """What a purge interrupted: a directory whose file is already gone (rmdir), or a file whose flags were cleared before its unlink (re-sealed and made reachable again - purge hides the
+        directory (0700) before it clears a flag, so nobody can have opened the flagless file for writing)."""
+        s = self.spec
+        actions: list[str] = []
+        for n in sorted(g for g in gens if g < cur):
+            st = self._gen_state(n)
+            if not st["dir"]:
+                continue
+            if not st["file"]:
+                os.rmdir(gen_name(s.prefix, n), dir_fd=self._dfd)
+                os.fsync(self._dfd)
+                actions.append(f"removed the empty directory of generation {n} (an interrupted purge)")
+                continue
+            if not fsflags.is_sealed(st["flags"]):
+                if st["dir_mode"] != 0o700:
+                    raise AuditCorrupt(f"generation {n} lost its seal while reachable")
+                gfd, fd = self._open_ro(n)
+                try:
+                    fsflags.add_flags(fd, fsflags.APPEND | fsflags.IMMUTABLE)
+                    os.fchmod(gfd, s.dir_mode)
+                    os.fsync(gfd)
+                finally:
+                    os.close(gfd)
+                    os.close(fd)
+                actions.append(f"re-sealed generation {n} (an interrupted purge cleared its flags)")
+            elif st["dir_mode"] != s.dir_mode:
+                gfd = self._open_gen_dir(n)
+                try:
+                    os.fchmod(gfd, s.dir_mode)
+                    os.fsync(gfd)
+                finally:
+                    os.close(gfd)
+                actions.append(f"made generation {n} reachable again (an interrupted purge hid it)")
+        return actions
+
+    def _complete_successor(self, n: int, prev: dict | None) -> list[str]:
         """The state after a crash between the seal and the CURRENT switch: validate or rebuild generation n (unreachable until step 5, so nobody else can have touched it)."""
         s = self.spec
         actions: list[str] = []
         st = self._gen_state(n)
         if st["file"] and st["flags"] & (fsflags.APPEND | fsflags.IMMUTABLE) == 0:
+            if st["dir_mode"] != 0o700:
+                raise AuditCorrupt(f"generation {n} is reachable but its file has no append-only flag")
             gfd = self._open_gen_dir(n)
             try:
                 fd = os.open(gen_file(s.prefix, n), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=gfd)
@@ -660,6 +713,8 @@ class AuditAdmin(Appender):
             if st["flags"] & fsflags.IMMUTABLE:
                 raise AuditCorrupt("successor generation is sealed before it was ever live")
             if not st["flags"] & fsflags.APPEND:
+                if st["dir_mode"] != 0o700:
+                    raise AuditCorrupt(f"generation {n} is reachable but its file has no append-only flag")
                 actions.append(f"set the append-only flag on generation {n}")
             self._finish_generation(gfd, fd)
             if st["dir_mode"] != s.dir_mode:
@@ -683,27 +738,36 @@ class AuditAdmin(Appender):
                 cur = self._read_current()
                 if cur is None:
                     raise AuditNotInitialised("audit log is not initialised")
+                self._ensure_open(cur)
+                head = self._refresh_tail().seq
+                if acked_seq > head:
+                    raise ValueError(f"acked_seq {acked_seq} is beyond the head of the log ({head})")      # a typo must not purge what the hub never acknowledged
                 for n in sorted(self._list_gens()):
                     if n >= cur - 1:
                         break
                     gfd = self._open_gen_dir(n)
                     try:
-                        fd = os.open(gen_file(s.prefix, n), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=gfd)
                         try:
-                            self._check_file(fd, "purge candidate")
-                            if not fsflags.is_sealed(fsflags.get_flags(fd)):
-                                break
-                            t = tail_state(fd, self.node, s.source)
-                            last = last_record(fd, t, self.node, s.source)
-                            if last is None or t.seq > acked_seq:
-                                break
-                            age = (now - protocol.parse_ts(last["ts"])).total_seconds()
-                            if age < MIN_AGE_PURGE_S:
-                                break
-                            fsflags.clear_flags(fd, fsflags.APPEND | fsflags.IMMUTABLE)
-                            os.unlink(gen_file(s.prefix, n), dir_fd=gfd)
-                        finally:
-                            os.close(fd)
+                            fd = os.open(gen_file(s.prefix, n), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=gfd)
+                        except FileNotFoundError:
+                            fd = -1                                                    # the remains of an interrupted purge: the directory only
+                        if fd >= 0:
+                            try:
+                                self._check_file(fd, "purge candidate")
+                                if not fsflags.is_sealed(fsflags.get_flags(fd)):
+                                    break
+                                t = tail_state(fd, self.node, s.source)
+                                last = last_record(fd, t, self.node, s.source)
+                                if last is None or t.seq > acked_seq:
+                                    break
+                                age = (now - protocol.parse_ts(last["ts"])).total_seconds()
+                                if age < MIN_AGE_PURGE_S:
+                                    break
+                                os.fchmod(gfd, 0o700)                                  # hidden BEFORE a flag is cleared: nobody can open the flagless file in between (recover() undoes this)
+                                fsflags.clear_flags(fd, fsflags.APPEND | fsflags.IMMUTABLE)
+                                os.unlink(gen_file(s.prefix, n), dir_fd=gfd)
+                            finally:
+                                os.close(fd)
                     finally:
                         os.close(gfd)
                     os.rmdir(gen_name(s.prefix, n), dir_fd=self._dfd)
@@ -729,7 +793,12 @@ class AuditAdmin(Appender):
                     return ["CURRENT missing"]
                 prev = None
                 for n in sorted(self._list_gens()):
-                    gfd, fd = self._open_ro(n)
+                    try:
+                        gfd, fd = self._open_ro(n)
+                    except FileNotFoundError:
+                        problems.append(f"generation {n}: directory without a log file (an interrupted purge; recover() removes it)")
+                        prev = None
+                        continue
                     try:
                         fl = fsflags.get_flags(fd)
                         if n < cur and not fsflags.is_sealed(fl):

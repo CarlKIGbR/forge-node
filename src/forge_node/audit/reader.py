@@ -5,10 +5,8 @@ import os
 import stat
 from dataclasses import dataclass
 
-from .scan import parse_record
+from .scan import MAX_LINE, iter_lines, parse_record
 from .spec import gen_file, gen_re
-
-READ_CHUNK = 1 << 20
 
 
 @dataclass
@@ -43,7 +41,7 @@ def first_record(dfd: int, prefix: str, n: int, node: str, source: str) -> dict 
     except OSError:
         return None
     try:
-        return parse_record(os.pread(fd, 20000, 0).split(b"\n", 1)[0], node, source)
+        return parse_record(os.pread(fd, MAX_LINE, 0).split(b"\n", 1)[0], node, source)
     finally:
         os.close(fd)
 
@@ -63,7 +61,8 @@ def start_cursor(dir_path: str, prefix: str, node: str, source: str, after_seq: 
 
 
 def read_batch(dir_path: str, prefix: str, node: str, source: str, cur: Cursor, after_seq: int, limit: int) -> list[dict]:
-    """Up to `limit` chain-continuing records with seq > after_seq, starting at the cursor; advances the cursor. Records at or below after_seq are skipped (already acknowledged)."""
+    """Up to `limit` chain-continuing records with seq > after_seq, starting at the cursor; advances the cursor. Records at or below after_seq are skipped (already acknowledged).
+    A generation that has a successor is SEALED (the successor is only created after the seal): its end is final, so an unterminated fragment at its end is skipped, not waited for."""
     out: list[dict] = []
     dfd = os.open(dir_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
@@ -71,32 +70,24 @@ def read_batch(dir_path: str, prefix: str, node: str, source: str, cur: Cursor, 
             gens = _gens(dfd, prefix)
             if cur.gen not in gens:
                 break
+            nxt = [g for g in gens if g > cur.gen]
             fd = _open_file(dfd, prefix, cur.gen)
             try:
-                progressed = False
-                while len(out) < limit:
-                    chunk = os.pread(fd, READ_CHUNK, cur.offset)
-                    if not chunk:
-                        break
-                    consumed = 0
-                    for line in chunk.split(b"\n")[:-1]:
-                        consumed += len(line) + 1
-                        rec = parse_record(line, node, source)
-                        if rec is None or rec["seq"] != cur.next_seq or (cur.prev_hash is not None and rec["prev_hash"] != cur.prev_hash):
-                            continue                                   # not part of the chain: a torn write, a hostile line, a duplicate - never shipped
+                size = os.fstat(fd).st_size
+                finished = True
+                for line, _start, after in iter_lines(fd, cur.offset, size):
+                    rec = parse_record(line, node, source) if line is not None else None
+                    if rec is not None and rec["seq"] == cur.next_seq and (cur.prev_hash is None or rec["prev_hash"] == cur.prev_hash):
                         cur.next_seq, cur.prev_hash = rec["seq"] + 1, rec["hash"]
                         if rec["seq"] > after_seq:
                             out.append(rec)
-                        if len(out) >= limit:
-                            break
-                    if not consumed:
-                        break                                          # an unterminated tail: wait for the writer
-                    cur.offset += consumed
-                    progressed = True
-                at_end = os.pread(fd, 1, cur.offset) == b""
+                    cur.offset = after                                 # anything else - a torn write, a hostile line, a duplicate, an over-long line - is skipped, never shipped
+                    if len(out) >= limit:
+                        finished = False
+                        break
+                at_end = finished and (nxt or cur.offset == size)
             finally:
                 os.close(fd)
-            nxt = [g for g in gens if g > cur.gen]
             if at_end and nxt and len(out) < limit:
                 cur.gen, cur.offset = nxt[0], 0
                 continue

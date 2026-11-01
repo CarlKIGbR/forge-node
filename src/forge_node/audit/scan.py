@@ -1,25 +1,29 @@
-"""Reading audit files: the tail of a live file (head sequence/hash, torn or foreign bytes after the last valid record) and the complete verification of a file or a whole log.
+"""Reading audit files: the head of a live file (sequence/hash, torn or foreign bytes after the last chain record) and the complete verification of a file or a whole log.
 
-A line is a RECORD only if it is strict canonical JSON, passes chain.validate_record for the log's node and source, and its hash matches its content. Anything else is DAMAGE (a torn write
-after a crash, or bytes a hostile writer appended to its own log). Damage is never deleted (+a forbids it); the next writer appends a `tail_repair` record that names it:
-  {"bytes": N, "inserted_newline": bool, "sha256": sha256(damaged bytes)}  - the damaged bytes are exactly the N bytes between the end of the last valid record and the start of the repair line
-(minus one inserted b"\\n" when the damage did not end with a newline), so a verifier can account for every byte of the file."""
+A line is a RECORD only if it is strict canonical JSON, passes chain.validate_record for the log's node and source, and its hash matches its content. A record is part of the CHAIN only if
+it CONTINUES it: first record of a file = a chain_link at offset 0; every later one has seq = previous seq + 1 and prev_hash = previous hash. Everything else is DAMAGE (a torn write after a
+crash, junk or a forged self-consistent record a hostile writer appended to its own log). The head of a file is therefore found by FOLLOWING the chain forward from a known point (the
+file start, or the writer's cached head) - never by looking for 'the last valid-looking record', which a forger could place anywhere. Damage is never deleted (+a forbids it); the next
+writer appends a `tail_repair` record that names it:
+  {"bytes": N, "inserted_newline": bool, "sha256": sha256(the first N damaged bytes)}  - the N bytes the repairing writer OBSERVED between the end of the last chain record and its own
+write; bytes a hostile writer slips in after that observation but before the repair line lands are 'foreign' extras (tolerated and counted for the agent log, a problem for the priv log).
+No size limit applies to damage: it is streamed, never held in memory."""
 import hashlib
 import os
 from dataclasses import dataclass, field
 
 from .. import canon, chain
-from .spec import MAX_DAMAGED_TAIL, AuditCorrupt
+from .spec import AuditCorrupt
 
 READ_CHUNK = 1 << 20
-FIRST_WINDOW = 64 * 1024
+MAX_LINE = chain.MAX_RECORD_BYTES + 64
 
 
 @dataclass(frozen=True)
 class Tail:
-    seq: int | None            # None: the file has no valid record
+    seq: int | None            # None: the file has no chain record
     hash: str | None
-    end: int                   # byte offset just after the last valid record's newline (0 if none)
+    end: int                   # byte offset just after the last chain record's newline (0 if none)
     size: int
     damaged: int               # size - end
 
@@ -30,7 +34,7 @@ class Tail:
 
 def parse_record(line: bytes, node: str, source: str) -> dict | None:
     """`line` WITHOUT the trailing newline. None = not a record."""
-    if not line or len(line) > chain.MAX_RECORD_BYTES + 64:
+    if not line or len(line) > MAX_LINE:
         return None
     try:
         rec = canon.loads(line)
@@ -54,43 +58,70 @@ def _pread_all(fd: int, off: int, n: int) -> bytes:
     return bytes(out)
 
 
-def tail_state(fd: int, node: str, source: str) -> Tail:
-    """Head of the file from its tail only (cheap). Looks back from the end for the last record that is part of the CHAIN: valid (hash, structure) AND linked - its prev_hash is the hash of
-    an earlier valid record and its seq is that one's + 1 - or the file's genesis record (a chain_link at offset 0). A record that is valid in itself but not linked (a hostile writer's
-    forgery with an invented seq/prev_hash) is damage like any other junk, so it cannot hijack the head. The window doubles until the answer is certain, the file start is reached, or the
-    damaged part exceeds MAX_DAMAGED_TAIL (then AuditCorrupt: that is not a crash artefact)."""
+def region_digest(fd: int, start: int, length: int) -> str:
+    """sha256 of file[start:start+length], streamed."""
+    h, off, left = hashlib.sha256(), start, length
+    while left > 0:
+        b = os.pread(fd, min(READ_CHUNK, left), off)
+        if not b:
+            break
+        h.update(b)
+        off += len(b)
+        left -= len(b)
+    return h.hexdigest()
+
+
+def iter_lines(fd: int, start: int, size: int):
+    """(line | None, line_start, next_offset) for every COMPLETE line in [start, size). A line longer than MAX_LINE is yielded as None and never held in memory; an unterminated
+    rest is not yielded (the writer may still be writing it)."""
+    off, line_start, buf, long_ = start, start, bytearray(), False
+    while off < size:
+        chunk = os.pread(fd, min(READ_CHUNK, size - off), off)
+        if not chunk:
+            break
+        pos = 0
+        while True:
+            nl = chunk.find(b"\n", pos)
+            if nl < 0:
+                rest = chunk[pos:]
+                if not long_:
+                    buf += rest
+                    if len(buf) > MAX_LINE:
+                        long_, buf = True, bytearray()
+                break
+            piece = chunk[pos:nl]
+            if not long_:
+                buf += piece
+                if len(buf) > MAX_LINE:
+                    long_, buf = True, bytearray()
+            nxt = off + nl + 1
+            yield (None if long_ else bytes(buf)), line_start, nxt
+            line_start, buf, long_ = nxt, bytearray(), False
+            pos = nl + 1
+        off += len(chunk)
+
+
+def follow(fd: int, node: str, source: str, tail: Tail | None) -> Tail:
+    """Head of the file by following the chain forward from `tail` (the writer's cached head) or, with None, from the start of the file (the first chain record must be a chain_link at
+    offset 0). Cost: the bytes after the starting point."""
     size = os.fstat(fd).st_size
-    window = FIRST_WINDOW
-    while True:
-        start = max(0, size - window)
-        data = _pread_all(fd, start, size - start)
-        lines = data.split(b"\n")[:-1]                       # complete lines; the last piece is the unterminated rest
-        offsets, off = [], start
-        for ln in lines:
-            offsets.append(off)
-            off += len(ln) + 1
-        usable_from = 0 if start == 0 else 1                  # the first line of a window that does not start at 0 may be cut
-        valid = []                                            # (line index, record) in file order
-        for i in range(usable_from, len(lines)):
-            rec = parse_record(lines[i], node, source)
-            if rec is not None:
-                valid.append((i, rec))
-        hashes = {r["hash"]: r["seq"] for _, r in valid}
-        for i, rec in reversed(valid):
-            linked = rec["prev_hash"] in hashes and hashes[rec["prev_hash"]] + 1 == rec["seq"] and rec["prev_hash"] != rec["hash"]
-            genesis = offsets[i] == 0 and rec["type"] == "chain_link"
-            if linked or genesis:
-                end = offsets[i] + len(lines[i]) + 1
-                if size - end > MAX_DAMAGED_TAIL:
-                    raise AuditCorrupt("damaged tail larger than the allowed limit")
-                return Tail(rec["seq"], rec["hash"], end, size, size - end)
-        if start == 0:
-            if size > MAX_DAMAGED_TAIL:
-                raise AuditCorrupt("no valid record in a large file")
-            return Tail(None, None, 0, size, size)
-        if size - start > MAX_DAMAGED_TAIL + FIRST_WINDOW:
-            raise AuditCorrupt("damaged tail larger than the allowed limit")
-        window *= 2
+    seq, prev, end = (None, None, 0) if tail is None else (tail.seq, tail.hash, tail.end)
+    for line, start, nxt in iter_lines(fd, end, size):
+        rec = parse_record(line, node, source) if line is not None else None
+        if rec is None:
+            continue
+        if seq is None:
+            if not (start == 0 and rec["type"] == "chain_link"):
+                continue
+        elif rec["seq"] != seq + 1 or rec["prev_hash"] != prev:
+            continue
+        seq, prev, end = rec["seq"], rec["hash"], nxt
+    return Tail(seq, prev, end, size, size - end)
+
+
+def tail_state(fd: int, node: str, source: str) -> Tail:
+    """Cold start: follow the chain from the beginning of the file."""
+    return follow(fd, node, source, None)
 
 
 def last_record(fd: int, tail: Tail, node: str, source: str) -> dict | None:
@@ -123,89 +154,66 @@ class FileReport:
     problems: list[str] = field(default_factory=list)
     repaired: list[dict] = field(default_factory=list)       # tail_repair records seen
     size: int = 0
-    foreign_bytes: int = 0                                   # bytes between a valid record and a tail_repair that the repair did not describe (a hostile writer racing the repair)
-    trailing_bytes: int = 0                                  # damage after the last valid record (a torn write not yet repaired, or the damage a successor's chain_link accounts for)
+    foreign_bytes: int = 0                                   # damaged bytes a tail_repair did not describe, or that sit between chain records without one (a hostile writer racing the writer)
+    trailing_bytes: int = 0                                  # damage after the last chain record (a torn write not yet repaired, or the damage a successor's chain_link accounts for)
     trailing_sha256: str | None = None
-
-    @property
-    def ok(self) -> bool:
-        return not self.problems
 
 
 def verify_file(fd: int, node: str, source: str, *, start_seq: int | None, start_prev: str | None, strict: bool) -> FileReport:
     """Reads the whole file. `start_seq`/`start_prev`: what the first record must continue (None/None: the first record must be a genesis chain_link, seq 1, genesis hash).
-    Damaged byte ranges inside the file are accepted only where the NEXT valid record is a tail_repair whose `bytes`/`sha256` describe the first `bytes` of them. Bytes beyond that
-    prefix were appended by someone racing the repair: a problem when `strict` (priv log: nobody else writes it), counted in `foreign_bytes` otherwise (agent log: the agent can append
-    to its own log). Damage at the very end is reported in trailing_bytes/sha256; whether it is acceptable depends on the file (live: not yet repaired; sealed: the successor's chain_link must account for it)."""
+    A record is accepted into the chain only if it CONTINUES it (seq + prev_hash); a valid-looking record that does not is damage, like junk. Damaged byte ranges inside the file are
+    accepted only where the NEXT chain record is a tail_repair whose `bytes`/`sha256` describe the first `bytes` of them; bytes beyond that prefix were appended by someone racing
+    the repair: a problem when `strict` (priv log: nobody else writes it), counted in `foreign_bytes` otherwise (agent log: the agent can append to its own log). Damage at the very
+    end is reported in trailing_bytes/sha256; whether it is acceptable depends on the file (live: not yet repaired; sealed: the successor's chain_link must account for it)."""
     rep = FileReport()
-    rep.size = os.fstat(fd).st_size
+    size = rep.size = os.fstat(fd).st_size
     expect_seq = 1 if start_seq is None else start_seq
     expect_prev = chain.GENESIS_HASH if start_prev is None else start_prev
-    data_off = 0
-    damaged = bytearray()
-    buf = b""
-    pos = 0                                           # absolute offset of buf[0]
-    first = True
-    while True:
-        chunk = os.pread(fd, READ_CHUNK, data_off)
-        data_off += len(chunk)
-        buf += chunk
-        while True:
-            nl = buf.find(b"\n")
-            if nl < 0:
-                break
-            line, buf = buf[:nl], buf[nl + 1:]
-            line_start, pos = pos, pos + nl + 1
-            rec = parse_record(line, node, source)
-            if rec is None:
-                damaged += line + b"\n"
-                if len(damaged) > MAX_DAMAGED_TAIL:
-                    rep.problems.append(f"offset {line_start}: damaged region larger than the limit")
-                    return rep
-                continue
-            if first:
-                rep.first, first = rec, False
-            if rec["type"] == "tail_repair" and damaged:
-                n = rec.get("bytes")
-                ins = rec.get("inserted_newline")
-                ok = isinstance(n, int) and isinstance(ins, bool) and rec.get("sha256") is not None
-                raw = bytes(damaged)
-                extra = len(raw) - n - (1 if ins else 0) if ok else -1
-                if ok and (extra < 0 or (ins and not raw.endswith(b"\n")) or hashlib.sha256(raw[:n]).hexdigest() != rec["sha256"]):
-                    ok = False
-                if not ok:
-                    rep.problems.append(f"seq {rec['seq']}: tail_repair does not describe the damaged bytes before it")
-                    return rep
-                if extra:
-                    if strict:
-                        rep.problems.append(f"seq {rec['seq']}: {extra} damaged bytes before the tail_repair are not described by it")
-                        return rep
-                    rep.foreign_bytes += extra
-                rep.repaired.append(rec)
-                damaged.clear()
-            elif damaged:
+    dmg_start, dmg_len = None, 0
+    end_of_chain = 0
+    for line, line_start, nxt in iter_lines(fd, 0, size):
+        rec = parse_record(line, node, source) if line is not None else None
+        # a record that does not continue the chain is damage (except that the very first record of the file decides where the chain starts)
+        if rec is not None and rep.first is None:
+            rep.first = rec
+        if rec is None or rec["seq"] != expect_seq or rec["prev_hash"] != expect_prev:
+            if rec is not None and dmg_start is None and rep.records == 0:
+                rep.problems.append(f"seq {rec['seq']}: the first record does not continue the chain (expected seq {expect_seq})")
+                return rep
+            if dmg_start is None:
+                dmg_start = line_start
+            dmg_len += nxt - line_start
+            continue
+        if rec["type"] == "tail_repair" and dmg_len:
+            n, ins = rec.get("bytes"), rec.get("inserted_newline")
+            ok = isinstance(n, int) and not isinstance(n, bool) and isinstance(ins, bool) and isinstance(rec.get("sha256"), str) and n >= 0
+            extra = dmg_len - n - (1 if ins else 0) if ok else -1
+            if ok and (extra < 0 or (ins and os.pread(fd, 1, dmg_start + dmg_len - 1) != b"\n") or region_digest(fd, dmg_start, n) != rec["sha256"]):
+                ok = False
+            if not ok:
+                rep.problems.append(f"seq {rec['seq']}: tail_repair does not describe the damaged bytes before it")
+                return rep
+            if extra:
                 if strict:
-                    rep.problems.append(f"offset {line_start}: {len(damaged)} damaged bytes not accounted for by a tail_repair record")
+                    rep.problems.append(f"seq {rec['seq']}: {extra} damaged bytes before the tail_repair are not described by it")
                     return rep
-                rep.foreign_bytes += len(damaged)               # a hostile writer slipped bytes in between the writer's last look at the tail and its write; the chain itself is intact
-                damaged.clear()
-            if rec["seq"] != expect_seq:
-                rep.problems.append(f"seq gap/duplicate: expected {expect_seq}, got {rec['seq']}")
+                rep.foreign_bytes += extra
+            rep.repaired.append(rec)
+        elif dmg_len:
+            if strict:
+                rep.problems.append(f"offset {dmg_start}: {dmg_len} damaged bytes not accounted for by a tail_repair record")
                 return rep
-            if rec["prev_hash"] != expect_prev:
-                rep.problems.append(f"seq {rec['seq']}: prev_hash does not match predecessor")
-                return rep
-            rep.records += 1
-            rep.head_seq, rep.head_hash = rec["seq"], rec["hash"]
-            expect_seq, expect_prev = rec["seq"] + 1, rec["hash"]
-        if not chunk:
-            break
-    if buf:                                                         # an unterminated last line
-        damaged += buf
-    if damaged:
-        rep.trailing_bytes, rep.trailing_sha256 = len(damaged), hashlib.sha256(bytes(damaged)).hexdigest()
-    if rep.first is None:
+            rep.foreign_bytes += dmg_len                  # slipped in between the writer's last look at the tail and its write; the chain itself is intact
+        dmg_start, dmg_len = None, 0
+        rep.records += 1
+        rep.head_seq, rep.head_hash = rec["seq"], rec["hash"]
+        expect_seq, expect_prev = rec["seq"] + 1, rec["hash"]
+        end_of_chain = nxt
+    if end_of_chain < size:
+        rep.trailing_bytes = size - end_of_chain
+        rep.trailing_sha256 = region_digest(fd, end_of_chain, size - end_of_chain)
+    if rep.records == 0:
         rep.problems.append("no record in file")
-    elif rep.first["type"] != "chain_link":
+    elif rep.first is None or rep.first["type"] != "chain_link":
         rep.problems.append("first record is not a chain_link")
     return rep

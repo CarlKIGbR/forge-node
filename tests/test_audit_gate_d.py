@@ -146,7 +146,7 @@ def test_seal_never_calls_chmod_on_append_only_inode(specs, monkeypatch):
     a.rotate()
     a.append("t0", {})
     a.recover()
-    a.purge(10 ** 6, Clock()() + timedelta(days=200))
+    a.purge(a.head()[0], Clock()() + timedelta(days=200))
     assert a.verify() == []
     assert calls, "the spy saw no mode/owner/size change at all: it is not wired"
     # and statically: the audit package never changes mode/owner/size by PATH, only on descriptors of objects it has just created (unflagged) or on directories
