@@ -746,9 +746,13 @@ def test_the_policy_serials_remembered_for_staging_are_bounded(tmp_path):
 def _holder(tmp_path, owner):
     from forge_node.agent.config import AgentConfig
     from n2_helpers import install_policy, signers_text
-    pol = tmp_path / "policy"
+    (tmp_path / "cfg").mkdir()
+    (tmp_path / "keys").mkdir()
+    for d in (tmp_path / "cfg", tmp_path / "keys"):
+        os.chmod(d, 0o755)
+    pol = tmp_path / "cfg" / "policy"
     install_policy(pol, policy_doc(), owner["priv"])
-    signers = tmp_path / "as"
+    signers = tmp_path / "keys" / "as"
     signers.write_text(signers_text(owner["pub"]))
     os.chmod(signers, 0o644)
     cfg = AgentConfig("g2", "127.0.0.1", 1, "/c", "/k", "/ca", str(pol), str(signers), str(tmp_path), "/s", os.getuid(), os.getuid(), "/")
@@ -769,7 +773,7 @@ def test_a_chmod_on_the_verified_policy_forces_reverification_and_the_old_policy
     assert h.refresh()[0].serial == 1                            # fixing it brings the policy back by full verification
 
 
-@pytest.mark.parametrize("what", ["sig-mode", "hardlink", "chown", "dir-mode", "signers-mode", "signers-hardlink", "signers-dir-mode"])
+@pytest.mark.parametrize("what", ["sig-mode", "hardlink", "chown", "dir-mode", "policy-parent-dir-mode", "signers-mode", "signers-hardlink", "signers-dir-mode"])
 def test_every_trust_relevant_attribute_is_part_of_the_cache_key(tmp_path, owner, what):
     h, pol, signers, logs = _holder(tmp_path, owner)
     if what == "sig-mode":
@@ -780,12 +784,14 @@ def test_every_trust_relevant_attribute_is_part_of_the_cache_key(tmp_path, owner
         os.chown(pol / "policy-1.json", 1234, 1234)
     elif what == "dir-mode":
         os.chmod(pol, 0o777)
+    elif what == "policy-parent-dir-mode":
+        os.chmod(tmp_path / "cfg", 0o777)
     elif what == "signers-mode":
         os.chmod(signers, 0o666)
     elif what == "signers-hardlink":
         os.link(signers, tmp_path / "signers-alias")
     elif what == "signers-dir-mode":
-        os.chmod(tmp_path, 0o777)
+        os.chmod(tmp_path / "keys", 0o777)
     view_, changed = h.refresh()
     assert view_ is None and changed is True and h.view is None, what
 

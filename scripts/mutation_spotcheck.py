@@ -79,7 +79,7 @@ M = [
  ("runner-extra-binaries", "t0/runner.py", "if not all(_trusted(p) for p in (path, *cmd.extra_binaries)):", "if not _trusted(path):", "tests/test_t0_runner.py"),
  ("runner-trust-chain", "t0/runner.py", "            if ds.st_uid != 0 or (ds.st_mode & 0o022 and not (ds.st_mode & stat.S_ISVTX)):", "            if False:", "tests/test_t0_runner.py"),
  ("holder-any-exception", "agent/loop.py", "        except Exception as e:  # noqa: BLE001 - ANY failure to establish the policy means no policy: never keep serving the previous one", "        except PolicyError as e:", "tests/test_n2_branches.py"),
- ("holder-signers-in-signature", "agent/loop.py", "            a = os.stat(self.cfg.allowed_signers, follow_symlinks=False)\n            return files + ((\"allowed_signers\", a.st_ino, a.st_mtime_ns, a.st_size),)", "            return files", "tests/test_n2_branches.py"),
+ ("holder-signers-in-signature", "agent/loop.py", "            signers = (\"allowed_signers\", *self._stat_key(os.stat(self.cfg.allowed_signers, follow_symlinks=False)))", "            signers = ()", "tests/test_n2_branches.py"),
  ("sample-tier", "t0/engine.py", "or 0 not in env.policy.tiers_enabled:\n            return None", "or False:\n            return None", "tests/test_t0_spool_metrics.py"),
  ("sample-bucket", "t0/engine.py", "            if not self.limiter.take(\"metrics.collect\", False):\n                return None", "            if False:\n                return None", "tests/test_t0_spool_metrics.py"),
  ("containers-json-mounts", "t0/probes.py", "    mj = _json_field(mounts)", "    mj = []", "tests/test_t0_probes.py"),
@@ -113,7 +113,7 @@ M = [
  ("git-common-dir-is-the-repo", "t0/runner.py", "(\"GIT_COMMON_DIR\", \"snap\", \"\")", "(\"GIT_COMMON_DIR\", \"repo\", \"/.git\")", "tests/test_t0_real_tools.py tests/test_t0_runner.py"),
  ("git-ignore-submodules", "t0/runner.py", ", \"--ignore-submodules=all\"),\n                                  slots", "),\n                                  slots", "tests/test_t0_real_tools.py tests/test_t0_runner.py"),
  ("git-inert-core-widened", "t0/probes.py", "_INERT_CORE = frozenset({\"filemode\",", "_INERT_CORE = frozenset({\"fsmonitor\", \"filemode\",", "tests/test_t0_probes.py tests/test_t0_fuzz.py"),
- ("git-snapshot-copies-config", "t0/probes.py", "    with open(os.path.join(snap, \"config\"), \"w\") as f:\n        f.write(config_text)", "    with open(os.path.join(snap, \"config\"), \"w\") as f:\n        f.write(config_text + info.get(\"raw_config\", \"\"))", "tests/test_t0_probes.py"),
+ ("git-snapshot-copies-config", "t0/probes.py", "            snap = _git_snapshot(info, cfg_text)", "            snap = _git_snapshot(info, env.fs.read_exception(f\"{real}/.git/config\", _SAFE_GIT_FILES))", "tests/test_t0_probes.py tests/test_t0_real_tools.py"),
  ("git-snapshot-cleanup", "t0/probes.py", "                shutil.rmtree(snap, ignore_errors=True)", "                pass", "tests/test_t0_probes.py"),
  ("git-value-check", "t0/probes.py", "and _INERT_VALUE.match(k.group(2)):", ":", "tests/test_t0_probes.py"),
  ("policy-key-mode", "agent/loop.py", "return (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_mode, st.st_uid, st.st_gid, st.st_nlink)", "return (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_uid, st.st_gid, st.st_nlink)", "tests/test_n2_branches.py"),
@@ -130,6 +130,12 @@ M = [
  ("net-ip-accounting-off", "t0/metrics.py", " and a < 2**53 and c < 2**53 and len(net) < 2 * MAX_CG", "", "tests/test_t0_spool_metrics.py"),
  ("net-window-not-aggregated", "t0/usage.py", "            e[\"rx\"] += _grow(e[\"prev\"][0], v[0])", "            e[\"rx\"] += 0", "tests/test_t0_spool_metrics.py"),
 ]
+# Survivors that are equivalent by construction (the same fact is covered by a second, independent element of the cache key); named here so the verdict says so.
+EQUIVALENT = {
+    "engine-logs-allow": "engine step 5 and T0Engine._logs both enforce the logs.unit allowlist (defence in depth); the inner one has its own test",
+    "policy-key-mode": "st_ctime_ns is in the cache key and changes on every chmod",
+    "policy-key-nlink": "st_ctime_ns is in the cache key and changes on every link/unlink",
+}
 only = sys.argv[1:]
 res = []
 for mid, f, old, new, tests in M:
@@ -145,7 +151,7 @@ for mid, f, old, new, tests in M:
     open(path, "w").write(s.replace(old, new, 1))
     p = subprocess.run([f"{WORK}/scripts/run-tests.sh", "-x", "-q", *tests.split()], capture_output=True, text=True, env={**os.environ, "FN_PG_IMAGE": PG}, timeout=900)
     tail = [l for l in p.stdout.splitlines() if l.startswith(("FAILED", "ERROR")) or " passed" in l or " failed" in l][-2:]
-    verdict = "KILLED" if p.returncode != 0 else "SURVIVED"
+    verdict = "KILLED" if p.returncode != 0 else ("EQUIVALENT" if mid in EQUIVALENT else "SURVIVED")
     res.append((mid, verdict)); print(mid, verdict, " | ".join(tail)[:200], flush=True)
-print(json.dumps({v: sum(1 for _, x in res if x == v) for v in ("KILLED", "SURVIVED", "NOT-APPLIED")}))
-print("SURVIVORS:", [m for m, v in res if v != "KILLED"])
+print(json.dumps({v: sum(1 for _, x in res if x == v) for v in ("KILLED", "EQUIVALENT", "SURVIVED", "NOT-APPLIED")}))
+print("SURVIVORS:", [m for m, v in res if v not in ("KILLED", "EQUIVALENT")])
