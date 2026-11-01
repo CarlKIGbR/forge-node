@@ -66,7 +66,7 @@ def test_t1_workload_fields_are_typed_and_bounded_even_before_they_mean_anything
 
 
 def test_policy_schema_rejects_apt_apply_op_or_flag():
-    for patch in ({"apt_apply": True}, {"t1": {"workloads_enabled": False, "ops": [], "apt.upgrade": 1}}, {"t3": {"manifests_enabled": ["apt.upgrade"], "opaque_enabled": False}}):
+    for patch in ({"apt_apply": True}, {"t1": {"workloads_enabled": False, "ops": [], "apt.upgrade": 1}}, {"t1": {"workloads_enabled": False, "ops": [], "lint": {"apt_apply": True}}}, {"t3": {"manifests_enabled": ["apt.upgrade"], "opaque_enabled": False}}):
         with pytest.raises(PolicyError) as e:
             parse(**patch)
         assert "apt" in e.value.detail or "unknown" in e.value.detail

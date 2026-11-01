@@ -359,3 +359,28 @@ def test_a_damaged_tail_is_repaired_inside_the_file_before_the_seal_so_the_chain
     link = file_records(live(s, 2))[0]
     assert link["type"] == "chain_link" and link["prev_damaged_bytes"] == 0 and link["prev_damaged_sha256"] is None and link["prev_seq"] == old[-1]["seq"]
     assert a.verify() == []
+
+
+def test_recovery_never_deletes_an_unflagged_file_in_a_reachable_directory(specs):
+    """Review (minor 3): on a filesystem with weaker ordering a crash could leave a REACHABLE generation directory around a file without +a - a hostile descriptor may exist. Recovery
+    must quarantine, not unlink and rebuild (the only safe case for removal is the 0700 directory)."""
+    s = specs["priv"]
+    a = admin(s)
+    a.init()
+    a.append("t0", {})
+    fd = os.open(live(s, 1), os.O_RDONLY)
+    fsflags.add_flags(fd, fsflags.IMMUTABLE)                                  # generation 1 sealed, CURRENT still names it: "n sealed, n+1 …"
+    os.close(fd)
+    os.mkdir(f"{s.dir}/priv.000002", 0o750)
+    os.chown(f"{s.dir}/priv.000002", 0, s.gid)
+    open(live(s, 2), "wb").close()                                            # unflagged, empty (incomplete), in a directory the agent can traverse
+    os.chmod(live(s, 2), 0o640)
+    os.chown(live(s, 2), 0, s.gid)
+    for _ in range(2):
+        with pytest.raises(AuditCorrupt, match="reachable"):
+            admin(s).recover()
+        assert os.path.exists(live(s, 2))                                      # nothing was deleted
+    # the same file in a 0700 directory is the ordinary crash state and is rebuilt
+    os.chmod(f"{s.dir}/priv.000002", 0o700)
+    assert any("rebuilt" in x or "removed the incomplete" in x or "built generation 2" in x for x in admin(s).recover())
+    assert admin(s).verify() == []
