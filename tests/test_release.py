@@ -193,6 +193,7 @@ def test_agent_and_privd_units_match_the_design(env):
     assert a["User"] == "forgenode" and a["NoNewPrivileges"] == "yes" and a["CapabilityBoundingSet"] == "" and a["IPAddressDeny"] == "any" and a["IPAddressAllow"].startswith("192.168.10.4/32")
     assert a["ReadWritePaths"] == "/var/lib/forge-node /var/log/forge-node-agent"          # the agent's directory log path is root-owned; it only appends to the file
     assert a["ExecStart"].endswith("forge-node.pyz agent run") and a["EnvironmentFile"] == "/etc/forge-node/node.env"
+    assert a["LimitFSIZE"] == "134217728"                                                  # a compromised agent cannot grow its (append-only, group-writable) audit file without bound
     assert p["User"] == "root" and p["NoNewPrivileges"] == "yes" and p["ProtectSystem"] == "strict" and p["RestrictAddressFamilies"] == "AF_UNIX" and p["IPAddressDeny"] == "any"
     assert p["CapabilityBoundingSet"] == "CAP_LINUX_IMMUTABLE CAP_CHOWN" and p["KillMode"] == "process"
     # test_privd_unit_writes_only_state_log_policy

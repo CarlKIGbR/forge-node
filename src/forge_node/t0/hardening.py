@@ -20,7 +20,9 @@ _COMMON = {
 
 AGENT_UNIT = MappingProxyType({
     **_COMMON, "User": "forgenode", "ReadWritePaths": "/var/lib/forge-node /var/log/forge-node-agent", "ProtectHome": "yes", "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6 AF_NETLINK",
-    "IPAddressAllow": "192.168.10.4/32 127.0.0.0/8", "CapabilityBoundingSet": "", "MemoryMax": "128M", "CPUQuota": "15%", "Nice": "19", "IOWeight": "10", "Restart": "on-failure", "RestartSec": "10",
+    "IPAddressAllow": "192.168.10.4/32 127.0.0.0/8", "CapabilityBoundingSet": "", "LimitFSIZE": "134217728", "MemoryMax": "128M", "CPUQuota": "15%", "Nice": "19", "IOWeight": "10", "Restart": "on-failure", "RestartSec": "10",
+    # LimitFSIZE (N3): the agent may append to its own audit log (0660, +a), so a compromised agent could otherwise write without bound into that one file; RLIMIT_FSIZE makes the write fail
+    # (Python ignores SIGXFSZ -> EFBIG -> AuditDown for the agent, fail closed). Bounds each file, not the number of rotations: see the N3 report (residual risk).
     # no PrivateDevices (nvidia-smi needs /dev/nvidia*) and no MemoryDenyWriteExecute (the NVIDIA driver library maps writable+executable memory)
 })
 AGENT_UNIT_OVERRIDES = MappingProxyType({"g4": MappingProxyType({"MemoryMax": "96M"})})          # swap-bound host (Design 4.5)
