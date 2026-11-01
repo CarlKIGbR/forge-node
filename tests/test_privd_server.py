@@ -266,7 +266,7 @@ def test_privctl_lockdown_audit_rotate_verify_and_closure(served):
     assert privctl.main(["audit-verify"], ctl) == 0 and json.loads(out.getvalue()) == {"priv": [], "agent": []}
     # the resolver through privctl: a closure with a protected member exits 1 and shows the edge; a clean one prints the hash
     from test_resolver import U, graph
-    ctl2, out2, _ = make_ctl(e, provider=graph(U("forge-x.service", Wants="kmu-a.service"), U("kmu-a.service")))
+    ctl2, out2, _ = make_ctl(e, provider=graph(U("forge-x.service", Wants="kmu-a.service"), U("kmu-a.service", ActiveState="inactive")))        # starting forge-x would start the protected unit
     assert privctl.main(["unit-closure", "forge-x.service", "start"], ctl2) == 1
     doc = json.loads(out2.getvalue())
     assert doc["denied"] and doc["closure_sha256"] is None and any("kmu-a.service" in h for h in doc["hits"])

@@ -484,3 +484,59 @@ def test_local_backend_has_no_collect_names_are_never_reused(tmp_path):
         b.start(name, {}, [sys.executable, "-c", "pass"])
     with pytest.raises(UnitError):
         b.start("not-a-unit.service", {}, ["/bin/true"])
+
+
+def test_audit_failure_after_the_effect_is_not_reported_as_a_denial(privd_env):
+    """The worker did its effect; then the audit log refuses the `result` record. Reporting `denied/retryable` would make the hub re-run an effect that already happened. The reply is
+    in_progress, the row stays open (effect_done), a re-delivery gets in_progress, and once the log is back reconcile commits from status.json - one effect, ever."""
+    from forge_node.privd.core import Deny
+    e = privd_env.ready()
+    plan = result(e.exec(dry_run=True)[0])
+    real, broken = e.ctx.audit, {"on": True}
+
+    def flaky(type_, fields):
+        if broken["on"] and type_ == "result":
+            raise Deny("DENY_AUDIT_DOWN", "log refused the result record")
+        return real(type_, fields)
+    e.ctx.audit = flaky
+    env, job = e.job_env(plan_hash=plan["plan_hash"])
+    assert e.call("exec", {"job": env}) == {"ok": True, "in_progress": True, "job_id": job["job_id"]}
+    row = e.ledger.get(job["job_id"])
+    assert row.state == "effect_done" and row.result is None and len(marks(e)) == 1
+    assert e.call("exec", {"job": env}) == {"ok": True, "in_progress": True, "job_id": job["job_id"]}          # the hub's re-delivery does not start a second worker
+    assert len(marks(e)) == 1 and len([u for u in e.backend.list_op_units() if job["job_id"] in u]) == 1
+    broken["on"] = False
+    kind, res = reconcile.reconcile_job(e.ctx, job["job_id"])
+    assert kind == "committed" and res["status"] == "committed" and len(marks(e)) == 1
+    assert e.ledger.get(job["job_id"]).state == "committed" and e.types(job["job_id"]) == ["intent", "result"]
+
+
+def test_effect_lock_blocks_a_worker_until_it_is_released(privd_env):
+    """The worker takes the effect lock BEFORE it looks at the ledger and acts; while another process holds it the worker produces nothing, afterwards it runs normally."""
+    import fcntl
+    import uuid
+    from forge_node.privd import worker
+    e = privd_env
+    jid = str(uuid.uuid4())
+    e.ledger.claim(jid, 1, "selftest.noop", "k-lock", "0" * 64, False, "meta", e.clock())
+    wd = Path(e.paths.work) / f"{jid}-1"
+    wd.mkdir(mode=0o700)
+    e.ledger.mark_started(jid, 1, op_unit_name(jid, 1), str(wd), None, None, False, e.clock())
+    req = {"job_id": jid, "attempt": 1, "fence": 1, "op": "selftest.noop", "params": {"note": ""}, "dry_run": False, "plan_hash": None, "effect_key": "k-lock", "ledger_path": e.paths.ledger,
+           "lock_dir": e.paths.locks, "priv_state": e.paths.priv_state}
+    (wd / "request.json").write_text(json.dumps(req))
+    os.chmod(wd / "request.json", 0o600)
+    holder = os.open(worker.lock_path(e.paths.locks, "k-lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    p = subprocess.Popen([sys.executable, "-m", "forge_node.privd.opworker", "run", str(wd)], env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        time.sleep(1.0)
+        assert p.poll() is None and not (wd / "status.json").exists() and not (wd / "effect.mark").exists()        # parked on the lock
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        assert p.wait(30) == 0
+    finally:
+        os.close(holder)
+        if p.poll() is None:
+            p.kill()
+    st = worker.read_status(str(wd))
+    assert st["outcome"] == "done" and (wd / "effect.mark").exists()

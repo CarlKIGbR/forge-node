@@ -123,13 +123,15 @@ def test_writes_are_confined_to_the_agent_state_modules():
         if obj := hits:
             writers[m.name] = sorted(hits)
     # probes.py: the git probe's private snapshot directory (mkdtemp in the unit's PrivateTmp, 0700, removed after the run) is the only thing a probe creates
-    assert set(writers) == {"spool.py", "limits.py", "loop.py", "__main__.py", "probes.py", "confined.py"}, writers
+    # N3 adds shipper.py (the audit-ack file, written through confined.py: temp name + replace, nothing else)
+    assert set(writers) == {"spool.py", "limits.py", "loop.py", "__main__.py", "probes.py", "confined.py", "shipper.py"}, writers
+    assert set(writers["shipper.py"]) <= {"unlink"}, writers
     # rework 2: the only code that creates files from NAMES THAT ARE NOT OUR CONSTANTS is confined.py (descriptor-relative, validated components). loop.py (staging) and probes.py
     # (git snapshot) keep only the mkdirat/unlinkat/chmod calls on directories/files they created themselves.
     assert set(writers["loop.py"]) <= {"unlink"} and set(writers["probes.py"]) <= {"chmod", "mkdir"}, writers
     # the agent never changes permissions or ownership of anything except its own spool directory
     for name, hits in writers.items():
-        if name not in ("spool.py", "probes.py", "loop.py"):
+        if name not in ("spool.py", "probes.py", "loop.py", "shipper.py"):
             assert not ({"chmod", "fchmod", "chown", "symlink", "link", "unlink", "remove", "rmdir"} & set(hits)), (name, hits)
 
 
@@ -141,7 +143,9 @@ def test_agent_and_t0_layers_contain_no_sealing_rotation_or_audit_admin_code():
         t = code_only(m)
         assert not _re.search(r"AuditAdmin|fsflags|FS_IOC|chattr|seal_record|\.rotate\(|\.recover\(|\.purge\(|\.init\(\)", t), m.name
         imported = {a.name for n in ast.walk(ast.parse(m.read_text())) if isinstance(n, ast.ImportFrom) and (n.module or "").startswith(("audit", "..audit")) for a in n.names}
-        assert imported <= {"Appender", "AuditDown", "AuditCorrupt", "agent_spec"}, (m.name, imported)
+        assert imported <= {"Appender", "AuditDown", "AuditCorrupt", "agent_spec", "priv_spec", "LogSpec", "reader"}, (m.name, imported)      # reader/LogSpec: read-only shipping (below)
+    reader_src = code_only(SRC / "audit" / "reader.py")
+    assert not re.search(r"O_WRONLY|O_RDWR|O_CREAT|O_APPEND|O_TRUNC|\.write\(|os\.(write|unlink|rename|mkdir|rmdir|chmod|chown|fchmod|fchown|truncate|ftruncate)\(|fsflags", reader_src)
     assert gates.GATES["D"].met is False and all(not g.met for g in gates.GATES.values())
 
 
@@ -259,6 +263,7 @@ def test_inventory_of_path_construction_in_the_t0_layer_and_the_agent():
         ("runner.py", "_trusted", "os.path.join"): "readlink() target of a link found in a root-trusted directory chain; only used to follow the chain, never to write",
         ("loop.py", "_signature", "os.path.join"): "names from listdir() of the policy directory, filtered by the prefix 'policy-'; only stat()-ed",
         ("__main__.py", "build", "os.path.join"): "state directory from the config x constants",
+        ("shipper.py", "_load", "os.path.join"): "state directory from the config x the constant ACK_FILE (read only)",
     }
     found = {}
     root = ROOT / "src" / "forge_node"
