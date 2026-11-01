@@ -331,7 +331,12 @@ def s_started(st: State) -> None:
         try:
             os.mkdir(name, 0o700, dir_fd=dfd)
         except FileExistsError:
-            raise Deny("FAIL_PRECHECK", "work directory of this attempt already exists")
+            # A handler that died after creating the directory and before recording `started`. The row is still `received` and we hold the job lock, so no worker can exist for this
+            # attempt (workers start only after the ledger says `started`): the leftover is removed and rebuilt, not a reason to fail the job for good.
+            if os.path.islink(st.work_dir) or not os.path.isdir(st.work_dir) or ctx.ledger.get(row.job_id).state != "received":
+                raise Deny("FAIL_PRECHECK", "work directory of this attempt already exists and is not a leftover of a dead handler")
+            shutil.rmtree(st.work_dir)
+            os.mkdir(name, 0o700, dir_fd=dfd)
         wfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
         try:
             req = {"job_id": row.job_id, "attempt": row.attempt, "fence": row.fence, "op": row.op, "params": st.params, "dry_run": st.dry_run, "plan_hash": st.extra.get("plan_hash"),

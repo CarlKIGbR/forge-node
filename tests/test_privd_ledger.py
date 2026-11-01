@@ -606,3 +606,45 @@ def test_startup_recovery_survives_a_damaged_or_locked_log(privd_env):
     r = e.exec(dry_run=True)[0]
     assert (r.get("code") or result(r)["reason_code"]) == "DENY_AUDIT_DOWN"
     assert e.call("status", {}, uid=AGENT_UID)["ok"] is True
+
+
+def test_leftover_work_directory_of_a_dead_handler_does_not_fail_the_job_for_good(privd_env):
+    """privd died after creating the attempt's work directory and before the ledger said `started`: the next delivery rebuilds it (no worker can exist for a `received` row)."""
+    import uuid
+    e = privd_env.ready()
+    env, job = e.job_env(dry_run=True)
+    jid = job["job_id"]
+    e.ledger.claim(jid, 1, "selftest.noop", "selftest.noop", __import__("forge_node.canon", fromlist=["x"]).digest(job["params"]), True, "meta", e.clock())
+    wd = Path(e.paths.work) / f"{jid}-1"
+    wd.mkdir(mode=0o700)
+    (wd / "request.json").write_text("{half written")
+    (wd / "junk").write_text("x")
+    assert result(e.call("exec", {"job": env}))["status"] == "dry_run"
+    assert e.ledger.get(jid).state == "committed" and not (wd / "junk").exists()
+    # but a directory that is not a plain directory (a symlink planted there) is refused
+    env2, job2 = e.job_env(dry_run=True)
+    e.ledger.claim(job2["job_id"], 1, "selftest.noop", "selftest.noop", __import__("forge_node.canon", fromlist=["x"]).digest(job2["params"]), True, "meta", e.clock())
+    os.symlink("/tmp", Path(e.paths.work) / f"{job2['job_id']}-1")
+    r = result(e.call("exec", {"job": env2}))
+    assert r["status"] == "failed" and r["reason_code"] == "FAIL_PRECHECK"
+
+
+def test_privd_killed_between_started_and_the_unit_start_is_aborted_safe_and_retried_as_attempt_2(privd_env):
+    """The window after `mark_started` and before `systemd-run`: the row says started, no unit exists. Startup recovery reconciles it (fence bump, nothing to stop, the probe sees no
+    effect) to aborted_safe; the hub's re-delivery runs it as attempt 2 - one effect in total."""
+    e = privd_env.ready()
+    plan = result(e.exec(dry_run=True)[0])
+    env, job = e.job_env(plan_hash=plan["plan_hash"])
+    e.ctx.backend.start = lambda *a: (_ for _ in ()).throw(SystemExit("privd killed right here"))        # the process dies before the unit exists
+    with pytest.raises(SystemExit):
+        e.call("exec", {"job": env})
+    row = e.ledger.get(job["job_id"])
+    assert row.state == "started" and row.worker_invocation_id is None and not marks(e)
+    fresh = e.restart()
+    rep = reconcile.recover_all(fresh.ctx)
+    assert rep["reconciled"] == [(job["job_id"], "aborted_safe")] and fresh.ledger.get(job["job_id"]).state == "aborted_safe"
+    fresh.clock.advance(seconds=61)
+    fresh.put_lease(seq=77)
+    env2, _ = fresh.job_env(job_id=job["job_id"], plan_hash=plan["plan_hash"], delivery_seq=2)
+    res = result(fresh.call("exec", {"job": env2}))
+    assert res["status"] == "committed" and res["attempt"] == 2 and len(marks(e)) == 1
