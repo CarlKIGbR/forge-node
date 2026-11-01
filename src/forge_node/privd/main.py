@@ -145,12 +145,13 @@ def node_id_from_file(path: str, owner_uid: int) -> str:
         text = os.read(fd, 64 * 1024 + 1).decode("utf-8", "replace")
     finally:
         os.close(fd)
-    for line in text.splitlines():
+    found = ""
+    for line in text.splitlines():                                 # the LAST assignment wins - as for systemd's EnvironmentFile= and for the switcher's `env` call (round 3: privctl took the first)
         m = re.match(r"^FORGE_NODE_NODE_ID=(?:\"([^\"]*)\"|'([^']*)'|(\S+))\s*$", line.strip())
         if m:
             v = next(g for g in m.groups() if g is not None)
-            return v if protocol.is_node_id(v) else ""
-    return ""
+            found = v if protocol.is_node_id(v) else ""
+    return found
 
 
 def run_privctl(argv: list) -> int:

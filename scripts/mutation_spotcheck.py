@@ -278,7 +278,7 @@ M = [
  ("n3-resolver-unneeded-below-conflicts", "privd/resolver.py", "        S |= set().union(*(unneeded_deps(u) for u in C | S))", "        pass", "tests/test_resolver.py"),
  ("n3-build-release-name-missing", "release/build.py", '\\nRELEASE = "{release}"', "", "tests/test_release.py"),
  ("n3-privd-version-is-the-constant", "privd/main.py", 'return f"{__version__}+{RELEASE}"', "return __version__", "tests/test_release.py"),
- ("n3-audit-torn-tail-newline-in-the-record-write", "audit/log.py", '            if os.pread(self._fd, 1, t.end + t.damaged - 1) == b"\n":\n                break', '            if True:\n                break', "tests/test_audit_review.py"),
+ ("n3-audit-torn-tail-newline-in-the-record-write", "audit/log.py", '            if os.pread(self._fd, 1, t.end + t.damaged - 1) == b"\\n":\n                break', '            if True:\n                break', "tests/test_audit_review.py"),
  ("n3-audit-scan-minimum-too-low", "audit/scan.py", "MIN_RECORD_LINE = 160", "MIN_RECORD_LINE = 1", "tests/test_audit_review.py"),
  ("n3-audit-scan-minimum-too-high", "audit/scan.py", "MIN_RECORD_LINE = 160", "MIN_RECORD_LINE = 400", "tests/test_audit_review.py"),
  ("n3-audit-recovery-readds-only-a", "audit/log.py", "elif fsflags.is_sealed(fl) or not fsflags.is_append_only(fl):", "elif fsflags.is_sealed(fl):", "tests/test_audit_review.py tests/test_audit_gate_d.py"),
@@ -289,6 +289,9 @@ M = [
  ("n3-fsproof-chown-no-control", "audit/fsproof.py", "lambda: os.fchown(fd, os.fstat(fd).st_uid + 1, -1), chown_control)", "lambda: os.fchown(fd, os.fstat(fd).st_uid + 1, -1), lambda: None)", "tests/test_audit_review.py"),
  ("n3-shipper-silent-stall", "agent/shipper.py", '            self.log(f"audit shipping: {why}; nothing is shipped for this log")', "            pass", "tests/test_audit_review.py"),
  ("n3-privctl-verify-one-log-hides-other", "privd/privctl.py", "except (AuditDown, AuditCorrupt, AuditNotInitialised) as e:", "except ZeroDivisionError as e:", "tests/test_audit_review.py"),
+ ("n3-privctl-node-id-first-assignment", "privd/main.py", "            found = v if protocol.is_node_id(v) else \"\"", "            return v if protocol.is_node_id(v) else \"\"", "tests/test_privd_server.py"),
+ ("n3-switch-signals-ignored-across-exec", "release/switcher.py", "signal.signal(sig, lambda _s, _f: None)", "signal.signal(sig, signal.SIG_IGN)", "tests/test_release.py"),
+ ("n3-switch-only-three-signals", "release/switcher.py", "signal.SIGTERM, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2)}", "signal.SIGTERM)}", "tests/test_release.py"),
 ]
 # Survivors that are equivalent by construction (the same fact is covered by a second, independent element of the cache key); named here so the verdict says so.
 EQUIVALENT = {

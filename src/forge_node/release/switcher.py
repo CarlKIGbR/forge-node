@@ -96,7 +96,8 @@ class Switcher:
             d = os.path.dirname(d)
 
     def locked(self):
-        """Context manager of a CHANGING command: exclusive non-blocking flock, and SIGHUP/SIGINT/SIGTERM ignored for its duration."""
+        """Context manager of a CHANGING command: exclusive non-blocking flock, and SIGHUP/SIGINT/SIGTERM/SIGQUIT/SIGUSR1/SIGUSR2 swallowed for its duration. A HANDLER, not SIG_IGN: an ignored
+        signal stays ignored across exec, and the children (systemctl, runuser, doctor) must not inherit a refusal to die when they are stopped."""
         sw = self
 
         class _Lock:
@@ -107,7 +108,7 @@ class Switcher:
                 except BlockingIOError:
                     os.close(self.fd)
                     raise Refused("another forge-node-release is running (lock held): wait for it") from None
-                self.old = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)}
+                self.old = {sig: signal.signal(sig, lambda _s, _f: None) for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2)}
                 return self
 
             def __exit__(self, *a):

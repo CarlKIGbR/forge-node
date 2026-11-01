@@ -948,16 +948,17 @@ def test_a_failed_first_install_can_be_repeated(env):
     assert sw.cmd_install_first("0.3.0") == 0
 
 
-def test_changing_commands_hold_a_lock_and_ignore_hangups_while_they_run(env):
+def test_changing_commands_hold_a_lock_and_survive_every_catchable_stop_signal_while_they_run(env):
     import fcntl
     import signal
     env.release("0.3.0", "full")
     sw = env.switcher()
-    seen = {}
+    sigs = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2)
     with sw.locked():
-        seen["hup"] = signal.getsignal(signal.SIGHUP)
-        seen["int"] = signal.getsignal(signal.SIGINT)
-        seen["term"] = signal.getsignal(signal.SIGTERM)
+        for sg in sigs:
+            os.kill(os.getpid(), sg)                                                         # round 3: SIGQUIT/SIGUSR1/SIGUSR2 used to kill a switch half way
+        child = subprocess.run([sys.executable, "-c", "import signal,sys; sys.exit(0 if all(signal.getsignal(s) != signal.SIG_IGN for s in (1,2,15,3,10,12)) else 1)"], check=False)
+        assert child.returncode == 0                                                         # children do not inherit an ignored disposition
         fd = os.open(env.lock_path, os.O_RDWR)
         with pytest.raises(BlockingIOError):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)                                   # nobody else gets in
@@ -965,8 +966,8 @@ def test_changing_commands_hold_a_lock_and_ignore_hangups_while_they_run(env):
         with pytest.raises(Refused, match="another forge-node-release"):
             with sw.locked():
                 pass
-    assert set(seen.values()) == {signal.SIG_IGN}
-    assert signal.getsignal(signal.SIGHUP) != signal.SIG_IGN                                 # restored afterwards
+    assert signal.getsignal(signal.SIGHUP) == signal.SIG_DFL or callable(signal.getsignal(signal.SIGHUP))
+    assert signal.getsignal(signal.SIGTERM) not in (signal.SIG_IGN,) and not getattr(signal.getsignal(signal.SIGTERM), "__name__", "") == "<lambda>"      # restored afterwards
     with sw.locked():                                                                          # and the lock was released
         pass
     # the dispatcher takes it for every changing command, not for status/check

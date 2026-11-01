@@ -302,6 +302,8 @@ def test_privctl_finds_the_node_id_in_node_env_when_sudo_scrubbed_the_environmen
     assert node_id_from_file(str(f), 0) == "g3"
     f.write_text("FORGE_NODE_NODE_ID=../etc\n")
     assert node_id_from_file(str(f), 0) == ""                                                  # not a node id
+    f.write_text("FORGE_NODE_NODE_ID=g2\nFORGE_NODE_NODE_ID=g3\n")
+    assert node_id_from_file(str(f), 0) == "g3"                                                # the LAST assignment wins, as for systemd's EnvironmentFile= and the switcher's env call
     f.write_text("FORGE_NODE_NODE_ID=g2\n")
     os.chmod(f, 0o666)
     assert node_id_from_file(str(f), 0) == ""                                                  # others can write it: it decides which node this is
