@@ -12,9 +12,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-SRC = str(Path(__file__).resolve().parents[1])
+SRC = os.environ.get("FN_MUT_SRC") or str(Path(__file__).resolve().parents[1])         # FN_MUT_SRC: a frozen snapshot (git archive) so edits made during a long run do not leak into later mutants
 WORK = os.path.join(tempfile.gettempdir(), "fn-mutation-work")
-IMAGES_LOCK = os.path.join(SRC, "..", "forge-core", "images.lock")
+IMAGES_LOCK = os.path.join(str(Path(__file__).resolve().parents[2]), "forge-core", "images.lock")
 PG = os.environ.get("FN_PG_IMAGE") or subprocess.run(["sed", "-n", "s/^IMG_PGVECTOR=//p", IMAGES_LOCK], capture_output=True, text=True).stdout.split()[0]
 M = [
  # id, file, old, new, tests

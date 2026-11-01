@@ -32,10 +32,15 @@ def e(privd_env):
     return privd_env.ready()
 
 
+EARLY = {"DENY_STOP", "DENY_LOCAL_STOP", "DENY_STALE_LEASE", "DENY_CLOCK"}          # denied at steps 3-5, before the intent record: a `denial` record only
+
+
 def denied(e, code, dry_run=True, **kw):
     r, job = e.exec(dry_run=dry_run, **kw)
     res = result(r)
     assert res["status"] == "denied" and res["reason_code"] == code, res
+    trail = [x["type"] for x in e.priv_records() if x.get("job_id") == job["job_id"]]
+    assert trail == (["denial"] if code in EARLY else ["intent", "result"]), (code, trail)
     assert not os.path.exists(f"{e.paths.work}/{job['job_id']}-1/effect.mark")
     assert not [u for u in e.backend.list_op_units() if job["job_id"] in u], "a unit was started for a denied job"
     return res, job
@@ -287,6 +292,7 @@ def test_privd_never_reads_agent_supplied_paths():
         ("gate.py", "_local_stop_active"): fixed, ("gate.py", "s_lockdown"): fixed + " (LOCAL_STOP)",
         ("gate.py", "s_selfcheck_run"): "wd = ctx.paths.work + 8 random bytes hex; constant file name",
         ("gate.py", "s_started"): "work dir name = uuid + int attempt (core.work_dir_path validates both); constant 'request.json'",
+        ("maintenance.py", "prune"): "job ids / attempts read from OUR ledger rows (uuid, int); fixed work/locks directories",
         ("lease.py", "LeaseStore._load"): fixed, ("lease.py", "LeaseStore._store"): fixed + ", temp name constant",
         ("ledger.py", "Ledger.__init__"): fixed,
         ("ops.py", "_marker"): "priv_state + constant", ("ops.py", "noop_effect"): "work_dir (given by privd) + constant",
