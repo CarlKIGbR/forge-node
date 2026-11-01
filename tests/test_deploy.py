@@ -51,6 +51,43 @@ def test_migrate_service_runs_as_schema_owner_not_as_hub_role_and_is_profile_gat
     assert "user=forge_nodehub" not in m["environment"]["FORGE_NODEHUB_MIGRATE_DSN"] and m["profiles"] == ["nodehub-migrate"] and m["restart"] == "no"
 
 
+def test_hub_image_contains_exactly_the_hub_import_closure():
+    """The Dockerfile copies the hub's import closure and nothing of the node side (agent, privd, audit, release, doctor ...)."""
+    import ast
+    base = ROOT / "src" / "forge_node"
+    copied = set()
+    for line in (ROOT / "Dockerfile").read_text().splitlines():
+        if line.startswith("COPY src/forge_node"):
+            *srcs, dst = line.split()[1:]
+            for src in srcs:
+                path = ROOT / src
+                copied |= {p.relative_to(base).as_posix() for p in (path.rglob("*.py") if path.is_dir() else [path])}
+
+    def deps(rel):
+        tree = ast.parse((base / rel).read_text())
+        pkg = rel.split("/")[:-1]
+        out = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom) and n.level:
+                up = pkg[:len(pkg) - (n.level - 1)]
+                mod = up + (n.module.split(".") if n.module else [])
+                names = [a.name for a in n.names]
+                cands = ["/".join(mod) + ".py", "/".join(mod) + "/__init__.py"] + ["/".join(mod + [x]) + ".py" for x in names]
+                out |= {c for c in cands if (base / c).exists()}
+        return out
+    todo, seen = [p for p in copied if p.startswith("hub/")], set()
+    while todo:
+        f = todo.pop()
+        if f in seen:
+            continue
+        seen.add(f)
+        todo += [d for d in deps(f) if d not in seen]
+    # the closure also needs the package markers of every directory it touches
+    seen |= {(Path(f).parent / "__init__.py").as_posix() for f in seen if (base / Path(f).parent / "__init__.py").exists() and Path(f).parent.as_posix() != "."} | {"__init__.py"}
+    assert seen <= copied, sorted(seen - copied)
+    assert not [c for c in copied if c.split("/")[0] in ("agent", "privd", "audit", "release") or c in ("doctor.py", "cli.py", "profile.py")], sorted(copied)
+
+
 def test_images_are_never_floating_in_n1_files():
     df = (ROOT / "Dockerfile").read_text()
     assert "ARG BASE_IMAGE" in df and not re.search(r"^FROM\s+\S+:latest", df, re.M)

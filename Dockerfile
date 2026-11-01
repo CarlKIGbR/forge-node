@@ -9,7 +9,10 @@ ARG FORGE_UID=994
 ARG FORGE_GID=981
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HOME=/tmp PYTHONPATH=/app/src FORGE_NODE_MIGRATIONS_DIR=/app/migrations FORGE_NODEHUB_CONTAINER=1
 WORKDIR /app
-COPY src/forge_node ./src/forge_node
+# Only what the hub imports (N3: the node-side packages - agent, privd, audit, release - do not belong into the hub image; tests/test_deploy.py checks the import closure).
+COPY src/forge_node/__init__.py src/forge_node/canon.py src/forge_node/chain.py src/forge_node/gates.py src/forge_node/protocol.py src/forge_node/redact.py src/forge_node/sshsig.py ./src/forge_node/
+COPY src/forge_node/hub ./src/forge_node/hub
+COPY src/forge_node/t0/__init__.py src/forge_node/t0/params.py ./src/forge_node/t0/
 COPY migrations ./migrations
 USER ${FORGE_UID}:${FORGE_GID}
 CMD ["python", "-m", "forge_node.hub"]
