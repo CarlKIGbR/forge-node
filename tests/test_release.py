@@ -744,3 +744,54 @@ def test_t0_artifacts_contain_only_listed_privd_modules_and_every_module_is_clas
     t0 = {str(p.relative_to(SRC_ROOT / "forge_node")) for p in build.package_files(SRC_ROOT, "t0") if p.parent == pkg}
     assert t0 == {f"privd/{n}" for n in build.T0_PRIVD_ALLOWED}
     assert not (set(build.T0_PRIVD_ALLOWED) & set(build.T0_PRIVD_EXCLUDED))
+
+
+def test_g28_the_switch_moves_current_directly_after_a_ledger_read_that_follows_the_stop(env):
+    """Production code, not the helper: the evidence log is written by the switcher's own calls (ledger read, stops, the move of `current`). The variant that reads the ledger BEFORE it has
+    stopped what can create rows must be flagged by the same assertion (a race test that cannot fail proves nothing)."""
+    from g28_race import EvidenceLog, assert_observed_before
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+
+    def instrumented(sw, log):
+        real_read, real_repoint, real_run = sw.ledger_schema_and_open, sw._repoint, sw.run
+
+        def read():
+            log.observe("ledger")
+            return real_read()
+
+        def repoint(link, target):
+            if link == sw.current_link:
+                log.act("repoint-current")
+            return real_repoint(link, target)
+
+        def run(argv, stdin, timeout):
+            if argv[:2] == ["/usr/bin/systemctl", "stop"]:
+                log.act("stop-all")
+            return real_run(argv, stdin, timeout)
+        sw.ledger_schema_and_open, sw._repoint, sw.run = read, repoint, run
+        return sw
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    log = EvidenceLog()
+    instrumented(sw, log)
+    assert sw.cmd_switch("0.3.1") == 0
+    ev = log.events
+    # (verify_release reads the ledger first, before anything is stopped; the read that decides is the last one before the move)
+    last_obs = max(i for i, e in enumerate(ev) if e == ("observe", "ledger") and i < ev.index(("act", "repoint-current")))
+    assert ev.index(("act", "stop-all")) < last_obs                                           # ... and it is made after everything that could change the ledger has stopped
+    assert_observed_before(log, "repoint-current", "ledger")
+    # the stale variant: read, THEN stop
+    sw2 = env.switcher()
+    env.release("0.3.2", "full")
+    log2 = EvidenceLog()
+    instrumented(sw2, log2)
+
+    def stale(self=sw2):
+        self.ledger_schema_and_open()
+        self._systemctl("stop", *UNITS_STOP)
+    sw2._quiesce_and_check_ledger = stale
+    assert sw2.cmd_switch("0.3.2") == 0
+    with pytest.raises(AssertionError):
+        assert_observed_before(log2, "repoint-current", "ledger")

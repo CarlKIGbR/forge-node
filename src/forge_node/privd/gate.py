@@ -30,7 +30,7 @@ from ..protocol import ProtoError
 from ..t0 import hardening
 from ..t0.policy import OWNER_PRINCIPAL, PolicyError
 from . import classes, reconcile as rec
-from .core import KINDS, Context, Deny, FileLock, Request, job_lock_path, result_doc, work_dir_path
+from .core import KINDS, Context, Deny, FileLock, Peer, Request, job_lock_path, result_doc, work_dir_path
 from .ledger import STATE_SCHEMA, Row, TargetBusy
 from .units import UnitError, UnitMaybeStarted, op_unit_name
 
@@ -797,6 +797,8 @@ def gate(ctx: Context, req: Request) -> dict:
     """The single guarded function. Returns the wire reply; never raises for a bad request. See the module docstring for the pipelines."""
     if not isinstance(ctx, Context) or not isinstance(req, Request):
         return {"ok": False, "code": "DENY_OP_UNKNOWN", "detail": "no context or no request: nothing is done"}      # missing guard state rejects (G27 fail closed)
+    if not isinstance(req.peer, Peer) or not isinstance(req.body, dict):
+        return {"ok": False, "code": "DENY_PARAM", "detail": "malformed request (no peer credentials or no body): nothing is done"}      # missing guard state rejects (G27 fail closed)
     plan = PIPELINES.get(req.kind)
     if plan is None:
         return {"ok": False, "code": "DENY_OP_UNKNOWN", "detail": "unknown request kind"}

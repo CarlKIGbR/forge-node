@@ -250,7 +250,8 @@ class Agent:
             return
         code = reply.get("code") if reply.get("code") in protocol.REASON_CODES else "DENY_STALE_LEASE"
         self.priv.record("denial", {"job_id": job["job_id"], "op": job["op"], "tier": job["tier"], "reason_code": code})
-        self._post(rt, job["job_id"], self._result(attempt, "denied", code, str(reply.get("detail", ""))[:300]))
+        status = "failed" if code.startswith("FAIL_") else "denied"                       # the hub rejects a `denied` result that carries a FAIL_* code: the job would stay open for ever
+        self._post_validated(rt, job["job_id"], self._result(attempt, status, code, str(reply.get("detail", ""))[:300]))
 
     @staticmethod
     def _result(attempt: int, status: str, code: str | None, output: str) -> dict:

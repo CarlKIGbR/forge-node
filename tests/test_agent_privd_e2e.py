@@ -142,3 +142,27 @@ def test_audit_travels_to_the_hub_chains_verify_across_rotation_and_the_crossche
     assert {"intent", "result", "chain_link", "policy", "lease"} <= types
     n = r.adm.execute("SELECT status FROM node.nodes WHERE node_id='g2'").fetchone()["status"]
     assert n == "active"                                                                       # not quarantined
+
+
+def test_the_crosscheck_does_not_quarantine_a_node_for_denials_the_agent_made_without_privd(chain_rig):
+    """Review M3: the agent denies by itself when its audit log is down or privd is unreachable; no privd record exists for such a job and none is owed."""
+    r = chain_rig
+    agent, link = r.make_chain_agent()
+    link.audit = None
+    jid = r.hub.enqueue_job(JobRequest(node="g2", tier=1, op="selftest.noop", params={"note": "x"}, dry_run=True)).job_id
+    agent.poll_once(wait_s=0)
+    assert r.hub.job_state(jid)["result_reason"] == "DENY_AUDIT_DOWN"
+    r.clock.advance(r.hub.cfg.crosscheck_grace_s + 5)
+    assert r.hub.crosscheck("g2") == []
+    assert r.adm.execute("SELECT quarantine FROM node.nodes WHERE node_id='g2'").fetchone()["quarantine"] is False
+
+
+def test_a_failure_code_from_privd_is_posted_as_failed_not_as_an_invalid_denied_result(chain_rig):
+    """Review: `denied` + FAIL_* is rejected by the hub, which left the job open for ever."""
+    r = chain_rig
+    agent, link = r.make_chain_agent()
+    link.execute = lambda env: {"ok": False, "code": "FAIL_PRECHECK", "detail": "internal error: boom"}
+    jid = r.hub.enqueue_job(JobRequest(node="g2", tier=1, op="selftest.noop", params={"note": "x"}, dry_run=True)).job_id
+    agent.poll_once(wait_s=0)
+    j = r.hub.job_state(jid)
+    assert j["state"] == "failed" and j["result_reason"] == "FAIL_PRECHECK", j

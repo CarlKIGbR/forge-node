@@ -515,11 +515,42 @@ def test_concurrent_policy_apply_of_the_same_serial_has_one_winner(privd_env):
     raw_a, sig_a = e.sign(e.doc(tiers=(0,), serial=2, protected={"paths": ["/opt/a"], "units": []}))
     raw_b, sig_b = e.sign(e.doc(tiers=(0,), serial=2, protected={"paths": ["/opt/b"], "units": []}))
     body = lambda raw, sig: {"policy_b64": base64.b64encode(raw).decode(), "sig": sig}      # noqa: E731
-    hook_after(e.ctx.policies, "installed_serial", il, "A.checked", only_thread="A")
+    import threading
+
+    class ProbeLock:
+        """The store's lock, observed: B's acquire is tried without blocking first, so 'B is contending for the lock' is a fact the test waits for, not a guess after a sleep."""
+
+        def __init__(self, real):
+            self.real, self.contended = real, threading.Event()
+
+        def __enter__(self):
+            if threading.current_thread().name == "il-B" and not self.real.acquire(blocking=False):
+                self.contended.set()
+                self.real.acquire()
+            elif threading.current_thread().name != "il-B":
+                self.real.acquire()
+            else:
+                pass
+            return self
+
+        def __exit__(self, *a):
+            self.real.release()
+    probe = ProbeLock(e.ctx.policies._lock)
+    e.ctx.policies._lock = probe
+    real_serial, calls_a = e.ctx.policies.installed_serial, []
+
+    def serial_then_park_inside_the_store(*a, **k):
+        r = real_serial(*a, **k)
+        if threading.current_thread().name == "il-A":
+            calls_a.append(r)
+            if len(calls_a) == 2:                                                          # the 1st call is the pipeline's own (outside the store's lock); the 2nd is the check inside apply()
+                il.park("A.checked")
+        return r
+    e.ctx.policies.installed_serial = serial_then_park_inside_the_store
     il.start("A", lambda: e.call("policy.apply", body(raw_a, sig_a)))
-    il.wait_parked("A.checked")                                                           # A saw serial 1 installed and is about to install 2
+    il.wait_parked("A.checked")                                                           # A, INSIDE the store's lock, saw serial 1 installed and is about to install 2
     il.start("B", lambda: e.call("policy.apply", body(raw_b, sig_b)))
-    time.sleep(0.2)                                                                        # B waits on the store's lock (it cannot overtake A's check -> install)
+    assert probe.contended.wait(5), "B never contended for the store's lock: it was able to run past A's check"
     il.release("A.checked")
     ra, rb = il.join("A"), il.join("B")
     assert [ra["ok"], rb["ok"]].count(True) == 1 and [ra["ok"], rb["ok"]].count(False) == 1

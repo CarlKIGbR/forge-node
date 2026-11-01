@@ -17,11 +17,12 @@ from pathlib import Path
 import pytest
 from audit_helpers import AGENT_GID, AGENT_UID
 from g27_entrypoints import DROP, EntryCase, assert_fail_closed, assert_guard_failures_rejected, check_entry_points, find_entry_points
-from g28_race import EvidenceLog, Interleaver, assert_observed_before, hook_after, hook_before
+from g28_race import Interleaver, hook_after, hook_before
 from privd_helpers import NODE, PrivdEnv, SRC
 
 from forge_node import protocol, sshsig
 from forge_node.privd import privctl, reconcile
+from forge_node.privd.client import PrivUnavailable
 from forge_node.privd.core import Context, Peer, Request
 from forge_node.privd.gate import gate
 from forge_node.privd.server import Server
@@ -29,7 +30,7 @@ from forge_node.privd.server import Server
 PRIVD = Path(SRC) / "forge_node" / "privd"
 RELEASE = Path(SRC) / "forge_node" / "release"
 AGENT = Path(SRC) / "forge_node" / "agent"
-GUARD_PARAMS = ("peer", "uid", "euid", "ctx", "req", "gates", "gate_set", "policy", "lease", "signature", "sig", "owner", "release")
+GUARD_PARAMS = ("peer", "uid", "euid", "ctx", "req", "gates", "gates_map", "gate_set", "policy", "lease", "signature", "sig", "owner", "release")
 EFFECTS = ("start", "append", "rotate", "recover", "purge", "apply", "mkdir", "unlink", "rename", "replace", "fchmod", "fchown", "fsync", "symlink", "write", "finish", "mark_started",
            "put", "flock", "kill", "stop", "run_pipe", "lock_target", "init")
 
@@ -42,6 +43,8 @@ def reject_on_denial(reply: dict):
     """Adapter from privd's reply dicts to the testkit's 'raises on rejection' contract."""
     if reply.get("ok") is False:
         raise Rejected(reply.get("code"))
+    if reply.get("in_progress"):
+        raise Rejected("in_progress")                                  # not an acceptance either: nothing finished
     r = reply.get("result")
     if isinstance(r, dict) and r.get("status") in ("denied", "failed"):
         raise Rejected(r.get("reason_code"))
@@ -79,10 +82,11 @@ def test_g27_no_optional_parameter_can_switch_a_check_off_anywhere_in_privd_the_
     import re
     bypass = re.compile(r"^(skip|bypass|no_check|unsafe|force|disable|trust)(_|$)|(^|_)(skip|bypass)$")
     allowed_defaults = {                                        # (file, function, param): why a default is harmless
-        ("log.py", "AuditAdmin.purge", "none"): "",
+        ("policy.py", "parse_policy", "gates_map"): "the T0 (agent-side) loader defaults to the PRODUCTION gate table gates.GATES; privd's PolicyStore passes it explicitly (asserted below) and tests pass "
+                                                    "their own; the default can only be the strict one",
     }
     offenders = []
-    for root in (PRIVD, Path(SRC) / "forge_node" / "audit", AGENT / "privlink.py", AGENT / "shipper.py", RELEASE / "switcher.py", RELEASE / "build.py"):
+    for root in (PRIVD, Path(SRC) / "forge_node" / "audit", AGENT / "privlink.py", AGENT / "shipper.py", RELEASE / "switcher.py", RELEASE / "build.py", Path(SRC) / "forge_node" / "t0" / "policy.py"):
         files = [root] if root.is_file() else sorted(root.rglob("*.py"))
         for f in files:
             for n in ast.walk(ast.parse(f.read_text())):
@@ -91,7 +95,7 @@ def test_g27_no_optional_parameter_can_switch_a_check_off_anywhere_in_privd_the_
                     pos = a.posonlyargs + a.args
                     defaulted = {p.arg for p in pos[len(pos) - len(a.defaults):]} | {p.arg for p, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None}
                     for p in defaulted:
-                        if bypass.search(p) or p in GUARD_PARAMS:
+                        if (bypass.search(p) or p in GUARD_PARAMS) and (f.name, n.name, p) not in allowed_defaults:
                             offenders.append((f.name, n.name, p))
     # the one reviewed exception: the release BUILDER's switcher_api/state_window/policy_schema are manifest VALUES, not guard inputs (the node's guard reads the signed manifest)
     assert not offenders, offenders
@@ -267,6 +271,13 @@ def test_g27_fail_closed_gate_rejects_missing_state_without_side_effects(rig):
     valid = dict(ctx=e.ctx, req=Request("status", Peer(1, AGENT_UID, AGENT_GID), {}))
     assert_fail_closed(lambda **kw: reject_on_denial(gate(**kw)), valid, ["ctx", "req"], rejects=(Rejected,), side_effects=lambda: side_effects(e))
     assert gate(e.ctx, Request("exec", Peer(1, AGENT_UID, AGENT_GID), None)) ["ok"] is False             # a body that is not a mapping at all
+    # review: the adapter rejected the "no body" / "no peer" cases itself - privd's own answer, with its own state untouched, is what counts
+    before = side_effects(e)
+    for kind in ("exec", "lease.put", "t0", "selfcheck", "reconcile", "policy.apply", "audit.rotate", "lockdown", "status"):
+        for bad in (Request(kind, None, {}), Request(kind, Peer(1, AGENT_UID, AGENT_GID), None), Request(kind, Peer(1, 0, 0), None), Request(kind, "peer", "body")):
+            r = gate(e.ctx, bad)
+            assert r["ok"] is False and r["code"] in ("FAIL_PRECHECK", "DENY_PARAM", "DENY_JOB_SIGNATURE", "DENY_OP_UNKNOWN"), (kind, bad, r)
+    assert side_effects(e) == before and not os.path.exists(e.paths.local_stop)
 
 
 def test_g27_behavioural_privctl_commands_refuse_non_root_without_side_effect(rig, tmp_path):
@@ -295,8 +306,8 @@ def test_g27_behavioural_privctl_commands_refuse_non_root_without_side_effect(ri
                     fn(c)
                 except privctl.CtlError:
                     raise Rejected("not root")
-                except Exception:
-                    if not as_root:
+                except (FileNotFoundError, PrivUnavailable):
+                    if not as_root:                                                  # root got PAST the guard and failed on a file / on the (absent) socket - the guard did not stop it
                         raise
                 return None
             return f
@@ -305,27 +316,31 @@ def test_g27_behavioural_privctl_commands_refuse_non_root_without_side_effect(ri
 
 
 def test_g27_behavioural_switcher_commands_reject_unverifiable_releases_without_side_effect(tmp_path, mkey_fixture):
-    """Two nodes: A has a current release (check/switch/self-update), B has none (install-first). On both, release 0.3.2 was tampered with after signing."""
+    """Node A has a current release (check/switch/self-update). `install-first` needs a node WITHOUT one, and its valid call would use that state up, so every call of it gets a fresh
+    node of its own - otherwise a tampered release would be refused as 'already current' even without the signature guard. On all of them release 0.3.2 was tampered with after signing."""
     from forge_node.release.switcher import Refused
     from test_release import Env
     (tmp_path / "a").mkdir()
-    (tmp_path / "b").mkdir()
-    a, b = Env(tmp_path / "a", mkey_fixture), Env(tmp_path / "b", mkey_fixture)
-    for env in (a, b):
+    a = Env(tmp_path / "a", mkey_fixture)
+    fresh: list = []
+
+    def prepare(env):
         for v in ("0.3.0", "0.3.1", "0.3.2"):
             env.release(v, "full")
-        evil = env.base / "releases" / "0.3.2" / "units" / "forge-node-agent.service"
-        evil.write_text("[Service]\nExecStart=/bin/sh\n")                                       # tampered after signing
-    swa, swb = a.switcher(), b.switcher()
+        (env.base / "releases" / "0.3.2" / "units" / "forge-node-agent.service").write_text("[Service]\nExecStart=/bin/sh\n")       # tampered after signing
+    prepare(a)
+    swa = a.switcher()
     swa.cmd_install_first("0.3.0")
     a.make_ledger()
     rep = check_entry_points(RELEASE, verbs=("cmd",), guarded=("verify_release",), expected_count=4, exempt={}, guard_params=GUARD_PARAMS, effect_calls=EFFECTS)
 
+    def changes(env):
+        calls = sum(1 for c in env.calls if not c[0].endswith("ssh-keygen"))              # ssh-keygen verifications do not count
+        links = sum(1 for n in ("current", "previous", "profile") if os.path.lexists(env.base / n))
+        return calls + links + (env.self_path.stat().st_size if env.self_path.exists() else 0) + (len(os.readlink(env.base / "current")) if os.path.islink(env.base / "current") else 0)
+
     def side():
-        """Everything a refused command must not have changed: systemctl calls (ssh-keygen verifications do not count), the `current` link on A, B's `current`/profile, the installed switcher."""
-        calls = sum(1 for env in (a, b) for c in env.calls if not c[0].endswith("ssh-keygen"))
-        cur = len(os.readlink(a.base / "current")) + sum(1 for n in ("current", "profile") if os.path.lexists(b.base / n))
-        return calls + cur + (a.self_path.stat().st_size if a.self_path.exists() else 0)
+        return changes(a) + sum(changes(e) for e in fresh)
 
     def mk(fn):
         def f(version, **_):
@@ -334,14 +349,27 @@ def test_g27_behavioural_switcher_commands_reject_unverifiable_releases_without_
             except Refused:
                 raise Rejected("refused")
         return f
+
+    def install_first(version):
+        n = len(fresh)
+        (tmp_path / f"n{n}").mkdir()
+        env = Env(tmp_path / f"n{n}", mkey_fixture)
+        prepare(env)
+        fresh.append(env)
+        try:
+            env.switcher().cmd_install_first(version)
+        finally:
+            if version != "0.3.1":                                                       # a refusal leaves this node exactly as prepare() made it
+                assert changes(env) == 0, "a refused install-first changed the node"
     failing = {"tampered release": dict(version="0.3.2"), "unknown release": dict(version="9.9.9"), "malformed version": dict(version="../x")}
     cases = {
         "release.switcher.Switcher.cmd_check": EntryCase(mk(swa.cmd_check), dict(version="0.3.1"), failing),
         "release.switcher.Switcher.cmd_switch": EntryCase(mk(swa.cmd_switch), dict(version="0.3.1"), failing),
         "release.switcher.Switcher.cmd_self_update": EntryCase(mk(swa.cmd_self_update), dict(version="0.3.1"), failing),
-        "release.switcher.Switcher.cmd_install_first": EntryCase(mk(swb.cmd_install_first), dict(version="0.3.1"), failing),
+        "release.switcher.Switcher.cmd_install_first": EntryCase(mk(install_first), dict(version="0.3.1"), failing),
     }
     assert_guard_failures_rejected(cases, report=rep, rejects=(Rejected,), side_effects=side)
+    assert len(fresh) == 4 and all(changes(e) == 0 for e in fresh[1:])                  # the valid call changed its node, none of the refused ones did
 
 
 @pytest.fixture
@@ -410,19 +438,6 @@ def test_reconcile_and_retry_claims_serialized(privd_env):
     env3, _ = e.job_env(job_id=jid, params={"note": "r"}, dry_run=False, delivery_seq=3, plan_hash=None)
     assert e.ledger.claim(jid, 3, "selftest.noop", "selftest.noop", __import__("forge_node.canon", fromlist=["x"]).digest({"note": "r"}), False, "meta", e.clock()).kind == "retry"
     assert e.ledger.get(jid).attempt == 2
-
-
-def test_g28_the_evidence_log_helper_flags_a_stale_snapshot():
-    """The helper itself, applied to the pattern used in the switcher and in privd (observe -> act directly after)."""
-    log = EvidenceLog()
-    log.observe("ledger")
-    log.act("switch")
-    assert_observed_before(log, "switch", "ledger")
-    log.observe("ledger")
-    log.observe("something else")
-    log.act("switch")
-    with pytest.raises(AssertionError):
-        assert_observed_before(log, "switch", "ledger")
 
 
 def test_g28_the_stop_recheck_test_fails_without_the_recheck(privd_env, monkeypatch):
