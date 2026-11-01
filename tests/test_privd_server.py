@@ -254,7 +254,7 @@ def test_privctl_lockdown_audit_rotate_verify_and_closure(served):
     e = served
     ctl, out, calls = make_ctl(e)
     assert privctl.main(["lockdown"], ctl) == 0 and os.path.exists(e.paths.local_stop)
-    assert calls == [["stop", "forge-node-agent.service"], ["disable", "--now", "forge-node-privd.socket"]]
+    assert calls == [["stop", "forge-node-agent.service"], ["disable", "--now", "forge-node-audit-rotate.timer"], ["disable", "--now", "forge-node-privd.socket"]]
     res = json.loads(out.getvalue())
     assert res["steps"]["stop_agent"]["rc"] == 0
     assert privctl.main(["lockdown"], ctl) == 0                                           # idempotent

@@ -345,3 +345,17 @@ def test_fsproof_removes_the_canary_of_a_proof_that_was_killed(realfs):
     assert left, "the killed proof left nothing behind: the test does not test anything"
     rep = fsproof.prove(realfs)
     assert rep["ok"] and os.listdir(realfs) == []
+
+
+def test_a_damaged_tail_is_repaired_inside_the_file_before_the_seal_so_the_chain_link_has_nothing_to_describe(specs):
+    """Rotation step 1 (design 8.3): the damage that exists when rotation starts gets its tail_repair record IN the old file; only damage that appears after that is described by the
+    chain_link. (Both would verify - the difference is where the evidence lives.)"""
+    s = specs["agent"]
+    a = agent_log(specs)
+    append_raw(live(s), b'{"torn":')
+    assert a.rotate() == 2
+    old = file_records(live(s, 1))
+    assert old[-1]["type"] == "tail_repair" and old[-1]["bytes"] == len(b'{"torn":')
+    link = file_records(live(s, 2))[0]
+    assert link["type"] == "chain_link" and link["prev_damaged_bytes"] == 0 and link["prev_damaged_sha256"] is None and link["prev_seq"] == old[-1]["seq"]
+    assert a.verify() == []

@@ -109,7 +109,7 @@ class Ctl:
         return 0 if r.get("ok") else 1
 
     def cmd_lockdown(self) -> int:
-        """LOCAL_STOP, then stop the agent and disable the privd socket. Works without privd: the file is created directly, systemctl is best effort and reported."""
+        """LOCAL_STOP, then stop the agent and disable the rotation timer and the privd socket. Works without privd: the file is created directly, systemctl is best effort and reported."""
         require_root(self.euid)
         d = os.path.dirname(self.local_stop)
         dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -122,7 +122,10 @@ class Ctl:
         finally:
             os.close(dfd)
         steps = {}
-        for label, argv in (("stop_agent", ["stop", "forge-node-agent.service"]), ("disable_privd_socket", ["disable", "--now", "forge-node-privd.socket"])):
+        # the rotation timer goes too: its service `Requires=` the privd socket, so an hourly tick would start the socket again. LOCAL_STOP is the durable part (privd itself refuses everything
+        # above T0 while the file exists); the units are the belt to that brace.
+        for label, argv in (("stop_agent", ["stop", "forge-node-agent.service"]), ("disable_rotate_timer", ["disable", "--now", "forge-node-audit-rotate.timer"]),
+                            ("disable_privd_socket", ["disable", "--now", "forge-node-privd.socket"])):
             rc, out, err = self.run_systemctl(argv)
             steps[label] = {"rc": rc, "err": err.decode("utf-8", "replace")[:200]}
         self.emit({"local_stop": self.local_stop, "steps": steps})
