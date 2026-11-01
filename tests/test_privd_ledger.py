@@ -264,8 +264,12 @@ def test_crash_midway_probe_unknown_is_indeterminate(privd_env):
 def test_opaque_crash_always_indeterminate(privd_env):
     """Idempotency class `opaque`: effects unknown, so a crash is indeterminate even when a probe would say 'not applied'."""
     e = privd_env.ready()
-    jid, kind, res = _died_without_status(e, dict(idempotency="opaque", probe=None))
+    jid, kind, res = _died_without_status(e, dict(idempotency="opaque", probe=lambda wd: "not_applied"))      # even a probe that says 'not applied' is not believed for an opaque op
     assert kind == "indeterminate" and e.ledger.get(jid).state == "indeterminate"
+    e.ledger.unlock_target("selftest.noop", jid)
+    jid0, kind0, _ = _died_without_status(e, dict(idempotency="opaque", probe=None))
+    assert kind0 == "indeterminate"
+    e.ledger.unlock_target("selftest.noop", jid0)
     jid2, kind2, _ = _died_without_status(e, dict(idempotency="probe", probe=lambda wd: "not_applied"))
     assert kind2 == "aborted_safe"                                                          # the same crash with an observable effect IS safely retryable
 
