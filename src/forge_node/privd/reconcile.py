@@ -6,11 +6,11 @@
              confirmed dead (unit inactive/failed AND cgroup empty), else indeterminate (4) the effect lock is taken (free now; held by an outsider -> indeterminate) (5) delegated effects
              settle, else indeterminate (6) the op's probe classifies: applied -> committed, not_applied -> aborted_safe (retryable with attempt+1), partial/unknown -> indeterminate,
              and a `recovery` audit record is appended. A new attempt can only start from aborted_safe through the serialized claim."""
-import os
 import threading
 from dataclasses import dataclass
 
 from .. import protocol
+from ..audit.spec import AuditCorrupt, AuditDown
 from . import worker
 from .core import Context, FileLock, job_lock_path, result_doc
 from .ledger import Row
@@ -218,9 +218,13 @@ def recover_all(ctx: Context) -> dict:
     """Startup recovery: audit logs first (rotation roll-forward, tail repair), then every unit and every open row (Design 9.4 'Startup recovery')."""
     from . import maintenance
     report = {"audit": {}, "attached": [], "reconciled": [], "orphans": [], "pruned": maintenance.prune(ctx)}
+    report["audit_errors"] = {}
     for name, log in (("priv", ctx.priv_log), ("agent", ctx.agent_log)):
         if log is not None:
-            report["audit"][name] = log.recover()
+            try:
+                report["audit"][name] = log.recover()
+            except (AuditDown, AuditCorrupt) as e:        # privd must come up (and answer DENY_AUDIT_DOWN / status) even if a log is damaged or - for the agent's own log - locked by a hostile agent
+                report["audit_errors"][name] = f"{type(e).__name__}: {e}"
     rows = {r.job_id: r for r in ctx.ledger.open_rows()}
     units = list(ctx.backend.list_op_units())
     known = {r.worker_unit for r in rows.values() if r.worker_unit}

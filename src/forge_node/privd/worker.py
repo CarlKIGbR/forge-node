@@ -8,7 +8,6 @@ Everything it needs is in `<work_dir>/request.json`, written by privd (root-only
   4. write status.json atomically (temp, fsync, rename, fsync dir) as the LAST act. The worker writes nowhere else and never touches the audit log."""
 import fcntl
 import hashlib
-import json
 import os
 import stat
 import sys

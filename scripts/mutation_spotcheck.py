@@ -150,7 +150,7 @@ M = [
  ("n3-audit-purge-age", "audit/log.py", "if age < MIN_AGE_PURGE_S:", "if False:", "tests/test_audit.py"),
  ("n3-audit-chain-trust", "audit/log.py", "        if not stat.S_ISDIR(st.st_mode) or st.st_uid != owner_uid or st.st_mode & 0o022:\n            return False", "        if not stat.S_ISDIR(st.st_mode):\n            return False", "tests/test_audit.py"),
  ("n3-audit-torn-successor-trusted", "audit/log.py", "                complete = rec is not None and data == line + b\"\\n\" and self._expected_link_ok(rec, n, prev)", "                complete = True", "tests/test_audit_gate_d.py"),
- ("n3-audit-no-tail-repair-before-seal", "audit/log.py", "        self._repair_tail_locked()                                            # 1", "        pass", "tests/test_audit_gate_d.py"),
+ ("n3-audit-no-tail-repair-before-seal", "audit/log.py", "        self._repair_tail_locked()                                            # 1: a damaged tail is accounted for BEFORE the file becomes immutable", "        pass", "tests/test_audit_gate_d.py"),
  ("n3-audit-forged-record-hijacks-head", "audit/scan.py", "            linked = rec[\"prev_hash\"] in hashes and hashes[rec[\"prev_hash\"]] + 1 == rec[\"seq\"] and rec[\"prev_hash\"] != rec[\"hash\"]", "            linked = True", "tests/test_audit_shipper.py"),
  ("n3-gate-no-stop", "privd/gate.py", "    if p[\"stop\"]:\n        raise Deny(\"DENY_STOP\", \"global stop\")", "    if False:\n        raise Deny(\"DENY_STOP\", \"global stop\")", "tests/test_n3_named.py"),
  ("n3-gate-no-skew", "privd/gate.py", "    if abs((st.ctx.now() - protocol.parse_ts(st.lease[\"issued_at\"])).total_seconds()) > protocol.CLOCK_SKEW_MAX_S:", "    if False:", "tests/test_n3_named.py"),

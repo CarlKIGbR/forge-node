@@ -9,11 +9,8 @@ import json
 import os
 import stat
 import sys
-from datetime import datetime, timezone
 
-from .. import canon
 from ..audit import fsproof
-from ..audit.log import AuditAdmin
 from ..audit.spec import AuditCorrupt, AuditDown
 from . import resolver
 from .client import PrivClient, PrivUnavailable

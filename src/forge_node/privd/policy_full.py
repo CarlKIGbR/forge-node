@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
 
-from .. import canon, gates, protocol
+from .. import canon, gates
 from ..t0.policy import PolicyError, PolicyView, parse_policy
 
 BUILTIN_PROTECTED_PATHS = ("/srv/models", "/srv/kmu-ai", "/opt/kmu-ai", "/etc/forge-node", "/etc/ssh", "/etc/sudoers", "/etc/sudoers.d", "/root", "/var/lib/forge-node-priv",

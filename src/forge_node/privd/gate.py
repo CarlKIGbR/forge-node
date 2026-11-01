@@ -22,7 +22,6 @@ import binascii
 import hashlib
 import os
 import shutil
-import stat
 from dataclasses import dataclass, field
 
 from .. import canon, gates, protocol, redact, sshsig

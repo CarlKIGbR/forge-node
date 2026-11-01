@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import pytest
+from audit_helpers import AGENT_UID
 from privd_helpers import NOW, SRC, PrivdEnv, attach, gates_with
 
 from forge_node import protocol
@@ -579,3 +580,29 @@ def test_retention_prunes_only_old_terminal_rows_with_their_work_dirs_and_locks(
     rep = maintenance.prune(e.ctx)
     os.close(fd)
     assert rep["rows"] == 1 and rep["locks"] == 0 and os.path.exists(f"{e.paths.locks}/job-{keep_recent}.lock")
+
+
+def test_startup_recovery_survives_a_damaged_or_locked_log(privd_env):
+    """privd comes up even when the agent's log is locked by a hostile agent process (the agent can lock its own audit.lock) or the priv log is damaged: the failure is reported, every
+    mutating op is then denied DENY_AUDIT_DOWN, status still answers."""
+    import fcntl
+    e = privd_env.ready()
+    fd = os.open(e.specs["agent"].lock, os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    from forge_node.audit import spec as audit_spec
+    old, audit_spec.LOCK_TIMEOUT_S = audit_spec.LOCK_TIMEOUT_S, 0.3
+    import forge_node.audit.log as audit_log
+    audit_log.LOCK_TIMEOUT_S = 0.3
+    try:
+        rep = reconcile.recover_all(e.ctx)
+    finally:
+        audit_log.LOCK_TIMEOUT_S = old
+        audit_spec.LOCK_TIMEOUT_S = old
+        os.close(fd)
+    assert "agent" in rep["audit_errors"] and "priv" not in rep["audit_errors"] and "lock busy" in rep["audit_errors"]["agent"]
+    os.unlink(f"{e.specs['priv'].dir}/CURRENT")
+    rep = reconcile.recover_all(e.ctx)
+    assert "priv" in rep["audit_errors"]
+    r = e.exec(dry_run=True)[0]
+    assert (r.get("code") or result(r)["reason_code"]) == "DENY_AUDIT_DOWN"
+    assert e.call("status", {}, uid=AGENT_UID)["ok"] is True

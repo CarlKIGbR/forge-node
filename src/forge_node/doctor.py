@@ -7,7 +7,6 @@ Checks (status ok | warn | fail | skip): clock, identity (node key/cert/CA, expi
 with nodev,nosuid, backing file on the root device), every probe and every op of the release's table inside its own unit. Exit status 0 only if nothing failed."""
 import json
 import os
-import stat
 import sys
 from datetime import datetime, timezone
 
