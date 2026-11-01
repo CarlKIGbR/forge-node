@@ -432,6 +432,7 @@ def test_selfcheck_and_status_observe_a_broken_priv_log_without_repairing_it(pri
     with pytest.raises(gate_mod.Deny, match="audit not writable"):
         gate_mod.s_audit_peek(gate_mod.State(e.ctx, Request("selfcheck", Peer(1, AGENT_UID, 1001), {"target": "audit"})))
     assert sorted(os.listdir(e.specs["priv"].dir)) == gens_before
+    assert gate_mod.PIPELINES["selfcheck"][2] is gate_mod.s_audit_peek                         # the pipeline really uses the non-healing step
     # ... and the request as a whole answers DENY_AUDIT_DOWN
     r = e.call("selfcheck", {"target": "audit"}, uid=AGENT_UID)
     assert r["ok"] is False and r["code"] == "DENY_AUDIT_DOWN"
