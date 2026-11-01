@@ -14,7 +14,7 @@ MAX_RECORD_BYTES = 16 * 1024
 SOURCES = ("agent", "priv", "hub")
 SOURCE_TYPES = {
     "priv": frozenset("intent result denial t0 chain_link recovery tail_repair lease policy release_switch".split()),
-    "agent": frozenset("relay denial t0 chain_link tail_repair lease policy release_switch".split()),
+    "agent": frozenset("relay denial t0 chain_link recovery tail_repair lease policy release_switch".split()),
     "hub": frozenset("job_issue job_result denial quarantine anomaly".split()),
 }
 _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")

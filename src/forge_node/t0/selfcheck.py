@@ -24,3 +24,36 @@ def selfcheck(env: Env) -> dict:
         cg = False
     missing_required = [c for c in REQUIRED_COMMANDS if not commands.get(c)]
     return {"commands": commands, "paths": paths, "cgroup_v2_system_slice": cg, "missing_required_commands": missing_required, "ok": not missing_required and all(paths.values())}
+
+
+# What each root probe needs to do its work, checked INSIDE that probe's own sandbox (doctor runs it in the probe's real transient unit). `optional`: a missing optional command is
+# reported but does not fail the check (sshd / virsh are not on every host).
+PROBE_NEEDS = {
+    "net": {"commands": ("ss_listen_procs",), "optional": (), "paths": ("/proc/net/dev",)},
+    "firewall": {"commands": ("iptables_docker_user",), "optional": (), "paths": ()},
+    "containers": {"commands": ("docker_ps_ids", "docker_inspect", "docker_image_inspect"), "optional": (), "paths": ()},
+    "container_net": {"commands": ("docker_ps_ids", "docker_inspect"), "optional": (), "paths": ("/proc/self/net/dev",)},
+    "vms": {"commands": (), "optional": ("virsh_list", "virsh_pools"), "paths": ()},
+    "certs": {"commands": ("openssl_x509_file",), "optional": (), "paths": ()},
+    "git": {"commands": ("git_status_tracked",), "optional": (), "paths": ()},
+    "access": {"commands": (), "optional": ("sshd_effective",), "paths": ("/etc/group", "/etc/passwd")},
+    "models": {"commands": ("du_ionice",), "optional": (), "paths": ()},
+    "journal": {"commands": ("journal_unit",), "optional": (), "paths": ()},
+    "activity": {"commands": ("journal_last",), "optional": (), "paths": ()},
+    "uulog": {"commands": (), "optional": (), "paths": ("/var/log/unattended-upgrades/unattended-upgrades.log",)},
+}
+
+
+def probe_selfcheck(name: str, env: Env) -> dict:
+    """Side-effect-free: do the commands and paths THIS probe needs exist and work from inside this unit? ok = every non-optional need is met."""
+    need = PROBE_NEEDS[name]
+    commands = {c: env.runner.available(c) for c in (*need["commands"], *need["optional"])}
+    paths = {}
+    for p in need["paths"]:
+        try:
+            env.fs.read_text(p, 1024)
+            paths[p] = True
+        except FsError:
+            paths[p] = False
+    missing = [c for c in need["commands"] if not commands[c]] + [p for p, okp in paths.items() if not okp]
+    return {"probe": name, "commands": commands, "paths": paths, "missing": missing, "ok": not missing}

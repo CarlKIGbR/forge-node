@@ -1,0 +1,2 @@
+g27_entrypoints.py and g28_race.py are verbatim copies of forge-standards testkit/ (v0.2.0, status proposed), commit cef5577eaf32169947408e4c689556ad6a57e51c in /srv/forge/work/forge-standards-g27g28.
+Update them only by copying a newer pinned release; do not edit them here.

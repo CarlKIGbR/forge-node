@@ -124,7 +124,7 @@ def _log_units(v, protected_units) -> tuple[LogUnit, ...]:
     return tuple(out)
 
 
-def parse_policy(raw: bytes, expect_node: str, file_serial: int, now: datetime) -> PolicyView:
+def parse_policy(raw: bytes, expect_node: str, file_serial: int, now: datetime, gates_map=gates.GATES) -> PolicyView:
     """Strict parse of the fields this layer uses. Raises PolicyError."""
     try:
         doc = canon.loads(raw)
@@ -151,7 +151,7 @@ def parse_policy(raw: bytes, expect_node: str, file_serial: int, now: datetime) 
     tiers = doc.get("tiers_enabled")
     if not isinstance(tiers, list) or any(isinstance(t, bool) or t not in protocol.TIERS for t in tiers) or 0 not in tiers:
         _bad("tiers_enabled must list tier 0")
-    viol = gates.policy_gate_violations(doc)
+    viol = gates.policy_gate_violations(doc, gates_map)
     if viol:
         _bad("gated feature switched on: " + "; ".join(viol[:3]))
     pins = doc.get("hub_tls_pins")
@@ -216,9 +216,9 @@ def _chain_trusted(path: str, owner_uid: int) -> bool:
         return False
 
 
-def load_installed(policy_dir: str, allowed_signers_path: str, node: str, now: datetime, *, owner_uid: int, ssh_keygen: str) -> PolicyView:
+def load_installed_blob(policy_dir: str, allowed_signers_path: str, now: datetime, *, owner_uid: int, ssh_keygen: str) -> tuple[bytes, int]:
     """The installed policy is the highest serial in `policy_dir`. If that one does not verify there is NO policy (fail closed): falling back to an older file would be the
-    downgrade the monotonic serial exists to prevent. Raises PolicyError."""
+    downgrade the monotonic serial exists to prevent. Returns the VERIFIED bytes and the serial (the file name); parsing is the caller's. Raises PolicyError."""
     try:
         dfd = os.open(policy_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError as e:
@@ -242,6 +242,11 @@ def load_installed(policy_dir: str, allowed_signers_path: str, node: str, now: d
         sshsig.verify(raw, sig.decode("ascii"), sshsig.NS_POLICY, OWNER_PRINCIPAL, signers, ssh_keygen)
     except (sshsig.SigError, UnicodeDecodeError, OSError) as e:
         raise PolicyError("DENY_POLICY_INVALID", f"policy signature invalid ({type(e).__name__})") from e
+    return raw, serial
+
+
+def load_installed(policy_dir: str, allowed_signers_path: str, node: str, now: datetime, *, owner_uid: int, ssh_keygen: str) -> PolicyView:
+    raw, serial = load_installed_blob(policy_dir, allowed_signers_path, now, owner_uid=owner_uid, ssh_keygen=ssh_keygen)
     return parse_policy(raw, node, serial, now)
 
 

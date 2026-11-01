@@ -13,8 +13,9 @@ from .runner import ReadOnlyRunner, trusted_binary
 
 def main(argv, stdin, stdout, *, node_id: str, policy_dir: str, allowed_signers: str, fs_root: str, owner_uid: int, now, ssh_keygen: str) -> int:
     """Thin wrapper over wire.handle_request so privd (in-process, N3) and the unit entry share one code path."""
-    if len(argv) != 1:
-        stdout.write(canon.canonical_text({"ok": False, "code": "BAD_REQUEST", "detail": "usage: probe_main <probe>"}) + "\n")
+    selfcheck_mode = len(argv) == 2 and argv[0] == "--selfcheck"
+    if len(argv) != 1 and not selfcheck_mode:
+        stdout.write(canon.canonical_text({"ok": False, "code": "BAD_REQUEST", "detail": "usage: probe_main [--selfcheck] <probe>"}) + "\n")
         return 2
     clock = now
     try:
@@ -23,6 +24,13 @@ def main(argv, stdin, stdout, *, node_id: str, policy_dir: str, allowed_signers:
         stdout.write(canon.canonical_text({"ok": False, "code": e.code, "detail": e.detail[:200]}) + "\n")
         return 1
     env = Env(Fs(ProtectedSet.from_policy(view.protected_paths), fs_root), ReadOnlyRunner(), clock, view)
+    if selfcheck_mode:
+        from .selfcheck import PROBE_NEEDS, probe_selfcheck
+        if argv[1] not in PROBE_NEEDS:
+            stdout.write(canon.canonical_text({"ok": False, "code": "DENY_OP_UNKNOWN", "detail": "unknown probe"}) + "\n")
+            return 2
+        stdout.write(canon.canonical_text({"ok": True, "data": probe_selfcheck(argv[1], env)}) + "\n")
+        return 0
     try:
         params = canon.loads(stdin.readline(wire.MAX_LINE))
     except canon.CanonError:

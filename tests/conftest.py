@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 TEST_DSN = os.environ.get("FORGE_NODE_TEST_DSN")
 HAVE_KEYGEN = shutil.which("ssh-keygen") is not None
 HAVE_OPENSSL = shutil.which("openssl") is not None
+REAL_FS = os.environ.get("FN_REAL_FS")                 # a directory on a real ext4 with CAP_LINUX_IMMUTABLE available (scripts/run-tests.sh sets it up); gate D tests need it
+REQUIRE_REAL_FS = os.environ.get("FN_REQUIRE_REAL_FS") == "1"
 
 
 def pytest_collection_modifyitems(config, items):
@@ -256,3 +258,42 @@ try:
     _hs.load_profile("forge-node")
 except ImportError:      # property tests are skipped by importorskip in their modules if hypothesis is missing
     pass
+
+
+# ------------------------------------------------------------------------------------------------------------ real filesystem (gate D)
+@pytest.fixture
+def realfs():
+    """A fresh root-owned directory on the real ext4 (chattr +a/+i work there). Flags are cleared and everything removed afterwards, whatever the test did. The harness
+    (FN_REQUIRE_REAL_FS=1) turns a missing or non-working real filesystem into a FAILURE; without the harness the test is skipped and reported as such."""
+    import tempfile
+    import clear_flags
+    from forge_node.audit import fsproof
+    if not REAL_FS or os.geteuid() != 0:
+        if REQUIRE_REAL_FS:
+            pytest.fail("FN_REQUIRE_REAL_FS=1 but no real filesystem / not root")
+        pytest.skip("needs FN_REAL_FS (a directory on ext4), root and CAP_LINUX_IMMUTABLE: run scripts/run-tests.sh")
+    os.chown(REAL_FS, 0, 0)
+    os.chmod(REAL_FS, 0o755)
+    base = tempfile.mkdtemp(dir=REAL_FS)
+    os.chmod(base, 0o755)
+    proof = fsproof.prove(base)
+    if not proof["ok"]:
+        if REQUIRE_REAL_FS:
+            pytest.fail(f"the real filesystem does not support the seal protocol: {proof}")
+        pytest.skip(f"filesystem does not support the seal protocol: {proof['fstype']}")
+    try:
+        yield base
+    finally:
+        clear_flags.main(["clear_flags", base])
+        shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.fixture
+def privd_env(realfs, owner, gate):
+    """A complete privd instance (real logs on ext4, ledger, local-process units) with only gate D switched on; tests that need other gate sets build PrivdEnv themselves."""
+    from privd_helpers import PrivdEnv
+    env = PrivdEnv(realfs, {"owner": owner, "gate": gate})
+    yield env
+    for log in (env.priv_log, env.agent_log):
+        log.close()
+    env.ledger.close()
