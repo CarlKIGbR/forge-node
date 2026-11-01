@@ -492,3 +492,16 @@ def test_privd_records_a_release_switch_when_its_version_differs_from_the_one_th
     assert record_release_switch(e.ctx) is False
     e.ctx.audit = real
     assert record_release_switch(e.ctx) is True
+
+
+def test_a_stored_plan_is_bound_to_the_op_and_parameters_it_was_computed_for(privd_env):
+    """A plan_hash that exists and is unexpired is not enough: the plan of {note: a} must not authorise an apply of {note: b} (mutant n3-gate-plan-not-bound survived without this)."""
+    e = privd_env.ready()
+    plan = result(e.exec(dry_run=True, params={"note": "a"})[0])
+    env, job = e.job_env(plan_hash=plan["plan_hash"], params={"note": "b"})
+    r = e.call("exec", {"job": env})
+    res = r["result"] if r.get("ok") else r
+    assert res.get("reason_code", res.get("code")) == "DENY_STALE_PLAN", r
+    assert not [d for d in os.listdir(e.paths.work) if os.path.exists(f"{e.paths.work}/{d}/effect.mark")]       # nothing ran
+    env2, _ = e.job_env(plan_hash=plan["plan_hash"], params={"note": "a"})
+    assert result(e.call("exec", {"job": env2}))["status"] == "committed"                                    # the plan it was computed for still works
