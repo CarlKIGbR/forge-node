@@ -351,9 +351,25 @@ def s_started(st: State) -> None:
     st.row = ctx.ledger.mark_started(row.job_id, row.attempt, unit, st.work_dir, None, st.extra.get("plan_hash"), st.dry_run, ctx.now())
 
 
+def _fresh_stop_check(st: State) -> None:
+    """G28: starting the unit is irreversible, so STOP is re-observed NOW (LOCAL_STOP file, the stored lease re-read and re-verified), not carried over from steps 3/4 which ran
+    before the audit intent, the policy, the rate buckets and the work directory. Same codes as the early steps."""
+    ctx = st.ctx
+    if _local_stop_active(ctx):
+        raise Deny("DENY_LOCAL_STOP", "LOCAL_STOP appeared before the unit started")
+    p = ctx.leases.current(_gate_keys(st))
+    if p is None or ctx.now() > protocol.parse_ts(p["valid_until"]):
+        raise Deny("DENY_STALE_LEASE", "lease no longer valid before the unit started")
+    if p["stop"] or (st.job["requester"]["project"] is not None and st.job["requester"]["project"] in p["stopped_projects"]):
+        raise Deny("DENY_STOP", "stop arrived before the unit started")
+    if p["quarantine"]:
+        raise Deny("DENY_QUARANTINE", "quarantine arrived before the unit started")
+
+
 def s_effect(st: State) -> None:
     """Pipeline 18: the effect, in the op's own transient unit with a property set from the fixed table."""
     ctx, row, entry = st.ctx, st.row, st.entry
+    _fresh_stop_check(st)
     props = classes.op_unit_properties(entry.unit_class, work_dir=st.work_dir, priv_state=ctx.paths.priv_state, forge_roots=tuple(r.path for r in _policy(st).forge_roots), timeout_s=entry.timeout_s)
     try:
         inv = ctx.backend.start(row.worker_unit, props, ctx.argv_for("op", entry.name, st.work_dir))

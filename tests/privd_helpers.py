@@ -126,7 +126,8 @@ class PrivdEnv:
         return [{"id": "hub-gate-1", "pub": self.gate_key["pub"], "not_after": "2099-12-31"}]
 
     def doc(self, **kw):
-        return policy_doc(gate_keys=self.gate_keys(), **kw)
+        kw.setdefault("gate_keys", self.gate_keys())
+        return policy_doc(**kw)
 
     def sign(self, doc_or_raw, ns=sshsig.NS_POLICY):
         raw = doc_or_raw if isinstance(doc_or_raw, bytes) else json.dumps(doc_or_raw, sort_keys=True, separators=(",", ":")).encode()

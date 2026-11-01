@@ -1,0 +1,166 @@
+"""privctl: the owner's root CLI on the node (Design 13.C/E/F). Every subcommand is a `cmd_*` function; each one starts with require_root() - the guard of this module (G27: a test counts
+the commands and checks the guard dominates every path). Subcommands that change privd's state do it by sending a REQUEST to privd (so they go through gate() like everything else);
+the few that must work while privd is down (audit-init, lockdown) or that are pure root-side maintenance (circuit-ack, audit-verify, audit-purge, unit-closure) act directly.
+
+policy-apply never takes a path from anybody else: the two files are opened with O_NOFOLLOW, must be regular files, are read completely into memory, and the signature, the schema and
+the installation all work on THOSE BYTES (no re-open by path, no TOCTOU in a world-writable /tmp)."""
+import base64
+import json
+import os
+import stat
+import sys
+from datetime import datetime, timezone
+
+from .. import canon
+from ..audit import fsproof
+from ..audit.log import AuditAdmin
+from ..audit.spec import AuditCorrupt, AuditDown
+from . import resolver
+from .client import PrivClient, PrivUnavailable
+
+MAX_BLOB = 256 * 1024
+
+
+class CtlError(Exception):
+    pass
+
+
+def require_root(euid: int) -> None:
+    """The guard of every command. `euid` is passed in (os.geteuid() in main): there is no code path to a command that skips it."""
+    if euid != 0:
+        raise CtlError("privctl must run as root")
+
+
+def read_nofollow(path: str, limit: int) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)       # O_NONBLOCK: a FIFO in place of the file is refused below instead of blocking forever
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            raise CtlError(f"{path}: not a regular file or too large")
+        data = os.read(fd, limit + 1)
+        if len(data) > limit:
+            raise CtlError(f"{path}: too large")
+        return data
+    finally:
+        os.close(fd)
+
+
+class Ctl:
+    """Everything a command needs, injected: nothing is read from the environment inside a command."""
+
+    def __init__(self, *, euid: int, client: PrivClient, state_setup, admin_factory, ledger_path: str, local_stop: str,
+                 systemctl_provider, protected_units: tuple, protected_paths: tuple, run_systemctl, clock, out):
+        """state_setup(): create the root-only state directories (audit-init only). admin_factory() -> (priv AuditAdmin, agent AuditAdmin): built when a command needs them, because
+        before audit-init the directories they open do not exist."""
+        self.euid, self.client, self.state_setup, self.admin_factory = euid, client, state_setup, admin_factory
+        self.ledger_path, self.local_stop, self.systemctl_provider = ledger_path, local_stop, systemctl_provider
+        self.protected_units, self.protected_paths, self.run_systemctl, self.clock, self.out = protected_units, protected_paths, run_systemctl, clock, out
+
+    def emit(self, doc) -> None:
+        self.out.write(json.dumps(doc, sort_keys=True, indent=1, default=str) + "\n")
+
+    # ---- commands -------------------------------------------------------------------------------------------------------------
+    def cmd_audit_init(self) -> int:
+        require_root(self.euid)
+        res = {}
+        self.state_setup()
+        for name, admin in zip(("priv", "agent"), self.admin_factory()):
+            proof = fsproof.prove(admin.spec.dir)                                      # the seal protocol must work on THIS filesystem, else nothing is created
+            res[name] = {"fs_proof": proof}
+            if not proof["ok"]:
+                self.emit(res)
+                raise CtlError(f"{name} log: the filesystem does not support the seal protocol (see fs_proof)")
+            res[name]["generation"] = admin.init()
+        self.emit(res)
+        return 0
+
+    def cmd_audit_verify(self) -> int:
+        require_root(self.euid)
+        res = {n: a.verify() for n, a in zip(("priv", "agent"), self.admin_factory())}
+        self.emit(res)
+        return 0 if not any(res.values()) else 1
+
+    def cmd_audit_rotate(self, which: str) -> int:
+        require_root(self.euid)
+        r = self.client.request("audit.rotate", {"log": which})
+        self.emit(r)
+        return 0 if r.get("ok") else 1
+
+    def cmd_audit_purge(self, acked_priv: int, acked_agent: int) -> int:
+        """`acked_*` = the highest seq per log the hub has acknowledged (read it from the hub: node.audit / the poll acks). Purge removes only sealed generations >= 90 days old."""
+        require_root(self.euid)
+        res = {}
+        for name, admin, acked in zip(("priv", "agent"), self.admin_factory(), (acked_priv, acked_agent)):
+            res[name] = admin.purge(acked, self.clock())
+        self.emit(res)
+        return 0
+
+    def cmd_policy_apply(self, policy_path: str, sig_path: str) -> int:
+        require_root(self.euid)
+        raw = read_nofollow(policy_path, MAX_BLOB)
+        sig = read_nofollow(sig_path, 16 * 1024).decode("ascii")
+        r = self.client.request("policy.apply", {"policy_b64": base64.b64encode(raw).decode("ascii"), "sig": sig})
+        self.emit(r)
+        return 0 if r.get("ok") else 1
+
+    def cmd_status(self) -> int:
+        require_root(self.euid)
+        r = self.client.request("status", {})
+        self.emit(r)
+        return 0 if r.get("ok") else 1
+
+    def cmd_lockdown(self) -> int:
+        """LOCAL_STOP, then stop the agent and disable the privd socket. Works without privd: the file is created directly, systemctl is best effort and reported."""
+        require_root(self.euid)
+        d = os.path.dirname(self.local_stop)
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            try:
+                os.close(os.open(os.path.basename(self.local_stop), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd))
+            except FileExistsError:
+                pass
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        steps = {}
+        for label, argv in (("stop_agent", ["stop", "forge-node-agent.service"]), ("disable_privd_socket", ["disable", "--now", "forge-node-privd.socket"])):
+            rc, out, err = self.run_systemctl(argv)
+            steps[label] = {"rc": rc, "err": err.decode("utf-8", "replace")[:200]}
+        self.emit({"local_stop": self.local_stop, "steps": steps})
+        return 0
+
+    def cmd_unit_closure(self, unit: str, action: str) -> int:
+        """The closure_sha256 the owner puts into the policy for a unit.* target, computed from the live unit graph by the resolver the node itself uses."""
+        require_root(self.euid)
+        r = resolver.resolve(self.systemctl_provider, unit, action, job_mode="replace", protected_units=self.protected_units, protected_paths=self.protected_paths)
+        self.emit({"unit": unit, "action": action, "denied": r.denied, "hits": [h.text() for h in r.hits], "closure_sha256": None if r.denied else r.closure_sha256(),
+                   "F": sorted(r.F), "C": sorted(r.C), "S": sorted(r.S), "X": sorted(r.X)})
+        return 1 if r.denied else 0
+
+    def cmd_circuit_ack(self, op: str, who: str) -> int:
+        """Re-enable an op whose circuit opened - only by an acknowledgement here, never by the failing caller."""
+        require_root(self.euid)
+        from .ledger import Ledger
+        led = Ledger(self.ledger_path)
+        try:
+            ok = led.circuit_ack(op, who)
+        finally:
+            led.close()
+        self.emit({"op": op, "acknowledged": ok})
+        return 0 if ok else 1
+
+
+def main(argv: list[str], ctl: Ctl) -> int:
+    """argv[0] = subcommand. Returns the exit code; errors are printed, never raised past here."""
+    cmds = {"audit-init": lambda a: ctl.cmd_audit_init(), "audit-verify": lambda a: ctl.cmd_audit_verify(), "status": lambda a: ctl.cmd_status(), "lockdown": lambda a: ctl.cmd_lockdown(),
+            "audit-rotate": lambda a: ctl.cmd_audit_rotate(a[0] if a else "both"), "policy-apply": lambda a: ctl.cmd_policy_apply(a[0], a[1]),
+            "unit-closure": lambda a: ctl.cmd_unit_closure(a[0], a[1]), "circuit-ack": lambda a: ctl.cmd_circuit_ack(a[0], a[1]),
+            "audit-purge": lambda a: ctl.cmd_audit_purge(int(a[0]), int(a[1]))}
+    if not argv or argv[0] not in cmds:
+        sys.stderr.write("usage: privctl " + "|".join(sorted(cmds)) + " ...\n")
+        return 2
+    try:
+        return cmds[argv[0]](argv[1:])
+    except (CtlError, PrivUnavailable, AuditDown, AuditCorrupt, OSError, ValueError, IndexError) as e:
+        sys.stderr.write(f"privctl {argv[0]}: {type(e).__name__}: {e}\n")
+        return 1

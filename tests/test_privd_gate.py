@@ -384,3 +384,58 @@ def test_t0_probe_rate_limit_is_authoritative_in_privd(privd_env):
     codes = [e.call("t0", {"probe": "uulog", "params": {}}) for _ in range(5)]
     assert [c["ok"] for c in codes[:3]] == [True] * 3
     assert codes[3]["code"] == "DENY_RATE"
+
+
+# ---------------------------------------------------------------------------------------------------------------------- G28: fresh evidence
+def test_stop_is_reobserved_immediately_before_the_unit_starts(privd_env):
+    """G28 race: the job passes steps 3/4 (no STOP), is parked right after its ledger row says `started`, STOP arrives (LOCAL_STOP, then a lease with stop=true, then a
+    quarantine lease), the job is released - the unit must not start in any of the three cases, and the job stays retryable."""
+    from g28_race import Interleaver, hook_after
+    e = privd_env.ready()
+    started = []
+    real_start = e.backend.start
+    e.backend.start = lambda *a: started.append(a) or real_start(*a)
+    cases = (("DENY_LOCAL_STOP", lambda n: open(e.paths.local_stop, "w").close()),
+             ("DENY_STOP", lambda n: e.put_lease(seq=11 + 3 * n, stop=True)),
+             ("DENY_QUARANTINE", lambda n: e.put_lease(seq=11 + 3 * n, quarantine=True)))
+    for n, (code, arrive) in enumerate(cases):
+        if os.path.exists(e.paths.local_stop):
+            os.unlink(e.paths.local_stop)
+        e.clock.advance(seconds=61)                                                    # fresh node-wide rate bucket and a fresh lease
+        assert e.put_lease(seq=10 + 3 * n)["ok"]
+        real_mark = e.ledger.mark_started
+        il = Interleaver()
+        hook_after(e.ledger, "mark_started", il, "A.started", only_thread="A")
+        env, job = e.job_env(dry_run=True)
+        il.start("A", lambda: e.call("exec", {"job": env}))
+        il.wait_parked("A.started")
+        arrive(n)
+        il.release("A.started")
+        res = result(il.join("A"))
+        e.ledger.mark_started = real_mark
+        assert res["status"] == "denied" and res["reason_code"] == code, (code, res)
+        assert not started, "the unit was started although STOP had been seen"
+        assert e.ledger.get(job["job_id"]).state == "denied_retryable"
+        types = [r["type"] for r in e.priv_records() if r.get("job_id") == job["job_id"]]
+        assert types == ["intent", "result"], types                                  # an intent was written, so the denial closes it with a result (hub cross-check)
+
+
+def test_concurrent_policy_apply_of_the_same_serial_has_one_winner(privd_env):
+    from g28_race import Interleaver, hook_after
+    e = privd_env
+    e.install(tiers=(0,), serial=1)
+    il = Interleaver()
+    raw_a, sig_a = e.sign(e.doc(tiers=(0,), serial=2, protected={"paths": ["/opt/a"], "units": []}))
+    raw_b, sig_b = e.sign(e.doc(tiers=(0,), serial=2, protected={"paths": ["/opt/b"], "units": []}))
+    body = lambda raw, sig: {"policy_b64": base64.b64encode(raw).decode(), "sig": sig}      # noqa: E731
+    hook_after(e.ctx.policies, "installed_serial", il, "A.checked", only_thread="A")
+    il.start("A", lambda: e.call("policy.apply", body(raw_a, sig_a)))
+    il.wait_parked("A.checked")                                                           # A saw serial 1 installed and is about to install 2
+    il.start("B", lambda: e.call("policy.apply", body(raw_b, sig_b)))
+    time.sleep(0.2)                                                                        # B waits on the store's lock (it cannot overtake A's check -> install)
+    il.release("A.checked")
+    ra, rb = il.join("A"), il.join("B")
+    assert [ra["ok"], rb["ok"]].count(True) == 1 and [ra["ok"], rb["ok"]].count(False) == 1
+    loser = rb if ra["ok"] else ra
+    assert loser["code"] == "DENY_POLICY_INVALID" and "not newer" in loser["detail"]
+    assert e.ctx.policies.current().serial == 2
