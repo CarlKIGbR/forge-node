@@ -484,3 +484,23 @@ def test_mutations_the_round_2_reviewer_found_to_pass_all_tests():
     h1 = R.resolve(base, NOTEXT, "forge-x.service", "start", job_mode="replace", protected_units=PU, protected_paths=PP)
     h2 = R.resolve(other, NOTEXT, "forge-x.service", "start", job_mode="replace", protected_units=PU, protected_paths=PP)
     assert h1.closure_sha256() != h2.closure_sha256()                                              # On*= data of members is bound into the hash (gate C's future recursion starts from it)
+
+
+def test_a_dependency_that_stops_when_unneeded_below_a_conflict_is_part_of_the_transaction():
+    """Round 3 (MAJOR): `start forge-x` stops its conflict forge-c; forge-c's dependency kmu-p (StopWhenUnneeded=yes) then becomes unneeded and systemd stops it too - only a plain `stop` saw it."""
+    g = graph(U("forge-x.service", Conflicts="forge-c.service"), U("forge-c.service", Requires="kmu-p.service"), U("kmu-p.service", StopWhenUnneeded="yes"))
+    text = lambda n: "[Install]\nWantedBy=multi-user.target\n"                                  # noqa: E731
+    g2 = graph(U("forge-x.service", Conflicts="forge-c.service"), U("forge-c.service", Requires="kmu-p.service"), U("kmu-p.service", StopWhenUnneeded="yes"), U("multi-user.target"))
+    for action, gr, tx in (("start", g, NOTEXT), ("restart", g, NOTEXT), ("try-restart", g, NOTEXT), ("reload-or-restart", g, NOTEXT), ("enable", g2, text)):
+        r = res(gr, action=action, text=tx)
+        assert "kmu-p.service" in hit_units(r) and "kmu-p.service" in r.S, action
+    # without StopWhenUnneeded there is nothing to find
+    g = graph(U("forge-x.service", Conflicts="forge-c.service"), U("forge-c.service", Requires="kmu-p.service"), U("kmu-p.service"))
+    assert not res(g, action="start").denied
+
+
+def test_an_unneeded_dependency_of_a_member_of_the_conflict_stop_closure_is_found_too():
+    g = graph(U("forge-x.service", Conflicts="forge-c.service"), U("forge-c.service", RequiredBy="forge-d.service"), U("forge-d.service", Requires="kmu-p.service forge-c.service"),
+              U("kmu-p.service", StopWhenUnneeded="yes"))
+    r = res(g, action="start")
+    assert "forge-d.service" in r.S and "kmu-p.service" in hit_units(r)

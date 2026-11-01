@@ -29,7 +29,7 @@ SWITCHER_API = 1
 VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}\Z")
 PRINCIPAL = "owner@forge"
 NAMESPACE = "forge-node-release"
-NONTERMINAL = ("received", "started", "effect_done", "reconciling")      # `indeterminate` is deliberately NOT here: its worker is confirmed dead, nothing can be orphaned (its target stays locked in the ledger)
+NONTERMINAL = ("received", "started", "effect_done", "reconciling", "indeterminate")      # `indeterminate` IS here (round 3): reconcile assigns it exactly when the worker could NOT be confirmed dead, the effect lock is held from outside its cgroup, or the settle hook failed - a live worker may exist; the owner resolves the row with `privctl resolve` first
 PROFILES = ("full", "t0")
 UNITS_START = ("forge-node-privd.socket", "forge-node-agent.service", "forge-node-audit-rotate.timer")
 UNITS_STOP = ("forge-node-agent.service", "forge-node-audit-rotate.timer", "forge-node-audit-rotate.service", "forge-node-privd.socket", "forge-node-privd.service")
@@ -341,20 +341,23 @@ class Switcher:
         self.say({"installed": ver, "profile": m["profile"], "started": False})
         return 0
 
-    def _quiesce_and_check_ledger(self) -> None:
+    def _quiesce_and_check_ledger(self, *, restart_on_refusal: bool) -> None:
         """Stop everything that can create or change a ledger row (agent, rotation timer and service, privd socket and service), THEN read the ledger (G28: the observation that decides
-        the switch is made after the last thing that could change it has stopped). Open rows - or a stop that did not work - : start everything again and refuse (nothing was changed)."""
+        the switch is made after the last thing that could change it has stopped). Open rows - or a stop that did not work - : refuse. `restart_on_refusal` is True only BEFORE the first change
+        (start everything again: nothing was changed); on the way back `current` points at the release that just failed, so nothing is started - the caller leaves a quiet node."""
         try:
             self._systemctl("stop", *UNITS_STOP)
             _, n = self.ledger_schema_and_open()
         except SwitchError as e:
-            self._best_effort_start()
+            if restart_on_refusal:
+                self._best_effort_start()
             if isinstance(e, Refused):
                 raise
-            raise Refused(f"the node could not be quiesced ({e}); everything was started again, nothing was changed") from e
+            raise Refused(f"the node could not be quiesced ({e})" + ("; everything was started again, nothing was changed" if restart_on_refusal else "")) from e
         if n:
-            self._best_effort_start()
-            raise Refused(f"{n} ledger row(s) are not terminal: a switch (or rollback) while an op is in flight would orphan its worker")
+            if restart_on_refusal:
+                self._best_effort_start()
+            raise Refused(f"{n} ledger row(s) are not terminal (received/started/effect_done/reconciling/indeterminate): a switch (or rollback) while an op is in flight would orphan its worker")
 
     def _best_effort_start(self) -> None:
         try:
@@ -404,15 +407,20 @@ class Switcher:
         failed = [ln for ln in text.splitlines() if '"status": "fail"' in ln or '"doctor": "FAILED"' in ln]
         return rc == 0, ("" if rc == 0 else f"rc {rc}: " + " | ".join(failed)[-1500:])
 
-    def _safe_stop(self) -> None:
-        """The way back failed: leave a quiet node - stopped AND disabled, so that a reboot does not start what nobody has verified (the next successful switch enables the units again)."""
+    def _safe_stop(self) -> list[str]:
+        """The way back failed: leave a quiet node - stopped AND disabled, so that a reboot does not start what nobody has verified (the next successful switch enables the units again).
+        Returns what did NOT work: the report must not claim a quiet node it did not get."""
+        failed = []
         for args in (("stop", *UNITS_STOP), ("disable", *UNITS_START)):
             try:
                 self._systemctl(*args)
-            except SwitchError:
-                pass
+            except SwitchError as e:
+                failed.append(f"{args[0]}: {e}")
+        return failed
 
-    def cmd_switch(self, ver: str) -> int:
+    def cmd_switch(self, ver: str, one_way: bool) -> int:
+        """`one_way` (required): the owner accepts that the new release's state window is wider than the current one, i.e. that the first start of its privd may move the ledger schema to a version
+        the current release cannot read - after which a failed doctor has NO way back and ends in a stopped, disabled node. Without it such a switch is refused before the first change."""
         m = self.verify_release(ver, False)
         prev = self.current()
         if prev is None:
@@ -422,24 +430,33 @@ class Switcher:
         if os.path.lexists(self.local_stop):
             raise Refused(f"{self.local_stop} exists (pause or lockdown): a switch would start the agent, the socket and the timer again - remove it deliberately first")
         pm = self.verify_release(prev, False)                         # the way back must be walkable BEFORE the first change, not discovered afterwards
+        way_back = m["state_max"] <= pm["state_max"] and m["state_min"] >= pm["state_min"]
+        if not way_back and not one_way:
+            raise Refused(f"release {ver} has the state window {m['state_min']}..{m['state_max']}, the current {prev} has {pm['state_min']}..{pm['state_max']}: after the new privd has opened the ledger "
+                          "the way back is closed. Use 'switch --one-way <version>' to accept that")
         env = self.doctor_env()
         old_previous = self._link_target(self.previous_link)
-        self._quiesce_and_check_ledger()
+        self._quiesce_and_check_ledger(restart_on_refusal=True)
         failure = None
         try:
             self._activate(ver, m)
             ok, why = self._doctor(env)
             if ok:
                 self._start_rest()
-                self.say({"switched": ver, "from": prev, "doctor": "ok", "rollback_possible": m["state_max"] <= pm["state_max"] and m["state_min"] >= pm["state_min"]})
-                return 0
-            failure = f"doctor failed ({why})"
+                done = {"switched": ver, "from": prev, "doctor": "ok", "rollback_possible": way_back}
+            else:
+                done = None
+                failure = f"doctor failed ({why})"
         except (SwitchError, OSError) as e:
+            done = None
             failure = f"{type(e).__name__}: {e}"
+        if done is not None:
+            self.say(done)                                          # outside the try: a dead stdout after a good switch must not roll it back
+            return 0
         # ANY failure after the first change: back to the previous release (verified again - the guard is not skipped on the way back)
         try:
             pm = self.verify_release(prev, False)
-            self._quiesce_and_check_ledger()
+            self._quiesce_and_check_ledger(restart_on_refusal=False)
             self._activate(prev, pm)
             ok, why = self._doctor(env)
             if not ok:
@@ -453,9 +470,10 @@ class Switcher:
                 except FileNotFoundError:
                     pass
         except (SwitchError, OSError) as e:
-            self._safe_stop()
-            self.say({"switched": None, "attempted": ver, "failure": failure, "restored": None, "restore_error": f"{type(e).__name__}: {e}",
-                      "state": f"STOPPED and disabled: nothing is running; current -> {self.current()}; fix, then 'switch' (it enables the units again) or 'check' a release"})
+            not_quiet = self._safe_stop()
+            state = (f"STOPPED and disabled: nothing is running; current -> {self.current()}; fix, then 'switch' (it enables the units again) or 'check' a release" if not not_quiet else
+                     f"NOT CONFIRMED STOPPED ({'; '.join(not_quiet)}): units of the release that FAILED may still be running; current -> {self.current()}; stop them by hand before anything else")
+            self.say({"switched": None, "attempted": ver, "failure": failure, "restored": None, "restore_error": f"{type(e).__name__}: {e}", "state": state})
             return 3
         self.say({"switched": None, "attempted": ver, "failure": failure, "restored": prev, "restored_doctor": "ok"})
         return 1
@@ -506,10 +524,11 @@ def run_process(argv, stdin, timeout_s):
 
 
 def main(argv, sw: Switcher) -> int:
-    cmds = {"status": lambda a: sw.show_status(), "check": lambda a: sw.cmd_check(a[0]), "switch": lambda a: sw.cmd_switch(a[0]), "install-first": lambda a: sw.cmd_install_first(a[0]),
+    cmds = {"status": lambda a: sw.show_status(), "check": lambda a: sw.cmd_check(a[0]), "switch": lambda a: sw.cmd_switch(a[-1], a[0] == "--one-way"), "install-first": lambda a: sw.cmd_install_first(a[0]),
             "self-update": lambda a: sw.cmd_self_update(a[0])}
-    if not argv or argv[0] not in cmds or len(argv) != (1 if argv[0] == "status" else 2):
-        sys.stderr.write("usage: forge-node-release status | check|switch|install-first|self-update <version>\n")
+    ok_len = (1 if argv[0] == "status" else 3 if argv[:2] == ["switch", "--one-way"] else 2) if argv else 0
+    if not argv or argv[0] not in cmds or len(argv) != ok_len:
+        sys.stderr.write("usage: forge-node-release status | check|switch|install-first|self-update <version> | switch --one-way <version>\n")
         return 2
     try:
         if argv[0] in ("switch", "install-first", "self-update"):

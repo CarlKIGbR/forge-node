@@ -11,9 +11,9 @@ import time
 from datetime import datetime, timezone
 
 from .. import __version__, gates, protocol
-from ..profile import PROFILE
 from ..audit.log import AuditAdmin
 from ..audit.spec import AuditCorrupt, AuditDown, agent_spec, priv_spec
+from ..profile import PROFILE, RELEASE
 from ..t0.runner import FIXED_PATH, RunnerError, trusted_binary
 from . import resolver
 from .client import PrivClient
@@ -37,6 +37,11 @@ PROTECTED_MOUNTS = ("/srv/models", "/srv/kmu-ai")
 PRIV_STATE = "/var/lib/forge-node-priv"
 RUN_DIR = "/run/forge-node"
 PATHS = Paths(PRIV_STATE, RUN_DIR, "/etc/forge-node/policy", "/etc/forge-node/allowed_signers", "/etc/forge-node/LOCAL_STOP")
+
+
+def full_version() -> str:
+    """`__version__` is a constant of the source tree; the release name written by the builder tells two releases of the same tree apart (the audit `release_switch` record compares this string)."""
+    return f"{__version__}+{RELEASE}"
 
 
 def now() -> datetime:
@@ -88,7 +93,7 @@ def build_context(node: str, agent_user: str = "forgenode") -> Context:
                            gates_map=gates.GATES, table_ops=table.names, devof=devof, protected_devs=protected_devs)
     leases = LeaseStore(path=PATHS.lease_file, ledger=ledger, node=node, ssh_keygen=ssh_keygen, clock=now, owner_uid=0)
     return Context(node=node, paths=PATHS, clock=now, ledger=ledger, priv_log=priv_log, agent_log=agent_log, backend=backend, optable=table, gates=gates.GATES, ssh_keygen=ssh_keygen,
-                   owner_uid=0, agent_uid=pw.pw_uid, policies=policies, leases=leases, argv_for=argv_for, version=__version__, sleep=time.sleep, monotonic=time.monotonic)
+                   owner_uid=0, agent_uid=pw.pw_uid, policies=policies, leases=leases, argv_for=argv_for, version=full_version(), sleep=time.sleep, monotonic=time.monotonic)
 
 
 def listener_from_systemd() -> socket.socket:

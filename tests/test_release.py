@@ -233,7 +233,7 @@ def test_release_switch_moves_agent_ops_units_together(env):
     sw.cmd_install_first("0.3.0")
     env.make_ledger()
     env.calls.clear()
-    assert sw.cmd_switch("0.3.1") == 0
+    assert sw.cmd_switch("0.3.1", False) == 0
     seq = [(c[1], c[2:]) for c in env.calls if c[0] == "/usr/bin/systemctl"]
     assert seq[0] == ("stop", list(UNITS_STOP))                                              # quiesce first: EVERYTHING that can create a ledger row, then the ledger is read
     assert [c for c in seq if c[0] == "stop"] == [seq[0]]
@@ -252,7 +252,7 @@ def test_a_failing_doctor_restores_the_previous_release_by_itself(env):
     sw.cmd_install_first("0.3.0")
     env.make_ledger()
     env.doctor_script = [False, True]                                       # the new release fails doctor, the restored one passes
-    assert sw.cmd_switch("0.3.1") == 1
+    assert sw.cmd_switch("0.3.1", False) == 1
     assert os.readlink(env.base / "current") == "releases/0.3.0"
     res = docs(env.out.getvalue())[-1]
     assert res["restored"] == "0.3.0" and res["failure"].startswith("doctor failed") and "privd" in res["failure"] and res["restored_doctor"] == "ok" and res["switched"] is None
@@ -265,7 +265,7 @@ def test_rollback_refused_on_state_schema_outside_window(env):
     sw.cmd_install_first("0.3.0")
     env.make_ledger(user_version=1)
     with pytest.raises(Refused, match="state schema 1 is outside the window 2..3"):
-        sw.cmd_switch("0.2.0")
+        sw.cmd_switch("0.2.0", False)
     with pytest.raises(Refused):
         sw.cmd_check("0.2.0")
     assert os.readlink(env.base / "current") == "releases/0.3.0" and not [c for c in env.calls if c[1:2] == ["stop"]]      # nothing was touched, not even stopped
@@ -281,14 +281,14 @@ def test_rollback_refused_while_ledger_nonterminal(env):
         env.make_ledger(state=state)
         env.calls.clear()
         with pytest.raises(Refused, match="not terminal"):
-            sw.cmd_switch("0.3.1")
+            sw.cmd_switch("0.3.1", False)
         assert os.readlink(env.base / "current") == "releases/0.3.0"
         stops = [c for c in env.calls if c[1:2] == ["stop"]]
         assert stops == [["/usr/bin/systemctl", "stop", *UNITS_STOP]]                        # everything was stopped to freeze the ledger, found it non-terminal, and was started again
         assert env.calls[-1] == ["/usr/bin/systemctl", "start", *UNITS_START]
     env.ledger.unlink()
     env.make_ledger(state="committed")                                                       # terminal rows do not block
-    assert sw.cmd_switch("0.3.1") == 0
+    assert sw.cmd_switch("0.3.1", False) == 0
 
 
 def test_the_ledger_is_reread_after_the_agent_is_stopped(env):
@@ -309,7 +309,7 @@ def test_the_ledger_is_reread_after_the_agent_is_stopped(env):
         return real_run(argv, stdin, timeout)
     sw.run = run
     with pytest.raises(Refused, match="not terminal"):
-        sw.cmd_switch("0.3.1")
+        sw.cmd_switch("0.3.1", False)
     assert os.readlink(env.base / "current") == "releases/0.3.0"
 
 
@@ -327,7 +327,7 @@ def test_rollback_keeps_ledger_audit_policy_untouched(env):
     sw = env.switcher()
     sw.cmd_install_first("0.3.0")
     before = snap()
-    assert sw.cmd_switch("0.3.1") == 0 and sw.cmd_switch("0.3.0") == 0
+    assert sw.cmd_switch("0.3.1", False) == 0 and sw.cmd_switch("0.3.0", False) == 0
     assert snap() == before
 
 
@@ -340,7 +340,7 @@ def test_switcher_supports_lower_switcher_api_and_refuses_higher_with_self_updat
     with pytest.raises(Refused, match="switcher_api 2.*self-update 0.4.0"):
         sw.cmd_check("0.4.0")
     with pytest.raises(Refused):
-        sw.cmd_switch("0.4.0")
+        sw.cmd_switch("0.4.0", False)
     env.release("0.2.5", "full", switcher_api=SWITCHER_API - 1 if SWITCHER_API > 0 else 0)  # equal-or-lower api is fine
     assert sw.cmd_check("0.2.5") == 0
 
@@ -439,12 +439,12 @@ def test_install_first_refuses_when_something_is_current_and_switch_refuses_with
     env.release("0.3.1", "full")
     sw = env.switcher()
     with pytest.raises(Refused, match="no release is current"):
-        sw.cmd_switch("0.3.1")
+        sw.cmd_switch("0.3.1", False)
     sw.cmd_install_first("0.3.0")
     with pytest.raises(Refused, match="already current"):
         sw.cmd_install_first("0.3.1")
     with pytest.raises(Refused, match="already current"):
-        sw.cmd_switch("0.3.0")
+        sw.cmd_switch("0.3.0", False)
 
 
 def test_policy_schema_newer_than_the_release_supports_blocks_a_rollback(env):
@@ -528,7 +528,7 @@ def test_doctor_runs_as_forgenode_with_the_node_env_and_the_after_switch_flag(en
     sw = env.switcher()
     sw.cmd_install_first("0.3.0")
     env.make_ledger()
-    assert sw.cmd_switch("0.3.1") == 0
+    assert sw.cmd_switch("0.3.1", False) == 0
     call = [c for c in env.calls if "doctor" in c][-1]
     assert call[:5] == ["/usr/sbin/runuser", "-u", "forgenode", "--", "/usr/bin/env"] and call[5] == "-i"
     assert "FORGE_NODE_NODE_ID=g2" in call and "FORGE_NODE_HUB_HOST=192.168.10.4" in call
@@ -551,7 +551,7 @@ def test_a_switch_without_a_usable_node_env_is_refused_before_anything_is_stoppe
         env.node_env.write_text(content)
     env.calls.clear()
     with pytest.raises(Refused, match=why):
-        sw.cmd_switch("0.3.1")
+        sw.cmd_switch("0.3.1", False)
     assert not _systemctl_calls(env) and os.readlink(env.base / "current") == "releases/0.3.0"
 
 
@@ -569,7 +569,7 @@ def test_a_failure_in_start_not_only_in_doctor_returns_to_the_previous_release(e
             return 1, b"", b"Job for forge-node-privd.socket failed"
         return real(argv, stdin, timeout)
     sw.run = run
-    assert sw.cmd_switch("0.3.1") == 1
+    assert sw.cmd_switch("0.3.1", False) == 1
     res = docs(env.out.getvalue())[-1]
     assert os.readlink(env.base / "current") == "releases/0.3.0" and res["restored"] == "0.3.0" and "failed" in res["failure"] and res["restored_doctor"] == "ok"
 
@@ -587,7 +587,7 @@ def test_when_the_way_back_fails_too_everything_is_stopped_and_disabled_and_the_
         (prev_tree / "bin" / "privctl").write_text("#!/bin/sh\necho tampered after install\n")
     env.on_doctor = tamper
     env.calls.clear()
-    assert sw.cmd_switch("0.3.1") == 3
+    assert sw.cmd_switch("0.3.1", False) == 3
     res = docs(env.out.getvalue())[-1]
     assert res["restored"] is None and "differs from RELEASE.json" in res["restore_error"] and res["state"].startswith("STOPPED and disabled")
     calls = _systemctl_calls(env)
@@ -601,7 +601,7 @@ def test_the_restored_release_failing_doctor_too_also_ends_stopped(env):
     sw.cmd_install_first("0.3.0")
     env.make_ledger()
     env.doctor_ok = False
-    assert sw.cmd_switch("0.3.1") == 3
+    assert sw.cmd_switch("0.3.1", False) == 3
     res = docs(env.out.getvalue())[-1]
     assert "fails doctor too" in res["restore_error"] and _systemctl_calls(env)[-1] == ["disable", *UNITS_START]
 
@@ -653,7 +653,7 @@ def test_missing_or_odd_state_is_a_refusal_never_a_skipped_check(env, sabotage, 
         os.link(d / "RELEASE.json.sig", env.tmp / "sig-copy")
     env.calls.clear()
     with pytest.raises(Refused, match=why):
-        sw.cmd_switch("0.3.1")
+        sw.cmd_switch("0.3.1", False)
     assert not _systemctl_calls(env) and os.readlink(env.base / "current") == "releases/0.3.0"
 
 
@@ -801,7 +801,7 @@ def test_g28_the_switch_moves_current_directly_after_a_ledger_read_that_follows_
     env.make_ledger()
     log = EvidenceLog()
     instrumented(sw, log)
-    assert sw.cmd_switch("0.3.1") == 0
+    assert sw.cmd_switch("0.3.1", False) == 0
     ev = log.events
     # (verify_release reads the ledger first, before anything is stopped; the read that decides is the last one before the move)
     last_obs = max(i for i, e in enumerate(ev) if e == ("observe", "ledger") and i < ev.index(("act", "repoint-current")))
@@ -813,11 +813,11 @@ def test_g28_the_switch_moves_current_directly_after_a_ledger_read_that_follows_
     log2 = EvidenceLog()
     instrumented(sw2, log2)
 
-    def stale(self=sw2):
+    def stale(self=sw2, **_):
         self.ledger_schema_and_open()
         self._systemctl("stop", *UNITS_STOP)
     sw2._quiesce_and_check_ledger = stale
-    assert sw2.cmd_switch("0.3.2") == 0
+    assert sw2.cmd_switch("0.3.2", False) == 0
     with pytest.raises(AssertionError):
         assert_observed_before(log2, "repoint-current", "ledger")
 
@@ -845,7 +845,7 @@ def test_self_update_can_install_a_switcher_newer_than_the_running_one_while_che
     sw = env.switcher()
     sw.cmd_install_first("0.3.0")
     env.self_path.write_text("#!/bin/sh\necho old\n")
-    for cmd in (sw.cmd_check, sw.cmd_switch):
+    for cmd in (sw.cmd_check, lambda v: sw.cmd_switch(v, False)):
         with pytest.raises(Refused, match="self-update"):
             cmd("0.4.0")
     assert sw.cmd_self_update("0.4.0") == 0
@@ -868,7 +868,7 @@ def test_a_node_that_cannot_be_quiesced_is_started_again_and_nothing_is_changed(
     sw.run = lambda argv, stdin, t: (1, b"", b"Failed to stop forge-node-privd.service") if argv[:2] == ["/usr/bin/systemctl", "stop"] else real(argv, stdin, t)
     env.calls.clear()
     with pytest.raises(Refused, match="could not be quiesced"):
-        sw.cmd_switch("0.3.1")
+        sw.cmd_switch("0.3.1", False)
     assert os.readlink(env.base / "current") == "releases/0.3.0"
     assert _systemctl_calls(env)[-1] == ["start", *UNITS_START]
 
@@ -883,14 +883,14 @@ def test_only_the_privd_socket_runs_while_doctor_checks_the_new_release(env):
     seen = []
     env.on_doctor = lambda: seen.append([c[1:] for c in env.calls if c[0] == "/usr/bin/systemctl" and c[1] in ("start", "enable")])
     env.calls.clear()
-    assert sw.cmd_switch("0.3.1") == 0
+    assert sw.cmd_switch("0.3.1", False) == 0
     assert seen[0] == [["start", "forge-node-privd.socket"]]                                   # at the time of doctor: the socket and nothing else
     assert _systemctl_calls(env)[-2:] == [["enable", *UNITS_START], ["start", *UNITS_START]]    # afterwards the rest, enabled again (a STOPPED node had them disabled)
     # a failing doctor never starts the agent or the timer of the unchecked release
     env.release("0.3.2", "full")
     env.doctor_script = [False, True]
     env.calls.clear()
-    assert sw.cmd_switch("0.3.2") == 1
+    assert sw.cmd_switch("0.3.2", False) == 1
     starts = [c for c in _systemctl_calls(env) if c[0] == "start"]
     assert starts[0] == ["start", "forge-node-privd.socket"] and starts[1] == ["start", "forge-node-privd.socket"] and starts[2:] == [["start", *UNITS_START]]      # new socket, restored socket, then the rest of the RESTORED one
 
@@ -904,12 +904,12 @@ def test_a_switch_is_refused_while_local_stop_exists_and_checks_the_way_back_fir
     env.local_stop.write_text("")
     env.calls.clear()
     with pytest.raises(Refused, match="LOCAL_STOP"):
-        sw.cmd_switch("0.3.1")
+        sw.cmd_switch("0.3.1", False)
     assert not _systemctl_calls(env)
     env.local_stop.unlink()
     (env.base / "releases" / "0.3.0" / "bin" / "privctl").write_text("#!/bin/sh\necho tampered\n")       # the CURRENT release no longer verifies: the way back would be closed
     with pytest.raises(Refused, match="differs from RELEASE.json"):
-        sw.cmd_switch("0.3.1")
+        sw.cmd_switch("0.3.1", False)
     assert not _systemctl_calls(env) and os.readlink(env.base / "current") == "releases/0.3.0"
 
 
@@ -920,9 +920,9 @@ def test_previous_does_not_point_at_the_release_that_was_just_taken_back(env):
     sw = env.switcher()
     sw.cmd_install_first("0.3.0")
     env.make_ledger()
-    assert sw.cmd_switch("0.3.1") == 0 and os.readlink(env.base / "previous") == "releases/0.3.0"
+    assert sw.cmd_switch("0.3.1", False) == 0 and os.readlink(env.base / "previous") == "releases/0.3.0"
     env.doctor_script = [False, True]
-    assert sw.cmd_switch("0.3.2") == 1
+    assert sw.cmd_switch("0.3.2", False) == 1
     assert os.readlink(env.base / "current") == "releases/0.3.1" and os.readlink(env.base / "previous") == "releases/0.3.0"      # not 0.3.2
 
 
@@ -932,7 +932,7 @@ def test_switch_reports_whether_the_way_back_stays_open(env):
     sw = env.switcher()
     sw.cmd_install_first("0.3.0")
     env.make_ledger()
-    assert sw.cmd_switch("0.3.1") == 0
+    assert sw.cmd_switch("0.3.1", True) == 0
     assert docs(env.out.getvalue())[-1]["rollback_possible"] is False                      # the new release may move the state beyond what 0.3.0 can run on
 
 
@@ -989,7 +989,7 @@ def test_doctor_failure_text_reaches_the_operator(env):
     sw.cmd_install_first("0.3.0")
     env.make_ledger()
     env.doctor_script = [False, True]
-    assert sw.cmd_switch("0.3.1") == 1
+    assert sw.cmd_switch("0.3.1", False) == 1
     assert "privd" in docs(env.out.getvalue())[-1]["failure"]
 
 
@@ -1073,7 +1073,7 @@ def test_the_way_back_re_reads_the_ledger_after_stopping_again(env):
         c.commit()
         c.close()
     env.on_doctor = a_row_appears
-    assert sw.cmd_switch("0.3.1") == 3
+    assert sw.cmd_switch("0.3.1", False) == 3
     res = docs(env.out.getvalue())[-1]
     assert "not terminal" in res["restore_error"] and res["restored"] is None
 
@@ -1093,7 +1093,7 @@ def test_an_oserror_while_moving_current_is_a_failure_that_takes_the_previous_re
             raise OSError(28, "No space left on device")
         return real(link, target)
     sw._repoint = flaky
-    assert sw.cmd_switch("0.3.1") == 1
+    assert sw.cmd_switch("0.3.1", False) == 1
     assert os.readlink(env.base / "current") == "releases/0.3.0" and "No space" in docs(env.out.getvalue())[-1]["failure"]
 
 
@@ -1192,3 +1192,118 @@ def test_the_modes_the_builder_writes_are_the_modes_the_switcher_demands():
             res_modes = {m.name.split("/", 1)[-1]: m.mode for m in tf.getmembers() if m.isfile()}
     assert res_modes["bin/privctl"] == 0o755 and res_modes["sbin/forge-node-release"] == 0o755
     assert all(m == 0o644 for n, m in res_modes.items() if n not in ("bin/privctl", "sbin/forge-node-release")), res_modes
+
+
+# ================================================================================================================= round-3 findings
+def _after_first_doctor(env):
+    i = next(i for i, c in enumerate(env.calls) if "doctor" in c)
+    return [c[1:] for c in env.calls[i:] if c[0] == "/usr/bin/systemctl"]
+
+
+def test_a_rollback_whose_stop_fails_does_not_start_the_release_that_just_failed_and_does_not_claim_a_quiet_node(env):
+    """Round 3 (MAJOR): on the way back `_best_effort_start` started the agent of the release that had just failed doctor (`current` still pointed at it) and the report then said 'nothing is running'."""
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw0 = env.switcher()
+    sw0.cmd_install_first("0.3.0")
+    env.make_ledger()
+    env.doctor_ok = False
+    orig, seen = env.run, {"doctor": False}
+
+    def run(argv, stdin, timeout):
+        seen["doctor"] = seen["doctor"] or "doctor" in argv
+        if seen["doctor"] and argv[0] == "/usr/bin/systemctl" and argv[1] == "stop":
+            env.calls.append(list(argv))
+            return 1, b"", b"Failed to stop"
+        return orig(argv, stdin, timeout)
+    sw = env.switcher(run=run)
+    assert sw.cmd_switch("0.3.1", False) == 3
+    after = _after_first_doctor(env)
+    assert not [c for c in after if c[0] == "start"], after                                  # nothing was started on the way back
+    res = docs(env.out.getvalue())[-1]
+    assert res["state"].startswith("NOT CONFIRMED STOPPED") and "may still be running" in res["state"] and "nothing is running" not in res["state"]
+
+
+def test_a_rollback_that_finds_an_open_row_does_not_start_the_failed_release_either(env):
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    env.doctor_ok = False
+
+    def row_appears():                                                                       # the new release's privd (briefly up for doctor) left a row behind
+        env.make_ledger(state="started")
+    env.on_doctor = row_appears
+    assert sw.cmd_switch("0.3.1", False) == 3
+    assert not [c for c in _after_first_doctor(env) if c[0] == "start"]
+    assert docs(env.out.getvalue())[-1]["state"].startswith("STOPPED and disabled")
+
+
+def test_a_switch_that_closes_the_way_back_is_refused_before_the_first_change_unless_the_owner_says_so(env):
+    """Round 3 (MAJOR): the new privd raises the ledger schema at doctor time; a failed doctor then had no way back (rc 3, node stopped on the failed release) although the switch had been
+    started without a word about it."""
+    env.release("0.3.0", "full", state_window=(1, 1))
+    env.release("0.3.1", "full", state_window=(1, 2))
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    env.calls.clear()
+    with pytest.raises(Refused, match="--one-way"):
+        sw.cmd_switch("0.3.1", False)
+    assert os.readlink(env.base / "current") == "releases/0.3.0" and not _systemctl_calls(env)       # nothing was touched, not even a stop
+    assert switcher_main(["switch", "0.3.1"], sw) == 1 and switcher_main(["switch", "--one-way"], sw) == 2
+    assert switcher_main(["switch", "--one-way", "0.3.1"], sw) == 0 and os.readlink(env.base / "current") == "releases/0.3.1"
+    env.release("0.3.2", "full", state_window=(1, 2))
+    assert sw.cmd_switch("0.3.2", False) == 0                                                # an equal window needs no flag
+
+
+@pytest.mark.parametrize("state", ["received", "started", "effect_done", "reconciling", "indeterminate"])
+def test_every_non_final_ledger_state_blocks_a_switch_including_indeterminate(env, state):
+    """Round 3 (MAJOR): `indeterminate` is assigned when the worker could NOT be confirmed dead; the switch must not move `current` under a worker that may be alive."""
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger(state=state)
+    with pytest.raises(Refused, match="not terminal"):
+        sw.cmd_switch("0.3.1", False)
+    assert os.readlink(env.base / "current") == "releases/0.3.0"
+
+
+def test_a_dead_stdout_after_a_good_switch_does_not_roll_it_back(env):
+    """Round 3 (MINOR): the final report was written inside the try; a dropped ssh session turned a completely successful switch into a rollback."""
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+
+    class Dead:
+        def write(self, _):
+            raise BrokenPipeError()
+
+        def flush(self):
+            pass
+    env.make_ledger()
+    env.switcher().cmd_install_first("0.3.0")
+    sw = env.switcher(out=Dead())
+    env.calls.clear()
+    with pytest.raises(BrokenPipeError):
+        sw.cmd_switch("0.3.1", False)
+    assert os.readlink(env.base / "current") == "releases/0.3.1"
+    assert len([c for c in env.calls if "doctor" in c]) == 1                                 # no second doctor = no rollback
+
+
+def test_the_release_name_is_built_into_the_zipapp_and_into_the_version_privd_records(env, monkeypatch):
+    """Round 3 (MAJOR): privd's version was the constant `__version__`, so a switch between two releases of the same tree left no `release_switch` record."""
+    names = {}
+    for ver in ("0.3.0", "0.3.1"):
+        res = build.build_release(ver, "full", env.tmp / f"o-{ver}", src_root=SRC_ROOT, sign=env.sign())
+        with tarfile.open(res["tar"]) as tf:
+            data = tf.extractfile(f"forge-node-{ver}/forge-node.pyz").read()
+        p = env.tmp / f"{ver}.pyz"
+        p.write_bytes(data)
+        names[ver] = zipfile.ZipFile(p).read("forge_node/profile.py").decode()
+        assert f'RELEASE = "{ver}"' in names[ver] and 'PROFILE = "full"' in names[ver]
+    assert names["0.3.0"] != names["0.3.1"]
+    from forge_node.privd import main as pmain
+    monkeypatch.setattr(pmain, "RELEASE", "0.3.1")
+    assert pmain.full_version().endswith("+0.3.1") and pmain.full_version().startswith(pmain.__version__)

@@ -270,6 +270,14 @@ M = [
  ("n3-build-t0-allowlist", "release/build.py", " and rel.parts[1] not in T0_PRIVD_ALLOWED:", " and False:", "tests/test_release.py"),
  ("n3-doctor-unpaced", "doctor.py", "        if self._selfchecks:\n            self.sleep(PACE_S)", "        if False:\n            self.sleep(PACE_S)", "tests/test_doctor.py"),
  ("n3-doctor-environmental-fails-switch", "doctor.py", "                if r[\"check\"] in ENVIRONMENTAL and r[\"status\"] == \"fail\":", "                if False:", "tests/test_doctor.py"),
+ ("n3-switch-rollback-restarts-failed-release", "release/switcher.py", "self._quiesce_and_check_ledger(restart_on_refusal=False)", "self._quiesce_and_check_ledger(restart_on_refusal=True)", "tests/test_release.py"),
+ ("n3-switch-claims-quiet-node-unverified", "release/switcher.py", "if not not_quiet else", "if True else", "tests/test_release.py"),
+ ("n3-switch-window-closes-way-back-silently", "release/switcher.py", "if not way_back and not one_way:", "if False:", "tests/test_release.py"),
+ ("n3-switch-indeterminate-ok", "release/switcher.py", '"reconciling", "indeterminate")', '"reconciling")', "tests/test_release.py"),
+ ("n3-switch-report-inside-try", "release/switcher.py", '                done = {"switched": ver, "from": prev, "doctor": "ok", "rollback_possible": way_back}', '                self.say({"switched": ver})\n                done = {"switched": ver, "from": prev, "doctor": "ok", "rollback_possible": way_back}', "tests/test_release.py"),
+ ("n3-resolver-unneeded-below-conflicts", "privd/resolver.py", "        S |= set().union(*(unneeded_deps(u) for u in C | S))", "        pass", "tests/test_resolver.py"),
+ ("n3-build-release-name-missing", "release/build.py", '\\nRELEASE = "{release}"', "", "tests/test_release.py"),
+ ("n3-privd-version-is-the-constant", "privd/main.py", 'return f"{__version__}+{RELEASE}"', "return __version__", "tests/test_release.py"),
 ]
 # Survivors that are equivalent by construction (the same fact is covered by a second, independent element of the cache key); named here so the verdict says so.
 EQUIVALENT = {

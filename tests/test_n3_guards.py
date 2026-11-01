@@ -364,7 +364,7 @@ def test_g27_behavioural_switcher_commands_reject_unverifiable_releases_without_
     failing = {"tampered release": dict(version="0.3.2"), "unknown release": dict(version="9.9.9"), "malformed version": dict(version="../x")}
     cases = {
         "release.switcher.Switcher.cmd_check": EntryCase(mk(swa.cmd_check), dict(version="0.3.1"), failing),
-        "release.switcher.Switcher.cmd_switch": EntryCase(mk(swa.cmd_switch), dict(version="0.3.1"), failing),
+        "release.switcher.Switcher.cmd_switch": EntryCase(mk(lambda v: swa.cmd_switch(v, False)), dict(version="0.3.1"), failing),
         "release.switcher.Switcher.cmd_self_update": EntryCase(mk(swa.cmd_self_update), dict(version="0.3.1"), failing),
         "release.switcher.Switcher.cmd_install_first": EntryCase(mk(install_first), dict(version="0.3.1"), failing),
     }

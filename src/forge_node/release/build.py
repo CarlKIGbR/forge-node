@@ -59,13 +59,13 @@ def package_files(src_root: Path, profile: str) -> list[Path]:
     return out
 
 
-def build_zipapp(src_root: Path, profile: str, target: Path) -> None:
+def build_zipapp(src_root: Path, profile: str, release: str, target: Path) -> None:
     """The release zipapp, written entry by entry with a fixed timestamp, fixed modes and a sorted order: the bytes depend on the source tree only - not on the builder's umask, time zone
     (zipapp/zipfile store LOCAL time), file mtimes or directory order. A zipapp is a zip with a `__main__.py`; `python3 -I forge-node.pyz` needs no header."""
     entries: dict[str, bytes] = {}
     for p in package_files(src_root, profile):
         entries["forge_node/" + p.relative_to(src_root / "forge_node").as_posix()] = p.read_bytes()
-    entries["forge_node/profile.py"] = f'"""Build profile (written by the release builder)."""\nPROFILE = "{profile}"\n'.encode()
+    entries["forge_node/profile.py"] = f'"""Build profile and release name (written by the release builder)."""\nPROFILE = "{profile}"\nRELEASE = "{release}"\n'.encode()
     # zipapp's own `main=` spec would call main() and DROP its return value (exit status 0 always): write the entry ourselves
     entries["__main__.py"] = b"import sys\nfrom forge_node.cli import main\n\nsys.exit(main())\n"
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_STORED) as z:
@@ -93,7 +93,7 @@ def build_release(version: str, profile: str, out_dir: Path, *, src_root: Path, 
     files: dict[str, tuple[bytes, int]] = {}                                    # relative path -> (content, mode)
     with tempfile.TemporaryDirectory(prefix="fn-build-") as t:
         pyz = Path(t) / "forge-node.pyz"
-        build_zipapp(Path(src_root), profile, pyz)
+        build_zipapp(Path(src_root), profile, version, pyz)
         files["forge-node.pyz"] = (pyz.read_bytes(), 0o644)
     files["bin/privctl"] = (_wrapper(), 0o755)
     switcher = (Path(src_root) / "forge_node" / "release" / "switcher.py").read_bytes()

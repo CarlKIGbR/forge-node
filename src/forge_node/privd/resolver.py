@@ -321,6 +321,7 @@ def resolve(provider: Callable[[str], dict | None], text_of: Callable[[str], str
         S = set()
         for c in C:
             S |= w.closure(c, REVERSE_STOP, ())
+        S |= set().union(*(unneeded_deps(u) for u in C | S))         # what a stopped conflict (or its dependents) needed may become unneeded and be stopped too
         return F, C, S
 
     def unneeded_deps(u: str) -> set:
