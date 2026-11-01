@@ -64,13 +64,13 @@ def _read_nofollow(path: str, limit: int, owner_uid: int | None = None) -> bytes
 
 
 class Switcher:
-    def __init__(self, *, base: str, root: str, ledger: str, signers: str, policy_dir: str, node_env: str, ssh_keygen: str, run, self_path: str, owner_uid: int, out):
+    def __init__(self, *, base: str, root: str, ledger: str, signers: str, policy_dir: str, node_env: str, ssh_keygen: str, runuser: str, run, self_path: str, owner_uid: int, out):
         """base: /opt/forge-node as a filesystem path (a test passes a temp directory); root: the LOGICAL prefix units refer to ('/opt/forge-node'); ledger: ledger.sqlite;
-        signers: allowed_signers; policy_dir: the installed policies (schema check); node_env: /etc/forge-node/node.env (what `doctor` needs, exactly as the agent unit gets it);
+        signers: allowed_signers; policy_dir: the installed policies (schema check); node_env: /etc/forge-node/node.env (what `doctor` needs, exactly as the agent unit gets it); runuser: the util-linux binary (/usr/sbin/runuser on Ubuntu - NOT /usr/bin);
         run(argv, stdin, timeout_s) -> (rc, out, err); self_path: where this switcher is installed.
         All required: there is no default that could stand in for a missing guard input."""
         self.base, self.root, self.ledger, self.signers, self.policy_dir, self.node_env = base, root, ledger, signers, policy_dir, node_env
-        self.ssh_keygen, self.run, self.self_path, self.owner_uid, self.out = ssh_keygen, run, self_path, owner_uid, out
+        self.ssh_keygen, self.runuser, self.run, self.self_path, self.owner_uid, self.out = ssh_keygen, runuser, run, self_path, owner_uid, out
 
     # ------------------------------------------------------------------------------------------------------------------------ paths
     def rel_dir(self, ver: str) -> str:
@@ -327,7 +327,7 @@ class Switcher:
         return env
 
     def _doctor(self, env: list[str]) -> bool:
-        argv = ["/usr/bin/runuser", "-u", "forgenode", "--", "/usr/bin/env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C", *env,
+        argv = [self.runuser, "-u", "forgenode", "--", "/usr/bin/env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C", *env,
                 "/usr/bin/python3", "-I", f"{self.root}/current/forge-node.pyz", "doctor", "--after-switch"]
         rc, out, err = self.run(argv, None, 300)
         return rc == 0
@@ -440,8 +440,12 @@ def production() -> int:
     if ssh_keygen is None:
         sys.stderr.write("no ssh-keygen\n")
         return 2
+    runuser = next((p for p in ("/usr/sbin/runuser", "/sbin/runuser", "/usr/bin/runuser") if os.path.exists(p)), None)
+    if runuser is None:
+        sys.stderr.write("no runuser\n")
+        return 2
     sw = Switcher(base="/opt/forge-node", root="/opt/forge-node", ledger="/var/lib/forge-node-priv/ledger.sqlite", signers="/etc/forge-node/allowed_signers",
-                  policy_dir="/etc/forge-node/policy", node_env="/etc/forge-node/node.env", ssh_keygen=ssh_keygen, run=run_process, self_path="/usr/local/sbin/forge-node-release", owner_uid=0, out=sys.stdout)
+                  policy_dir="/etc/forge-node/policy", node_env="/etc/forge-node/node.env", ssh_keygen=ssh_keygen, runuser=runuser, run=run_process, self_path="/usr/local/sbin/forge-node-release", owner_uid=0, out=sys.stdout)
     return main(sys.argv[1:], sw)
 
 

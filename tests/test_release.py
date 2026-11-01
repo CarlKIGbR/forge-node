@@ -94,7 +94,7 @@ class Env:
         return res
 
     def switcher(self, **kw) -> Switcher:
-        args = dict(base=str(self.base), root="/opt/forge-node", ledger=str(self.ledger), signers=str(self.signers), policy_dir=str(self.policy_dir), node_env=str(self.node_env), ssh_keygen=shutil.which("ssh-keygen"),
+        args = dict(base=str(self.base), root="/opt/forge-node", ledger=str(self.ledger), signers=str(self.signers), policy_dir=str(self.policy_dir), node_env=str(self.node_env), ssh_keygen=shutil.which("ssh-keygen"), runuser="/usr/sbin/runuser",
                     run=self.run, self_path=str(self.self_path), owner_uid=0, out=self.out)
         args.update(kw)
         return Switcher(**args)
@@ -522,7 +522,7 @@ def test_doctor_runs_as_forgenode_with_the_node_env_and_the_after_switch_flag(en
     env.make_ledger()
     assert sw.cmd_switch("0.3.1") == 0
     call = [c for c in env.calls if "doctor" in c][-1]
-    assert call[:5] == ["/usr/bin/runuser", "-u", "forgenode", "--", "/usr/bin/env"] and call[5] == "-i"
+    assert call[:5] == ["/usr/sbin/runuser", "-u", "forgenode", "--", "/usr/bin/env"] and call[5] == "-i"
     assert "FORGE_NODE_NODE_ID=g2" in call and "FORGE_NODE_HUB_HOST=192.168.10.4" in call
     assert call[-5:] == ["/usr/bin/python3", "-I", "/opt/forge-node/current/forge-node.pyz", "doctor", "--after-switch"]
     assert not [a for a in call if a.startswith("PYTHON")]                                  # nothing from the caller's environment leaks in
@@ -800,3 +800,13 @@ def test_g28_the_switch_moves_current_directly_after_a_ledger_read_that_follows_
 def test_every_template_lists_the_model_directory_for_the_round_0_model_inventory():
     for nid in policies.NODES:
         assert policies.template(nid)["t0"]["model_dirs"] == ["/srv/models"], nid          # inv.models is round-0 scope on all four hosts (T0 nodes included)
+
+
+def test_the_runuser_path_is_a_parameter_probed_where_ubuntu_keeps_it():
+    """Found by looking at the real host: runuser is /usr/sbin/runuser on Ubuntu (there is no /usr/bin/runuser), so a hard-coded path would have failed every doctor run at install time
+    (the test double accepts any argv). The switcher takes it as a required parameter; production() probes the places it can live."""
+    import inspect
+    src = inspect.getsource(Switcher)
+    assert '"/usr/bin/runuser"' not in src and "self.runuser" in src and "runuser: str" in inspect.getsource(Switcher.__init__)
+    prod = inspect.getsource(__import__("forge_node.release.switcher", fromlist=["production"]).production)
+    assert prod.index('"/usr/sbin/runuser"') < prod.index('"/usr/bin/runuser"')
