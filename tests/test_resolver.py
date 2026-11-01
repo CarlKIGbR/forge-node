@@ -50,11 +50,39 @@ def test_conflictedby_reverse_edge_detected():
 
 def test_t2_unit_start_requires_wants_bindsto_protected_dependency_denied():
     for key in ("Requires", "Wants", "BindsTo", "Requisite", "Upholds"):
-        g = graph(U("forge-x.service", **{key: "kmu-db.service"}), U("kmu-db.service"))
+        g = graph(U("forge-x.service", **{key: "kmu-db.service"}), U("kmu-db.service", ActiveState="inactive"))          # starting forge-x would START the protected unit
         assert "kmu-db.service" in hit_units(res(g)), key
     # transitively
-    g = graph(U("forge-x.service", Requires="forge-y.service"), U("forge-y.service", Wants="forge-z.service"), U("forge-z.service", Requires="kmu-q.service"), U("kmu-q.service"))
+    g = graph(U("forge-x.service", Requires="forge-y.service"), U("forge-y.service", Wants="forge-z.service"), U("forge-z.service", Requires="kmu-q.service"), U("kmu-q.service", ActiveState="inactive"))
     assert "kmu-q.service" in hit_units(res(g))
+
+
+def test_an_active_protected_dependency_is_not_an_effect_but_is_bound_into_the_hash():
+    """Starting forge-edge.service (Requires=docker.service) does nothing to a docker.service that is already active: no hit. Its data is still in closure_sha256, so the closure
+    changing (a drop-in on docker.service, a new Conflicts=) invalidates the signed hash."""
+    g = graph(U("forge-x.service", Requires="docker.service"), U("docker.service", FragmentPath="/usr/lib/systemd/system/docker.service"))
+    r = res(g)
+    assert not r.denied and r.F == {"docker.service"}
+    h = r.closure_sha256()
+    g2 = graph(U("forge-x.service", Requires="docker.service"), U("docker.service", FragmentPath="/usr/lib/systemd/system/docker.service", DropInPaths="/etc/systemd/system/docker.service.d/o.conf"))
+    assert res(g2).closure_sha256() != h
+    # a restart or a stop of docker itself is of course an effect on it
+    g3 = graph(U("docker.service"))
+    assert R.resolve(g3, "docker.service", "restart", job_mode="replace", protected_units=("docker.service",), protected_paths=()).denied
+    # ... and so is starting something that requires it when it is NOT running
+    g4 = graph(U("forge-x.service", Requires="docker.service"), U("docker.service", ActiveState="failed"))
+    assert R.resolve(g4, "forge-x.service", "start", job_mode="replace", protected_units=("docker.service",), protected_paths=()).denied
+
+
+def test_split_names_understands_systemctl_quoting():
+    assert R.split_names('a.service "opt-kmu\\x2dai.mount" b.target') == ["a.service", "opt-kmu\\x2dai.mount", "b.target"]
+    assert R.split_names('"a \\"q\\" b.service" c') == ['a "q" b.service', "c"]
+    assert R.split_names("") == [] and R.split_names("   ") == []
+    assert R.split_names('"open') == ["\x00unterminated"]                                       # malformed quoting never yields a plausible name
+    g = graph(U("forge-x.service", Wants='"opt-kmu\\x2dai.mount"'), U("opt-kmu\\x2dai.mount"))
+    p = R.systemctl_provider("/x", lambda *a: (0, b"Id=x\n", b""))
+    assert p("opt-kmu\\x2dai.mount") == {"Id": "x"}                                           # an escaped mount unit name passes the name check
+    assert "opt-kmu\\x2dai.mount" in res(g).F
 
 
 def test_stop_closure_of_conflicted_unit_checked():
@@ -84,13 +112,13 @@ def test_reload_propagation_and_enable_disable_boot_effect():
 
 
 def test_socket_timer_triggers_included():
-    g = graph(U("forge-x.timer", Triggers="forge-x.service"), U("forge-x.service", Requires="kmu-db.service"), U("kmu-db.service"))
+    g = graph(U("forge-x.timer", Triggers="forge-x.service"), U("forge-x.service", Requires="kmu-db.service", ActiveState="inactive"), U("kmu-db.service", ActiveState="inactive"))
     r = res(g, unit="forge-x.timer")
     assert "forge-x.service" in r.F and "kmu-db.service" in hit_units(r)
 
 
 def test_protected_fragment_path_and_dropin_denied():
-    g = graph(U("forge-x.service", Wants="odd.service"), U("odd.service", FragmentPath="/opt/kmu-ai/units/odd.service"))
+    g = graph(U("forge-x.service", Wants="odd.service"), U("odd.service", FragmentPath="/opt/kmu-ai/units/odd.service", ActiveState="inactive"))
     assert "odd.service" in hit_units(res(g))
     g = graph(U("forge-x.service", DropInPaths="/srv/models/override.conf"))
     assert "forge-x.service" in hit_units(res(g))
@@ -131,8 +159,13 @@ def test_t2_unit_with_onsuccess_in_closure_denied():
     assert r.denied and any("OnSuccess" in h.reason for h in r.hits)
     assert any("OnSuccess" in h.edge and "forge-after.service" in h.edge for h in r.hits)
     # buried in the closure rather than on the requested unit
-    g = graph(U("forge-x.service", Requires="forge-y.service"), U("forge-y.service", OnSuccess="forge-after.service"), U("forge-after.service"))
+    g = graph(U("forge-x.service", Requires="forge-y.service"), U("forge-y.service", OnSuccess="forge-after.service", ActiveState="inactive"), U("forge-after.service"))
     assert any(h.unit == "forge-y.service" and "OnSuccess" in h.reason for h in res(g).hits)
+    # ... but an ACTIVE dependency that merely has OnFailure= (sysinit.target, local-fs.target: every real unit reaches them) is not changed by the transaction: it cannot fail because of it
+    g = graph(U("forge-x.service", Requires="local-fs.target"), U("local-fs.target", OnFailure="emergency.target"), U("emergency.target"))
+    assert not res(g).denied
+    g = graph(U("forge-x.service", Requires="local-fs.target"), U("local-fs.target", OnFailure="emergency.target", ActiveState="inactive"), U("emergency.target"))
+    assert res(g).denied
 
 
 def test_t2_unit_with_onfailure_in_closure_denied():

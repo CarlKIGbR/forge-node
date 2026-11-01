@@ -5,9 +5,15 @@ Starting or restarting a unit does not only touch that unit: systemd also activa
   C  every loaded unit named in Conflicts= of a member of F, or carrying a Conflicts= that names a member of F (ConflictedBy),
   S  the stop-closure of C (reverse edges RequiredBy, BoundBy, ConsistsOf, PropagatesStopTo),
   X  action extras (restart propagation, reload propagation, WantedBy/RequiredBy of enable/disable),
-and reports a PROTECTED HIT if any member is in the protected unit set, has a FragmentPath in a protected path, or cannot be fully enumerated (provider error, missing property, a loaded
-unit without a fragment): an incomplete resolution is a hit (fail closed). `closure_sha256` binds the resolved sets AND each member's fragment/drop-in paths, so a new drop-in or a new
+and reports a PROTECTED HIT if a member the transaction would CHANGE is in the protected unit set, has a FragmentPath in a protected path, or cannot be fully enumerated (provider error,
+missing property): an incomplete resolution is a hit (fail closed). `closure_sha256` binds the COMPLETE resolved sets AND each member's fragment/drop-in/On*= data, so a new drop-in or a new
 Conflicts= changes the hash (DENY_CLOSURE_CHANGED until the owner re-signs).
+
+STATE-AWARE EFFECT SET (refinement of the design text, found by the live check on carlgpu2 - see the N3 report): the literal rule 'any member of F is protected' denies EVERY real unit,
+because the forward closure of a service reaches sysinit.target, local-fs.target, -.slice ... and even the design's own example forge-edge.service (it `Requires=docker.service`). Starting a
+unit does nothing to a dependency that is already active; what a transaction changes is: the requested unit, forward members that are NOT active (they get started), conflicting units that ARE
+active (they get stopped) and the active members of the stop-closure. Protected-name/path hits, the 'no fragment' rule and the gate-C rule are evaluated on that effect set; completeness is
+required of the whole closure. A protected dependency that is INACTIVE (so the start would start it) is a hit.
 
 GATE C (Betriebsleiter decision): this resolver does NOT follow OnSuccess=/OnFailure= edges or isolate-like job modes. Until it follows them recursively and binds them into the hash
 (N6/N7), it REJECTS - as a hit, like an incomplete resolution - any unit in the closure that uses OnSuccess=/OnFailure= (or an isolate OnSuccessJobMode=/OnFailureJobMode=), and any
@@ -71,6 +77,36 @@ class Resolution:
         return hashlib.sha256(canon.canonical(doc)).hexdigest()
 
 
+def split_names(value: str) -> list[str]:
+    """Whitespace-separated unit names/paths as `systemctl show` prints them: a name with special characters (every escaped mount unit: opt-kmu\\x2dai.mount) is wrapped in double quotes
+    with backslash, double quote, dollar and backtick escaped by a backslash. Malformed quoting yields a token that no unit regex accepts (-> an incomplete resolution), never a guess."""
+    out, i, n = [], 0, len(value)
+    while i < n:
+        if value[i].isspace():
+            i += 1
+            continue
+        tok = []
+        if value[i] == '"':
+            i += 1
+            while i < n and value[i] != '"':
+                if value[i] == "\\" and i + 1 < n and value[i + 1] in '\\"$`':
+                    tok.append(value[i + 1])
+                    i += 2
+                else:
+                    tok.append(value[i])
+                    i += 1
+            if i >= n:
+                out.append("\x00unterminated")
+                break
+            i += 1
+        else:
+            while i < n and not value[i].isspace():
+                tok.append(value[i])
+                i += 1
+        out.append("".join(tok))
+    return out
+
+
 class Incomplete(Exception):
     pass
 
@@ -79,9 +115,12 @@ class _Walker:
     def __init__(self, provider: Callable[[str], dict | None], protected_units: tuple, protected_paths: tuple, res: Resolution):
         self.provider, self.pu, self.pp, self.res = provider, protected_units, protected_paths, res
         self.cache: dict[str, dict | None] = {}
+        self.via: dict[str, str] = {}                              # how a unit was reached first (for the edge text of a hit)
 
     def props(self, name: str, edge: str, strong: bool = True) -> dict | None:
-        """Properties of a unit (with its relation lists split). None = skip (weak edge to a not-found unit); a hit is recorded for anything incomplete."""
+        """Properties of a unit (relation lists split). None = skip (weak edge to a not-found unit); a hit is recorded for anything incomplete."""
+        if edge:
+            self.via.setdefault(name, edge)
         if name not in self.cache:
             try:
                 raw = self.provider(name)
@@ -98,34 +137,44 @@ class _Walker:
     def _normalise(self, name: str, raw: dict | None, edge: str) -> dict | None:
         if raw is None:
             self.res.hits.append(Hit(name, "cannot be enumerated (systemctl show failed)", edge))
-            return {"_incomplete": True, **{k: [] for k in REL_PROPS}}
+            return {"_incomplete": True, "ActiveState": "inactive", **{k: [] for k in REL_PROPS}, "OnSuccess": [], "OnFailure": [], "OnSuccessJobMode": "", "OnFailureJobMode": "",
+                    "FragmentPath": "", "DropInPaths": "", "LoadState": "", "Names": [name]}
         if raw.get("LoadState") == "not-found":
             return {"_notfound": True}
         missing = [k for k in ALL_PROPS if k not in raw]
         if missing:
             self.res.hits.append(Hit(name, f"incomplete resolution: systemctl show lacks {missing[:3]}", edge))
-            return {"_incomplete": True, **{k: [] for k in REL_PROPS}}
-        p = {k: raw[k].split() for k in REL_PROPS}
+            return {"_incomplete": True, "ActiveState": "inactive", **{k: [] for k in REL_PROPS}, "OnSuccess": [], "OnFailure": [], "OnSuccessJobMode": "", "OnFailureJobMode": "",
+                    "FragmentPath": "", "DropInPaths": "", "LoadState": "", "Names": [name]}
+        p = {k: split_names(raw[k]) for k in REL_PROPS}
         p.update({k: raw[k] for k in META_PROPS + GATE_C_PROPS if k not in ("Names",)})
-        p["Names"] = raw["Names"].split()
-        p["OnSuccess"], p["OnFailure"] = raw["OnSuccess"].split(), raw["OnFailure"].split()
+        p["Names"] = split_names(raw["Names"])
+        p["OnSuccess"], p["OnFailure"] = split_names(raw["OnSuccess"]), split_names(raw["OnFailure"])
+        p["DropInPaths"] = " ".join(split_names(raw["DropInPaths"]))
         return p
 
-    def check_member(self, name: str, p: dict, edge: str) -> None:
-        """Hits that depend on the unit alone: protected name/path, no fragment, gate C."""
-        if p.get("_incomplete"):
+    def is_active(self, name: str) -> bool:
+        """Will the transaction leave this unit alone / is there something to stop? activating and reloading units count as active; anything unknown does not (fail closed)."""
+        p = self.cache.get(name)
+        return bool(p) and not p.get("_notfound") and not p.get("_incomplete") and p.get("ActiveState") in ("active", "activating", "reloading")
+
+    def record(self, name: str, p: dict) -> None:
+        """What goes into closure_sha256 for a member (whether or not the transaction changes it)."""
+        if not p.get("_incomplete"):
+            self.res.frag[name] = {"fragment": p.get("FragmentPath", ""), "dropins": sorted(p.get("DropInPaths", "").split()), "onsuccess": sorted(p["OnSuccess"]), "onfailure": sorted(p["OnFailure"])}
+
+    def check_effect(self, name: str, why: str) -> None:
+        """Hits for a member the transaction would CHANGE: protected name or path, a loaded unit without any fragment, gate C (On*= / isolate job modes)."""
+        edge = f"{self.via[name]}; {why}" if name in self.via else why
+        p = self.cache.get(name)
+        if not p or p.get("_incomplete") or p.get("_notfound"):
             return
-        names = [name, *p.get("Names", [])]
-        for n in names:
-            for g in self.pu:
-                if fnmatchcase(n, g):
-                    self.res.hits.append(Hit(name, f"protected unit ({g})", edge))
-                    break
-            else:
-                continue
-            break
-        frag = p.get("FragmentPath", "")
-        drop = p.get("DropInPaths", "")
+        for n in [name, *p.get("Names", [])]:
+            g = next((g for g in self.pu if fnmatchcase(n, g)), None)
+            if g:
+                self.res.hits.append(Hit(name, f"protected unit ({g})", edge))
+                break
+        frag, drop = p.get("FragmentPath", ""), p.get("DropInPaths", "")
         if not frag and p.get("LoadState") == "loaded":
             self.res.hits.append(Hit(name, "loaded unit without a fragment file cannot be enumerated", edge))
         for path in [frag, *drop.split()]:
@@ -137,18 +186,16 @@ class _Walker:
         for k in ("OnSuccessJobMode", "OnFailureJobMode"):
             if p[k] == "isolate":
                 self.res.hits.append(Hit(name, f"{k}=isolate: isolate job modes are not handled (gate C)", f"{name} —{k}→ isolate"))
-        self.res.frag[name] = {"fragment": frag, "dropins": sorted(drop.split()), "onsuccess": sorted(p["OnSuccess"]), "onfailure": sorted(p["OnFailure"])}
 
-    def closure(self, start: str, keys: tuple, strong_keys: tuple, edge_label: str) -> set:
-        """Transitive closure over the given relation keys; every member is checked. Returns the members (without `start`)."""
+    def closure(self, start: str, keys: tuple, strong_keys: tuple) -> set:
+        """Transitive closure over the given relation keys. Returns the members (without `start`); every member is loaded (completeness) and recorded for the hash."""
         seen, todo = set(), [(start, "")]
         while todo:
             u, via = todo.pop()
             p = self.props(u, via, strong=True)
             if p is None:
                 continue
-            if u not in self.res.frag:
-                self.check_member(u, p, via)
+            self.record(u, p)
             for k in keys:
                 for v in p.get(k, []):
                     if v in seen or v == start:
@@ -178,21 +225,19 @@ def resolve(provider: Callable[[str], dict | None], unit: str, action: str, *, j
     if root is None:
         res.hits.append(Hit(unit, "requested unit is not loaded"))
         return res
-    w.check_member(unit, root, "requested unit")
+    w.record(unit, root)
 
     def start_sets():
-        F = w.closure(unit, FORWARD, STRONG, "forward")
-        # sockets/timers: whatever they trigger is activated later
-        for u in {unit} | F:
+        F = w.closure(unit, FORWARD, STRONG)
+        for u in {unit} | F:                                       # sockets/timers: whatever they trigger is activated later
             p = w.props(u, "", strong=False)
             if p:
                 for t in p.get("Triggers", []):
                     if w.props(t, f"{u} —Triggers→ {t}", strong=False) is not None:
                         F.add(t)
-                        F |= w.closure(t, FORWARD, STRONG, "forward")
-        members = {unit} | F
+                        F |= w.closure(t, FORWARD, STRONG)
         C = set()
-        for u in members:
+        for u in {unit} | F:
             p = w.props(u, "", strong=False)
             if not p:
                 continue
@@ -200,48 +245,65 @@ def resolve(provider: Callable[[str], dict | None], unit: str, action: str, *, j
                 q = w.props(v, f"{u} —Conflicts→ {v}", strong=False)
                 if q is not None and q.get("LoadState") == "loaded":
                     C.add(v)
-                    w.check_member(v, q, f"{u} —Conflicts→ {v}")
+                    w.record(v, q)
         S = set()
         for c in C:
-            S |= w.closure(c, REVERSE_STOP, (), "stop")
+            S |= w.closure(c, REVERSE_STOP, ())
         return F, C, S
 
-    def stop_set(u):
-        return w.closure(u, REVERSE_STOP, (), "stop")
+    effect: dict[str, str] = {}                                    # member -> why the transaction changes it (the edge text of the hit)
+
+    def mark(names, why, only_active=None):
+        for n in names:
+            if only_active is None or w.is_active(n) == only_active:
+                effect.setdefault(n, why)
 
     if action in ("start", "try-restart", "reload-or-restart"):
         res.F, res.C, res.S = start_sets()
+        mark({unit}, "requested unit")
+        mark(res.F, "would be started (inactive dependency)", only_active=False)
+        mark(res.C, "would be stopped (conflict)", only_active=True)
+        mark(res.S, "would be stopped (stop-closure of a conflict)", only_active=True)
     elif action == "stop":
-        res.S = stop_set(unit)
+        res.S = w.closure(unit, REVERSE_STOP, ())
+        mark({unit}, "requested unit")
+        mark(res.S, "would be stopped (stop-closure)", only_active=True)
     elif action == "restart":
-        res.S = stop_set(unit)
+        stop = w.closure(unit, REVERSE_STOP, ())
         F, C, S = start_sets()
-        res.F, res.C, res.S = F, C, res.S | S
-        for u in {unit}:
-            p = w.props(u, "", strong=False)
-            for v in (p or {}).get("ConsistsOf", []):
-                res.X.add(v)
+        res.F, res.C, res.S = F, C, stop | S
+        res.X = set(root.get("ConsistsOf", []))
+        for v in res.X:
+            q = w.props(v, f"{unit} —ConsistsOf→ {v}", strong=False)
+            if q is not None:
+                w.record(v, q)
+        mark({unit}, "requested unit")
+        mark(F, "would be started (inactive dependency)", only_active=False)
+        mark(C, "would be stopped (conflict)", only_active=True)
+        mark(res.S, "would be stopped/restarted (stop-closure)", only_active=True)
+        mark(res.X, "restarted with it (PartOf)", only_active=True)
     elif action == "reload":
-        p = root
-        for v in p.get("PropagatesReloadTo", []):
-            if w.props(v, f"{unit} —PropagatesReloadTo→ {v}", strong=False) is not None:
+        for v in root.get("PropagatesReloadTo", []):
+            q = w.props(v, f"{unit} —PropagatesReloadTo→ {v}", strong=False)
+            if q is not None:
                 res.X.add(v)
-                w.check_member(v, w.props(v, "", strong=False), f"{unit} —PropagatesReloadTo→ {v}")
-    else:                                                         # enable disable mask unmask: boot-time effect + the stop-closure of a running unit
+                w.record(v, q)
+        mark({unit}, "requested unit")
+        mark(res.X, "reloaded with it", only_active=True)
+    else:                                                          # enable disable mask unmask: boot-time effect + the stop-closure of a running unit
         for k in ("WantedBy", "RequiredBy", "UpheldBy"):
             for v in root.get(k, []):
                 q = w.props(v, f"{unit} —{k}→ {v}", strong=False)
                 if q is not None:
                     res.X.add(v)
-                    w.check_member(v, q, f"{unit} —{k}→ {v}")
+                    w.record(v, q)
+        mark({unit}, "requested unit")
+        mark(res.X, "its boot-time start set changes", only_active=None)
         if action in ("disable", "mask"):
-            res.S = stop_set(unit)
-    # every member found by a closure was checked when it was walked; sets that were filled directly are checked here too
-    for name in sorted(res.members):
-        if name not in res.frag:
-            p = w.props(name, "", strong=False)
-            if p:
-                w.check_member(name, p, "")
+            res.S = w.closure(unit, REVERSE_STOP, ())
+            mark(res.S, "would be stopped (stop-closure)", only_active=True)
+    for name in sorted(effect):
+        w.check_effect(name, effect[name])
     seen, uniq = set(), []
     for h in res.hits:
         if (h.unit, h.reason, h.edge) not in seen:
