@@ -137,7 +137,8 @@ def test_a_client_that_does_not_read_its_reply_cannot_pin_a_thread(serve, monkey
     s.connect(e.paths.socket)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
     s.sendall(canon.canonical({"req": "status"}) + b"\n")                                      # ... and never reads
-    waitfor(lambda: srv._sems["root"]._value == server_mod.ROOT_CONNECTIONS, "the stuck sender to be released", 10)
+    waitfor(lambda: srv._sems["root"]._value == server_mod.ROOT_CONNECTIONS - 1, "the connection to take its slot", 5)
+    waitfor(lambda: srv._sems["root"]._value == server_mod.ROOT_CONNECTIONS, "the stuck sender to be released", 10)         # only the send timeout can do that
     s.close()
 
 

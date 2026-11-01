@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import time
+import uuid
 
 import pytest
 from audit_helpers import AGENT_UID
@@ -467,6 +468,25 @@ def test_two_jobs_cannot_both_pass_the_busy_check_and_both_start(privd_env):
     assert result(il.join("A"))["status"] in ("dry_run", "committed")
     assert len(starts) == 1 and starts[0].endswith(f"{job_a['job_id']}-1.service") or job_a["job_id"] in starts[0], starts
     assert job_b["job_id"] not in " ".join(starts)
+
+
+def test_a_target_locked_between_the_early_check_and_the_start_stops_the_start(privd_env):
+    """The early target-lock check (step 16) passes; an indeterminate job locks the target before the transition to `started`; the check INSIDE the transition must refuse."""
+    from g28_race import Interleaver, hook_before
+    e = privd_env.ready()
+    starts = []
+    real = e.backend.start
+    e.backend.start = lambda *a: starts.append(a) or real(*a)
+    il = Interleaver()
+    hook_before(e.ledger, "mark_started", il, "A.pre", only_thread="A")
+    env, job = e.job_env(dry_run=True)
+    il.start("A", lambda: e.call("exec", {"job": env}))
+    il.wait_parked("A.pre")
+    e.ledger.lock_target("selftest.noop", str(uuid.uuid4()), "indeterminate", e.clock())            # ... another job just became indeterminate on this target
+    il.release("A.pre")
+    res = result(il.join("A"))
+    assert res["status"] == "denied" and res["reason_code"] == "DENY_TARGET_LOCKED" and not starts
+    assert e.ledger.get(job["job_id"]).state == "denied_retryable"
 
 
 def test_a_job_denied_after_its_work_directory_exists_succeeds_when_it_is_redelivered(privd_env):
