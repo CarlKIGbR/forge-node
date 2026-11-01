@@ -956,7 +956,8 @@ def test_changing_commands_hold_a_lock_and_survive_every_catchable_stop_signal_w
     sigs = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2)
     with sw.locked():
         for sg in sigs:
-            os.kill(os.getpid(), sg)                                                         # round 3: SIGQUIT/SIGUSR1/SIGUSR2 used to kill a switch half way
+            assert callable(signal.getsignal(sg)), sg                                        # a handler is installed (round 3: SIGQUIT/SIGUSR1/SIGUSR2 used to kill a switch half way). (Not os.kill:
+            os.kill(os.getpid(), sg)                                                         # the suite runs as pid 1 of its container, which the kernel never kills with a default-action signal)
         child = subprocess.run([sys.executable, "-c", "import signal,sys; sys.exit(0 if all(signal.getsignal(s) != signal.SIG_IGN for s in (1,2,15,3,10,12)) else 1)"], check=False)
         assert child.returncode == 0                                                         # children do not inherit an ignored disposition
         fd = os.open(env.lock_path, os.O_RDWR)
