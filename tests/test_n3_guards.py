@@ -124,6 +124,39 @@ def test_g27_the_static_check_fails_on_a_new_unguarded_entry_point_even_a_condit
     assert not rep.ok and any("counted 10" in p for p in rep.problems)                      # a new guarded entry point still has to be counted by a reviewer
 
 
+def _transport_effects(src: str) -> list:
+    """Calls in the Server methods that are NOT the nine handlers (dispatch, serve_connection, serve, peer_of, stop) that could be an effect or could reach privd's state: the transport
+    may parse, route to a handler by name and read the clock - nothing else."""
+    import ast
+    import re
+    tree = ast.parse(src)
+    out = []
+    for cls in (n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Server"):
+        for fn in (n for n in cls.body if isinstance(n, ast.FunctionDef) and not n.name.startswith("handle_")):
+            for c in ast.walk(fn):
+                if isinstance(c, ast.Call):
+                    name = ast.unparse(c.func)
+                    if name.rsplit(".", 1)[-1] in EFFECTS + ("gate",) and name not in ("self.stop", "self._stop.set") and not name.startswith("threading.Thread(") or re.match(r"self\.ctx\.(ledger|backend|priv_log|agent_log|policies|leases|paths|optable)\b", name):
+                        out.append((fn.name, name))
+    return out
+
+
+def test_g27_the_transport_between_the_socket_and_the_handlers_has_no_effect_of_its_own(tmp_path):
+    """Review M8: the counted entry points are the handle_* methods; dispatch/serve_connection sit between the socket and them and are not counted. They must contain no effect and no
+    access to privd's state (a new branch in dispatch that starts a unit would otherwise pass the entry-point count). Mutation proof included."""
+    src = (PRIVD / "server.py").read_text()
+    assert _transport_effects(src) == []
+    mutated = src.replace("            body = {k: v for k, v in doc.items() if k != \"req\"}", "            body = {k: v for k, v in doc.items() if k != \"req\"}\n            if kind == 'x':\n                self.ctx.backend.start('x', {}, [])")
+    assert mutated != src and _transport_effects(mutated) == [("dispatch", "self.ctx.backend.start")]
+    needle = "            return canon.canonical(getattr(self, name)(peer, body)) + b\"\\n\""
+    mutated2 = src.replace(needle, "            self.ctx.ledger.finish('j', 1, 'failed', {}, None)\n" + needle)
+    assert mutated2 != src and _transport_effects(mutated2)
+    # startup recovery is not a request path: it is called from the daemon's main() before the socket exists, and from nowhere else in the package
+    import re
+    callers = sorted(f.name for f in PRIVD.glob("*.py") if re.search(r"\brecover_all\(", f.read_text()) and f.name != "reconcile.py")
+    assert callers == ["main.py"]
+
+
 def test_every_op_table_entry_dispatches_through_gate():
     """No code path from the socket to an op script that skips gate(): the only callers of the unit start for an op are in gate.py, and `reconcile.py` never starts a worker."""
     import ast

@@ -99,6 +99,7 @@ class Context:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     monitors: list = field(default_factory=list)
     denial_window: list = field(default_factory=lambda: [0.0, 0, 0])      # [window start, written, suppressed]
+    worker_started: dict = field(default_factory=dict)                    # (job_id, attempt) -> ctx.monotonic() when this process started the unit (a wall clock that jumps must not shorten a worker's budget)
 
     def now(self) -> datetime:
         return self.clock()

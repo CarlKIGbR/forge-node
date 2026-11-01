@@ -25,3 +25,5 @@ FragmentPath=/usr/lib/systemd/system/docker.service
 DropInPaths=
 OnSuccessJobMode=fail
 OnFailureJobMode=replace
+RequisiteOf=
+StopWhenUnneeded=no

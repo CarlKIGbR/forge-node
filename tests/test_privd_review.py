@@ -252,3 +252,97 @@ def test_selfcheck_audit_reads_the_live_logs_and_leaves_no_trace_in_them(privd_e
         fd = os.open(f, os.O_RDONLY)
         fsflags.clear_flags(fd, fsflags.IMMUTABLE)
         os.close(fd)
+
+
+# ----------------------------------------------------------------------------------------------------------- G28: fresh evidence (policy)
+def test_a_policy_change_between_started_and_the_unit_start_is_seen(privd_env):
+    """Review: _fresh_stop_check re-read only LOCAL_STOP and the lease. A policy applied meanwhile that disables the op, makes it dry-run-only or revokes the hub gate key must stop the
+    start of the (irreversible) unit."""
+    from g28_race import Interleaver, hook_after
+    e = privd_env.ready()
+    starts = []
+    real = e.backend.start
+    e.backend.start = lambda *a: starts.append(a) or real(*a)
+    good = [{"op": "selftest.noop", "mode": "enforce"}]
+    other_key = [{"id": "hub-gate-2", "pub": e.gate_key["pub"], "not_after": "2099-12-31"}]
+    cases = (("DENY_TIER_DISABLED", dict(t1_ops=[])),                                                       # the op is no longer enabled
+             ("DENY_TIER_DISABLED", dict(t1_ops=[{"op": "selftest.noop", "mode": "dry_run_only"}])),         # the apply may only dry-run now
+             ("DENY_STALE_LEASE", dict(t1_ops=good, gate_keys=other_key)))                                   # hub-gate-1 is revoked: the stored lease no longer verifies
+    serial = 10
+    for n, (code, change) in enumerate(cases):
+        serial += 2
+        e.clock.advance(seconds=61)
+        assert e.install(serial=serial, t1_ops=good)["ok"] and e.put_lease(seq=100 + 10 * n)["ok"]
+        plan = result(e.exec(dry_run=True)[0])
+        e.clock.advance(seconds=61)
+        assert e.put_lease(seq=105 + 10 * n)["ok"]
+        il = Interleaver()
+        hook_after(e.ledger, "mark_started", il, "A.started", only_thread="A")
+        env, job = e.job_env(plan_hash=plan["plan_hash"])
+        before = len(starts)
+        il.start("A", lambda: e.call("exec", {"job": env}))
+        il.wait_parked("A.started")
+        r = e.install(serial=serial + 1, **change)
+        assert r["ok"], r
+        il.release("A.started")
+        res = result(il.join("A"))
+        del e.ledger.mark_started                                                                           # drop the instance hook again
+        assert res["reason_code"] == code, (n, res)
+        assert len(starts) == before, "the unit was started although the policy had changed"
+        assert e.ledger.get(job["job_id"]).state in ("denied", "denied_retryable")
+        serial += 1
+
+
+def test_a_policy_installed_while_the_audit_log_was_down_is_recorded_late_and_shown_in_status(privd_env):
+    e = privd_env.ready()
+    real = e.ctx.audit
+    broken = {"on": True}
+
+    def flaky(type_, fields):
+        if broken["on"] and type_ == "policy":
+            from forge_node.privd.core import Deny
+            raise Deny("DENY_AUDIT_DOWN", "down")
+        return real(type_, fields)
+    e.ctx.audit = flaky
+    r = e.install(serial=5, t1_ops=[{"op": "selftest.noop", "mode": "enforce"}])
+    assert r["ok"] and r["audit_seq"] is None
+    assert e.call("status", {})["status"]["policy_audit_pending"] is True
+    broken["on"] = False
+    r = e.install(serial=6, t1_ops=[{"op": "selftest.noop", "mode": "enforce"}])
+    assert r["ok"] and r["audit_seq"] is not None
+    pol = [x for x in e.priv_records() if x["type"] == "policy" and x.get("action") == "apply"]
+    assert [(x["serial"], x.get("late", False)) for x in pol][-2:] == [(5, True), (6, False)]
+    assert e.call("status", {})["status"]["policy_audit_pending"] is False
+
+
+def test_failures_of_the_op_itself_count_towards_the_circuit_not_only_worker_failures(privd_env):
+    from forge_node.privd.units import UnitError
+    e = privd_env.ready()
+    e.backend.start = lambda *a: (_ for _ in ()).throw(UnitError("systemd-run failed"))
+    for i in range(3):
+        e.clock.advance(seconds=61)
+        assert e.put_lease(seq=300 + i)["ok"]
+        res = result(e.exec(dry_run=True)[0])
+        assert res["reason_code"] == "FAIL_EXEC"
+    assert e.ledger.circuit("selftest.noop")["state"] == "open"
+
+
+def test_a_wall_clock_that_jumps_forward_does_not_make_a_live_worker_look_overdue(privd_env, monkeypatch):
+    """Review: reconcile measured the worker's time budget with the wall clock; a step forward stopped a worker that was still inside its budget."""
+    e = privd_env.ready()
+    jid = str(uuid.uuid4())
+    e.ledger.claim(jid, 1, "selftest.noop", "selftest.noop", "0" * 64, False, "meta", e.clock())
+    wd = Path(e.paths.work) / f"{jid}-1"
+    wd.mkdir(mode=0o700)
+    unit = op_unit_name(jid, 1)
+    e.ledger.mark_started(jid, 1, unit, str(wd), None, None, False, False, e.clock())
+    inv = e.backend.start(unit, {}, ["/bin/sleep", "30"])
+    e.ledger.set_invocation(jid, 1, inv, e.clock())
+    e.ctx.worker_started[(jid, 1)] = e.ctx.monotonic()                                         # what s_effect records when THIS process started the unit
+    e.clock.advance(seconds=3600)                                                              # NTP steps the wall clock an hour forward
+    kind, _ = reconcile.reconcile_job(e.ctx, jid)
+    assert kind == "in_progress" and e.backend.show(unit).is_active
+    e.ctx.worker_started.pop((jid, 1))                                                         # a restarted privd has no monotonic reference: it falls back to the wall clock
+    kind, _ = reconcile.reconcile_job(e.ctx, jid)
+    assert kind != "in_progress"
+    e.backend.stop(unit)

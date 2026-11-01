@@ -16,7 +16,7 @@ from privd_helpers import NOW, SRC
 from forge_node import canon, sshsig
 from forge_node.privd.policy_full import parse_full
 from forge_node.release import build, policies, units
-from forge_node.release.switcher import SWITCHER_API, Refused, Switcher, VERSION_RE, main as switcher_main
+from forge_node.release.switcher import SWITCHER_API, UNITS_START, UNITS_STOP, Refused, Switcher, VERSION_RE, main as switcher_main
 from forge_node.t0.policy import OWNER_PRINCIPAL
 
 SRC_ROOT = Path(SRC)
@@ -59,6 +59,9 @@ class Env:
         self.policy_dir = tmp / "policy"
         self.policy_dir.mkdir()
         self.ledger = tmp / "ledger.sqlite"
+        self.node_env = tmp / "node.env"
+        self.node_env.write_text("# written by the installer\nFORGE_NODE_NODE_ID=g2\nFORGE_NODE_HUB_HOST=192.168.10.4\n")
+        os.chmod(self.node_env, 0o644)
         self.calls = []
         self.doctor_ok = True
         self.self_path = tmp / "sbin" / "forge-node-release"
@@ -91,7 +94,7 @@ class Env:
         return res
 
     def switcher(self, **kw) -> Switcher:
-        args = dict(base=str(self.base), root="/opt/forge-node", ledger=str(self.ledger), signers=str(self.signers), policy_dir=str(self.policy_dir), ssh_keygen=shutil.which("ssh-keygen"),
+        args = dict(base=str(self.base), root="/opt/forge-node", ledger=str(self.ledger), signers=str(self.signers), policy_dir=str(self.policy_dir), node_env=str(self.node_env), ssh_keygen=shutil.which("ssh-keygen"),
                     run=self.run, self_path=str(self.self_path), owner_uid=0, out=self.out)
         args.update(kw)
         return Switcher(**args)
@@ -224,8 +227,8 @@ def test_release_switch_moves_agent_ops_units_together(env):
     env.calls.clear()
     assert sw.cmd_switch("0.3.1") == 0
     seq = [(c[1], c[2:]) for c in env.calls if c[0] == "/usr/bin/systemctl"]
-    assert seq[0] == ("stop", ["forge-node-agent.service"])                                  # quiesce first
-    assert seq[1] == ("stop", ["forge-node-privd.service", "forge-node-privd.socket", "forge-node-audit-rotate.timer"])
+    assert seq[0] == ("stop", list(UNITS_STOP))                                              # quiesce first: EVERYTHING that can create a ledger row, then the ledger is read
+    assert [c for c in seq if c[0] == "stop"] == [seq[0]]
     assert seq[-1] == ("start", ["forge-node-privd.socket", "forge-node-agent.service", "forge-node-audit-rotate.timer"])
     assert os.readlink(env.base / "current") == "releases/0.3.1" and os.readlink(env.base / "previous") == "releases/0.3.0"
     assert any("doctor" in c for c in env.calls)                                              # doctor ran after the switch, as forgenode
@@ -244,7 +247,7 @@ def test_a_failing_doctor_restores_the_previous_release_by_itself(env):
     assert sw.cmd_switch("0.3.1") == 1
     assert os.readlink(env.base / "current") == "releases/0.3.0"
     res = docs(env.out.getvalue())[-1]
-    assert res["restored"] == "0.3.0" and res["doctor"] == "failed" and res["switched"] is None
+    assert res["restored"] == "0.3.0" and res["failure"] == "doctor failed" and res["restored_doctor"] == "failed" and res["switched"] is None
 
 
 def test_rollback_refused_on_state_schema_outside_window(env):
@@ -273,8 +276,8 @@ def test_rollback_refused_while_ledger_nonterminal(env):
             sw.cmd_switch("0.3.1")
         assert os.readlink(env.base / "current") == "releases/0.3.0"
         stops = [c for c in env.calls if c[1:2] == ["stop"]]
-        assert stops == [["/usr/bin/systemctl", "stop", "forge-node-agent.service"]]          # the agent was stopped to freeze the ledger, found it non-terminal, and was started again
-        assert env.calls[-1] == ["/usr/bin/systemctl", "start", "forge-node-agent.service"]
+        assert stops == [["/usr/bin/systemctl", "stop", *UNITS_STOP]]                        # everything was stopped to freeze the ledger, found it non-terminal, and was started again
+        assert env.calls[-1] == ["/usr/bin/systemctl", "start", *UNITS_START]
     env.ledger.unlink()
     env.make_ledger(state="committed")                                                       # terminal rows do not block
     assert sw.cmd_switch("0.3.1") == 0
@@ -290,7 +293,7 @@ def test_the_ledger_is_reread_after_the_agent_is_stopped(env):
     real_run = env.run
 
     def run(argv, stdin, timeout):
-        if argv[:3] == ["/usr/bin/systemctl", "stop", "forge-node-agent.service"]:
+        if argv[:3] == ["/usr/bin/systemctl", "stop", "forge-node-agent.service"] and "forge-node-privd.service" in argv:
             c = sqlite3.connect(env.ledger)
             c.execute("INSERT INTO exec VALUES('late', 'started')")                          # the last in-flight delivery lands while the agent is being stopped
             c.commit()
@@ -471,7 +474,7 @@ def test_the_switcher_is_stdlib_only_and_independent_of_the_release_tree():
             assert n.level == 0, "relative import: the switcher must not depend on forge_node"
             mods.add((n.module or "").split(".")[0])
     assert mods <= {"hashlib", "json", "os", "re", "sqlite3", "stat", "subprocess", "sys", "tempfile"} and "forge_node" not in mods
-    assert len((SRC_ROOT / "forge_node" / "release" / "switcher.py").read_text().splitlines()) < 400        # "a few hundred lines"
+    assert len((SRC_ROOT / "forge_node" / "release" / "switcher.py").read_text().splitlines()) < 500        # "a few hundred lines"
 
 
 # --------------------------------------------------------------------------------------------------------------------- policy templates
@@ -503,3 +506,241 @@ def test_t0_templates_have_no_forge_roots_and_g2_g3_values_match_13d():
     assert (r3["path"], r3["size_bytes"], r3["min_free_bytes"]) == ("/var/lib/forge-node/data", 53687091200, 161061273600)
     d = (SRC_ROOT.parent / "docs" / "design" / "FORGE_NODE.md").read_text()
     assert "107374182400" in d and "53687091200" in d
+
+
+# ================================================================================================================= review findings
+def _systemctl_calls(env):
+    return [c[1:] for c in env.calls if c[0] == "/usr/bin/systemctl"]
+
+
+def test_doctor_runs_as_forgenode_with_the_node_env_and_the_after_switch_flag(env):
+    """Review B1: doctor ran with an empty environment, exited 2 without FORGE_NODE_NODE_ID, and so every switch (and every rollback) was undone. The call is now pinned."""
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    assert sw.cmd_switch("0.3.1") == 0
+    call = [c for c in env.calls if "doctor" in c][-1]
+    assert call[:5] == ["/usr/bin/runuser", "-u", "forgenode", "--", "/usr/bin/env"] and call[5] == "-i"
+    assert "FORGE_NODE_NODE_ID=g2" in call and "FORGE_NODE_HUB_HOST=192.168.10.4" in call
+    assert call[-5:] == ["/usr/bin/python3", "-I", "/opt/forge-node/current/forge-node.pyz", "doctor", "--after-switch"]
+    assert not [a for a in call if a.startswith("PYTHON")]                                  # nothing from the caller's environment leaks in
+
+
+@pytest.mark.parametrize("content,why", [(None, "cannot be read"), ("", "no FORGE_NODE_NODE_ID"), ("FORGE_NODE_HUB_HOST=1.2.3.4\n", "no FORGE_NODE_NODE_ID"),
+                                          ("FORGE_NODE_NODE_ID=g2\nPATH=/evil\n", "not understood"), ("FORGE_NODE_NODE_ID=g2 ; rm -rf /\n", "not understood"),
+                                          ("FORGE_NODE_NODE_ID=$(id)\n", "not understood")])
+def test_a_switch_without_a_usable_node_env_is_refused_before_anything_is_stopped(env, content, why):
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    if content is None:
+        env.node_env.unlink()
+    else:
+        env.node_env.write_text(content)
+    env.calls.clear()
+    with pytest.raises(Refused, match=why):
+        sw.cmd_switch("0.3.1")
+    assert not _systemctl_calls(env) and os.readlink(env.base / "current") == "releases/0.3.0"
+
+
+def test_a_failure_in_start_not_only_in_doctor_returns_to_the_previous_release(env):
+    """Review M6: only a doctor failure triggered the way back; a failing `start` left `current` moved and the agent stopped."""
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    real = env.run
+
+    def run(argv, stdin, timeout):
+        if argv[:2] == ["/usr/bin/systemctl", "start"] and os.readlink(env.base / "current").endswith("0.3.1"):
+            return 1, b"", b"Job for forge-node-privd.socket failed"
+        return real(argv, stdin, timeout)
+    sw.run = run
+    assert sw.cmd_switch("0.3.1") == 1
+    res = docs(env.out.getvalue())[-1]
+    assert os.readlink(env.base / "current") == "releases/0.3.0" and res["restored"] == "0.3.0" and "failed" in res["failure"] and res["restored_doctor"] == "ok"
+
+
+def test_when_the_way_back_fails_too_everything_is_stopped_and_the_exit_status_says_so(env):
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    env.doctor_ok = False
+    (env.base / "releases" / "0.3.0" / "bin" / "privctl").write_text("#!/bin/sh\necho tampered after install\n")      # the previous release no longer verifies
+    env.calls.clear()
+    assert sw.cmd_switch("0.3.1") == 3
+    res = docs(env.out.getvalue())[-1]
+    assert res["restored"] is None and "owner signature" not in res["restore_error"] and "differs from RELEASE.json" in res["restore_error"] and res["state"].startswith("STOPPED")
+    assert _systemctl_calls(env)[-1] == ["stop", *UNITS_STOP]                                # a quiet node, not a half-switched one
+
+
+@pytest.mark.parametrize("sabotage,why", [
+    ("profile_missing", "profile file is missing"),
+    ("policy_garbage", "cannot be read"),
+    ("policy_schema_string", "no integer schema"),
+    ("ledger_no_state_column", "no readable exec table"),
+    ("base_writable", "only root can write"),
+    ("releases_writable", "only root can write"),
+    ("signers_writable", "only root can write"),
+    ("signers_foreign", "only root can write"),
+    ("manifest_foreign", "only root can write"),
+    ("sig_hardlink", "only root can write"),
+])
+def test_missing_or_odd_state_is_a_refusal_never_a_skipped_check(env, sabotage, why):
+    """Review M8: a guard whose input is missing must refuse (fail closed), not pass."""
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    d = env.base / "releases" / "0.3.1"
+    if sabotage == "profile_missing":
+        (env.base / "profile").unlink()
+    elif sabotage == "policy_garbage":
+        (env.policy_dir / "policy-3.json").write_text("not json")
+    elif sabotage == "policy_schema_string":
+        (env.policy_dir / "policy-3.json").write_text('{"schema": "1"}')
+    elif sabotage == "ledger_no_state_column":
+        env.ledger.unlink()
+        c = sqlite3.connect(env.ledger)
+        c.execute("CREATE TABLE exec(job_id TEXT, status TEXT)")
+        c.execute("PRAGMA user_version=1")
+        c.commit()
+        c.close()
+    elif sabotage == "base_writable":
+        os.chmod(env.base, 0o777)
+    elif sabotage == "releases_writable":
+        os.chmod(env.base / "releases", 0o775)
+    elif sabotage == "signers_writable":
+        os.chmod(env.signers, 0o666)
+    elif sabotage == "signers_foreign":
+        os.chown(env.signers, 65534, 0)
+    elif sabotage == "manifest_foreign":
+        os.chown(d / "RELEASE.json", 65534, 0)
+    elif sabotage == "sig_hardlink":
+        os.link(d / "RELEASE.json.sig", env.tmp / "sig-copy")
+    env.calls.clear()
+    with pytest.raises(Refused, match=why):
+        sw.cmd_switch("0.3.1")
+    assert not _systemctl_calls(env) and os.readlink(env.base / "current") == "releases/0.3.0"
+
+
+def test_tree_checks_each_fail_on_their_own(env):
+    """Review M9: the hard-link, owner and sub-directory-mode checks passed their tests even when removed, because another check refused the same case first. Each case here is valid
+    in every other respect (listed, right content, root-owned where it is not the point)."""
+    env.release("0.3.0", "full")
+    sw = env.switcher()
+    d = env.base / "releases" / "0.3.0"
+    assert sw.cmd_check("0.3.0") == 0
+    # (a) a listed file that is a second name of an inode somewhere else: identical content, only the link count differs
+    f = d / "units" / "forge-node-agent.service"
+    data = f.read_bytes()
+    outside = env.tmp / "outside-copy"
+    outside.write_bytes(data)
+    f.unlink()
+    os.link(outside, f)
+    with pytest.raises(Refused, match="one link"):
+        sw.cmd_check("0.3.0")
+    f.unlink()
+    f.write_bytes(data)
+    os.chmod(f, 0o644)
+    assert sw.cmd_check("0.3.0") == 0
+    # (b) a listed file owned by somebody else
+    os.chown(f, 65534, 0)
+    with pytest.raises(Refused, match="only root can write"):
+        sw.cmd_check("0.3.0")
+    os.chown(f, 0, 0)
+    # (c) a sub-directory that others can write / that somebody else owns
+    os.chmod(d / "units", 0o775)
+    with pytest.raises(Refused, match="not root-controlled"):
+        sw.cmd_check("0.3.0")
+    os.chmod(d / "units", 0o755)
+    os.chown(d / "units", 65534, 0)
+    with pytest.raises(Refused, match="not root-controlled"):
+        sw.cmd_check("0.3.0")
+    os.chown(d / "units", 0, 0)
+    # (d) the release directory itself belongs to somebody else
+    os.chown(d, 65534, 0)
+    with pytest.raises(Refused, match="only root can write"):
+        sw.cmd_check("0.3.0")
+    os.chown(d, 0, 0)
+    assert sw.cmd_check("0.3.0") == 0
+
+
+def test_the_signature_check_tells_the_failures_apart(env):
+    """Review M9: `match="another release|profile mismatch"` could not tell which check fired."""
+    env.release("0.3.0", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.release("0.9.0", "t0")
+    with pytest.raises(Refused) as e:
+        sw.cmd_check("0.9.0")
+    assert str(e.value).startswith("profile mismatch")
+    shutil.move(env.base / "releases" / "0.9.0", env.base / "releases" / "0.9.9")
+    with pytest.raises(Refused) as e:
+        sw.cmd_check("0.9.9")
+    assert "names another release than its directory" in str(e.value)
+
+
+def test_install_first_masking_is_gone_each_guard_failure_is_checked_in_its_own_state(env):
+    """Review M9: a tampered release passed `install-first` only because 'already current' came first. Fresh node each time, tampered release, no other reason to refuse."""
+    env.release("0.3.0", "full")
+    (env.base / "releases" / "0.3.0" / "units" / "evil.service").write_text("[Service]\nExecStart=/bin/sh\n")
+    sw = env.switcher()
+    assert not os.path.lexists(env.base / "current")
+    with pytest.raises(Refused, match="not listed in RELEASE.json"):
+        sw.cmd_install_first("0.3.0")
+    assert not os.path.lexists(env.base / "current") and not (env.base / "profile").exists() and not _systemctl_calls(env)
+
+
+def test_self_update_never_leaves_a_moment_without_a_switcher(env, monkeypatch):
+    env.release("0.3.0", "full")
+    sw = env.switcher()
+    env.self_path.write_text("#!/bin/sh\necho old\n")
+    seen = []
+    real_rename = os.rename
+
+    def rename(a, b, *x, **k):
+        seen.append((str(a), str(b), env.self_path.exists(), Path(str(env.self_path) + ".prev").exists()))
+        return real_rename(a, b, *x, **k)
+    monkeypatch.setattr(os, "rename", rename)
+    real_replace = os.replace
+
+    def replace(a, b, *x, **k):
+        seen.append((str(a), str(b), env.self_path.exists(), Path(str(env.self_path) + ".prev").exists()))
+        return real_replace(a, b, *x, **k)
+    monkeypatch.setattr(os, "replace", replace)
+    assert sw.cmd_self_update("0.3.0") == 0
+    assert seen and all(exists for _, _, exists, _ in seen), seen                         # the switcher exists at every step
+    assert Path(str(env.self_path) + ".prev").read_text() == "#!/bin/sh\necho old\n"
+
+
+def test_the_build_does_not_depend_on_the_builders_umask(env):
+    import hashlib
+    digests = set()
+    for n, um in enumerate((0o022, 0o002, 0o077)):
+        old = os.umask(um)
+        try:
+            res = build.build_release("0.3.0", "full", env.tmp / f"um{n}", src_root=SRC_ROOT, sign=env.sign())
+        finally:
+            os.umask(old)
+        digests.add(res["manifest"]["files"]["forge-node.pyz"])
+        assert hashlib.sha256(Path(res["tar"]).read_bytes()).hexdigest() == res["sha256"]
+    assert len(digests) == 1, digests
+
+
+def test_t0_artifacts_contain_only_listed_privd_modules_and_every_module_is_classified():
+    """Review: the t0 exclusion was a deny-list; a future privd/ops_*.py would have shipped on g1/g4. Now an allow-list, and a new module must be classified by a reviewer."""
+    pkg = SRC_ROOT / "forge_node" / "privd"
+    modules = {p.name for p in pkg.glob("*.py")}
+    assert modules == set(build.T0_PRIVD_ALLOWED) | set(build.T0_PRIVD_EXCLUDED), sorted(modules - set(build.T0_PRIVD_ALLOWED) - set(build.T0_PRIVD_EXCLUDED))
+    t0 = {str(p.relative_to(SRC_ROOT / "forge_node")) for p in build.package_files(SRC_ROOT, "t0") if p.parent == pkg}
+    assert t0 == {f"privd/{n}" for n in build.T0_PRIVD_ALLOWED}
+    assert not (set(build.T0_PRIVD_ALLOWED) & set(build.T0_PRIVD_EXCLUDED))

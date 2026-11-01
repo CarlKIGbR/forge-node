@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 """forge-node-release: the version-independent release switcher (Design 13.E). Installed OUTSIDE the release tree (/usr/local/sbin/forge-node-release) because it must be able to
 switch ANY release, including a rollback to one older than itself. Stdlib only, no import from forge_node: it reads each release's RELEASE.json and drives units; nothing else.
 
@@ -8,9 +8,10 @@ One guard, verify_release(), stands in front of every command that changes anyth
   * the manifest names this release, the profile of the installed node, a switcher_api this switcher supports (else: 'run self-update'), a policy schema the INSTALLED policy fits,
     and a state-schema window that contains the ledger's PRAGMA user_version;
   * every file in the tree is listed with its sha256, nothing else is there, no symlinks, no hard links, nothing group/other-writable.
-`switch` additionally refuses while a ledger row is non-terminal (re-read after the agent has been stopped, immediately before `current` is moved), moves agent, privd, units and the op
-table together (they all live below `current`), starts, runs `doctor`, and goes back to the previous release by itself when doctor fails. It never edits, truncates or replaces the
-ledger, the logs or the policy."""
+`switch` additionally refuses while a ledger row is non-terminal (re-read after EVERYTHING that can create a row - agent, privd socket and service, the rotation timer - has been stopped,
+immediately before `current` is moved), moves agent, privd, units and the op table together (they all live below `current`), starts, runs `doctor --after-switch` and goes back to the
+previous release by itself when ANY step after the first change fails (not only doctor). If the way back fails too, everything is stopped (a quiet node, T0 off, nothing running that
+nobody has verified) and the exit status says so (3). It never edits, truncates or replaces the ledger, the logs or the policy."""
 import hashlib
 import json
 import os
@@ -28,6 +29,8 @@ NAMESPACE = "forge-node-release"
 NONTERMINAL = ("received", "started", "effect_done", "reconciling")
 PROFILES = ("full", "t0")
 UNITS_START = ("forge-node-privd.socket", "forge-node-agent.service", "forge-node-audit-rotate.timer")
+UNITS_STOP = ("forge-node-agent.service", "forge-node-audit-rotate.timer", "forge-node-audit-rotate.service", "forge-node-privd.socket", "forge-node-privd.service")
+ENV_LINE = re.compile(r"^(FORGE_NODE_[A-Z0-9_]{1,48})=([A-Za-z0-9._:/@+-]{0,256})\Z")
 
 
 class SwitchError(Exception):
@@ -46,23 +49,27 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def _read_nofollow(path: str, limit: int) -> bytes:
+def _read_nofollow(path: str, limit: int, owner_uid: int | None = None) -> bytes:
+    """Read a regular file without following a symlink. With `owner_uid`: also one link, that owner, not writable by group/others (checked on the open descriptor)."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
             raise Refused(f"{path}: not a regular file or too large")
+        if owner_uid is not None and (st.st_nlink != 1 or st.st_uid != owner_uid or st.st_mode & 0o022):
+            raise Refused(f"{path}: not a root-owned file with one link that only root can write")
         return os.read(fd, limit + 1)
     finally:
         os.close(fd)
 
 
 class Switcher:
-    def __init__(self, *, base: str, root: str, ledger: str, signers: str, policy_dir: str, ssh_keygen: str, run, self_path: str, owner_uid: int, out):
+    def __init__(self, *, base: str, root: str, ledger: str, signers: str, policy_dir: str, node_env: str, ssh_keygen: str, run, self_path: str, owner_uid: int, out):
         """base: /opt/forge-node as a filesystem path (a test passes a temp directory); root: the LOGICAL prefix units refer to ('/opt/forge-node'); ledger: ledger.sqlite;
-        signers: allowed_signers; policy_dir: the installed policies (schema check); run(argv, timeout_s) -> (rc, out, err); self_path: where this switcher is installed.
+        signers: allowed_signers; policy_dir: the installed policies (schema check); node_env: /etc/forge-node/node.env (what `doctor` needs, exactly as the agent unit gets it);
+        run(argv, stdin, timeout_s) -> (rc, out, err); self_path: where this switcher is installed.
         All required: there is no default that could stand in for a missing guard input."""
-        self.base, self.root, self.ledger, self.signers, self.policy_dir = base, root, ledger, signers, policy_dir
+        self.base, self.root, self.ledger, self.signers, self.policy_dir, self.node_env = base, root, ledger, signers, policy_dir, node_env
         self.ssh_keygen, self.run, self.self_path, self.owner_uid, self.out = ssh_keygen, run, self_path, owner_uid, out
 
     # ------------------------------------------------------------------------------------------------------------------------ paths
@@ -103,8 +110,10 @@ class Switcher:
                 ver = c.execute("PRAGMA user_version").fetchone()[0]
                 try:
                     n = c.execute(f"SELECT COUNT(*) FROM exec WHERE state IN ({','.join('?' * len(NONTERMINAL))})", NONTERMINAL).fetchone()[0]
-                except sqlite3.OperationalError:
-                    n = 0
+                except sqlite3.OperationalError as e:
+                    if ver == 0:
+                        return 0, 0                                     # a ledger file privd has not initialised yet
+                    raise Refused(f"ledger (schema {ver}) has no readable exec table ({e}): refusing to count 'no open rows'") from e
                 return ver, n
             finally:
                 c.close()
@@ -112,28 +121,37 @@ class Switcher:
             raise Refused(f"ledger unreadable ({e}): refusing to touch anything") from e
 
     def installed_policy_schema(self) -> int | None:
+        """Schema of the newest installed policy; None only when NO policy is installed (a fresh node). A policy that is there but cannot be read or has no schema is a refusal:
+        'unknown' must not pass a compatibility check."""
         try:
             names = [n for n in os.listdir(self.policy_dir) if re.match(r"^policy-[1-9][0-9]{0,8}\.json\Z", n)]
-        except OSError:
+        except FileNotFoundError:
             return None
+        except OSError as e:
+            raise Refused(f"policy directory unreadable ({e})") from e
         if not names:
             return None
         newest = max(names, key=lambda n: int(n[7:-5]))
         try:
-            doc = json.loads(_read_nofollow(os.path.join(self.policy_dir, newest), 256 * 1024))
-            return doc["schema"] if isinstance(doc.get("schema"), int) else None
-        except (OSError, ValueError, KeyError, SwitchError):
-            return None
+            doc = json.loads(_read_nofollow(os.path.join(self.policy_dir, newest), 256 * 1024, self.owner_uid))
+            schema = doc["schema"]
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            raise Refused(f"the installed policy {newest} cannot be read ({type(e).__name__}): refusing to judge compatibility") from e
+        if isinstance(schema, bool) or not isinstance(schema, int):
+            raise Refused(f"the installed policy {newest} has no integer schema")
+        return schema
 
     # ------------------------------------------------------------------------------------------------------------------------- guard
     def verify_release(self, ver: str) -> dict:
         """THE guard. Returns the verified manifest or raises Refused. Every effect of this program is behind a call to this function."""
         d = self.rel_dir(ver)
-        st = os.lstat(d) if os.path.lexists(d) else None
-        if st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != self.owner_uid or st.st_mode & 0o022:
-            raise Refused(f"release {ver}: not a root-owned directory that only root can write")
-        raw = _read_nofollow(os.path.join(d, "RELEASE.json"), 1 << 20)
-        sig = _read_nofollow(os.path.join(d, "RELEASE.json.sig"), 16 * 1024)
+        for anc in (self.base, os.path.join(self.base, "releases"), d):
+            st = os.lstat(anc) if os.path.lexists(anc) else None
+            if st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != self.owner_uid or st.st_mode & 0o022:
+                raise Refused(f"{anc}: not a root-owned directory that only root can write")
+        _read_nofollow(self.signers, 1 << 20, self.owner_uid)                       # the trust anchor itself: root-owned, one link, not writable by anyone else
+        raw = _read_nofollow(os.path.join(d, "RELEASE.json"), 1 << 20, self.owner_uid)
+        sig = _read_nofollow(os.path.join(d, "RELEASE.json.sig"), 16 * 1024, self.owner_uid)
         self._verify_signature(raw, sig)
         try:
             m = json.loads(raw)
@@ -147,6 +165,8 @@ class Switcher:
         if m["profile"] not in PROFILES:
             raise Refused("unknown profile")
         installed = self.installed_profile()
+        if installed is None and self.current() is not None:
+            raise Refused("a release is current but the node's profile file is missing or unreadable: refusing to compare against 'unknown'")
         if installed is not None and installed != m["profile"]:
             raise Refused(f"profile mismatch: this node is '{installed}', the release is '{m['profile']}'")
         ints = ("switcher_api", "state_min", "state_max", "policy_schema")
@@ -180,7 +200,9 @@ class Switcher:
 
     def _verify_tree(self, d: str, files: dict) -> None:
         seen = set()
-        for dirpath, dirnames, filenames in os.walk(d, followlinks=False):
+        def fail(e):
+            raise Refused(f"cannot scan the release tree ({e})")
+        for dirpath, dirnames, filenames in os.walk(d, followlinks=False, onerror=fail):
             for n in dirnames:
                 st = os.lstat(os.path.join(dirpath, n))
                 if stat.S_ISLNK(st.st_mode) or st.st_uid != self.owner_uid or st.st_mode & 0o022:
@@ -205,7 +227,7 @@ class Switcher:
 
     def installed_profile(self) -> str | None:
         try:
-            return _read_nofollow(self.profile_file, 16).decode().strip() or None
+            return _read_nofollow(self.profile_file, 16, self.owner_uid).decode().strip() or None
         except (OSError, SwitchError):
             return None
 
@@ -234,10 +256,14 @@ class Switcher:
 
     # --------------------------------------------------------------------------------------------------------------------- commands
     def show_status(self) -> int:
-        schema, open_rows = self.ledger_schema_and_open()
         rels = sorted(os.listdir(os.path.join(self.base, "releases"))) if os.path.isdir(os.path.join(self.base, "releases")) else []
-        self.say({"current": self.current(), "previous": self._link_target(self.previous_link), "profile": self.installed_profile(), "switcher_api": SWITCHER_API,
-                  "state_schema": schema, "non_terminal_rows": open_rows, "installed_policy_schema": self.installed_policy_schema(), "releases": rels})
+        doc = {"current": self.current(), "previous": self._link_target(self.previous_link), "profile": self.installed_profile(), "switcher_api": SWITCHER_API, "releases": rels}
+        for key, fn in (("ledger", lambda: dict(zip(("state_schema", "non_terminal_rows"), self.ledger_schema_and_open()))), ("installed_policy_schema", self.installed_policy_schema)):
+            try:
+                doc[key] = fn()
+            except Refused as e:
+                doc[key] = f"UNREADABLE: {e}"                                  # status reports it; every changing command refuses on it
+        self.say(doc)
         return 0
 
     def cmd_check(self, ver: str) -> int:
@@ -260,24 +286,58 @@ class Switcher:
         return 0
 
     def _quiesce_and_check_ledger(self) -> None:
-        self._systemctl("stop", "forge-node-agent.service")
-        _, n = self.ledger_schema_and_open()                           # re-read NOW, after the agent can no longer cause work (G28)
+        """Stop everything that can create or change a ledger row (agent, rotation timer and service, privd socket and service), THEN read the ledger (G28: the observation that decides
+        the switch is made after the last thing that could change it has stopped). Open rows: start everything again and refuse."""
+        self._systemctl("stop", *UNITS_STOP)
+        try:
+            _, n = self.ledger_schema_and_open()
+        except SwitchError:
+            self._systemctl("start", *UNITS_START)
+            raise
         if n:
-            self._systemctl("start", "forge-node-agent.service")
+            self._systemctl("start", *UNITS_START)
             raise Refused(f"{n} ledger row(s) are not terminal: a switch (or rollback) while an op is in flight would orphan its worker")
 
     def _activate(self, ver: str, m: dict) -> None:
         prev = self.current()
-        self._systemctl("stop", "forge-node-privd.service", "forge-node-privd.socket", "forge-node-audit-rotate.timer")
         if prev and prev != ver:
             self._repoint(self.previous_link, os.path.join("releases", prev))
         self._repoint(self.current_link, os.path.join("releases", ver))
         self._link_units(m)
         self._systemctl("start", *UNITS_START)
 
-    def _doctor(self) -> bool:
-        rc, out, err = self.run(["/usr/bin/runuser", "-u", "forgenode", "--", "/usr/bin/python3", "-I", f"{self.root}/current/forge-node.pyz", "doctor"], None, 300)
+    def doctor_env(self) -> list[str]:
+        """The environment `doctor` needs, from node.env exactly as the agent unit gets it (EnvironmentFile): only well-formed FORGE_NODE_* assignments; FORGE_NODE_NODE_ID is required.
+        Read BEFORE anything is changed, so a node without it is refused up front instead of failing doctor after the switch."""
+        try:
+            raw = _read_nofollow(self.node_env, 64 * 1024, self.owner_uid).decode("utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            raise Refused(f"{self.node_env} cannot be read ({type(e).__name__})") from e
+        env = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            mt = ENV_LINE.match(line)
+            if mt is None:
+                raise Refused(f"{self.node_env}: line not understood: {line[:40]!r}")
+            env.append(f"{mt.group(1)}={mt.group(2)}")
+        if not any(e.startswith("FORGE_NODE_NODE_ID=") for e in env):
+            raise Refused(f"{self.node_env} has no FORGE_NODE_NODE_ID")
+        return env
+
+    def _doctor(self, env: list[str]) -> bool:
+        argv = ["/usr/bin/runuser", "-u", "forgenode", "--", "/usr/bin/env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C", *env,
+                "/usr/bin/python3", "-I", f"{self.root}/current/forge-node.pyz", "doctor", "--after-switch"]
+        rc, out, err = self.run(argv, None, 300)
         return rc == 0
+
+    def _safe_stop(self) -> None:
+        """The way back failed: leave a quiet node (nothing unverified running) rather than a half-switched one."""
+        try:
+            self._systemctl("stop", *UNITS_STOP)
+        except SwitchError:
+            pass
 
     def cmd_switch(self, ver: str) -> int:
         m = self.verify_release(ver)
@@ -286,16 +346,29 @@ class Switcher:
             raise Refused("no release is current: use 'install-first'")
         if prev == ver:
             raise Refused("that release is already current")
+        env = self.doctor_env()
         self._quiesce_and_check_ledger()
-        self._activate(ver, m)
-        if self._doctor():
-            self.say({"switched": ver, "from": prev, "doctor": "ok"})
-            return 0
-        # doctor failed: back to the previous release (verified again - the guard is not skipped on the way back)
-        pm = self.verify_release(prev)
-        self._quiesce_and_check_ledger()
-        self._activate(prev, pm)
-        self.say({"switched": None, "attempted": ver, "restored": prev, "doctor": "failed", "restored_doctor": "ok" if self._doctor() else "failed"})
+        failure = None
+        try:
+            self._activate(ver, m)
+            if self._doctor(env):
+                self.say({"switched": ver, "from": prev, "doctor": "ok"})
+                return 0
+            failure = "doctor failed"
+        except (SwitchError, OSError) as e:
+            failure = f"{type(e).__name__}: {e}"
+        # ANY failure after the first change: back to the previous release (verified again - the guard is not skipped on the way back)
+        try:
+            pm = self.verify_release(prev)
+            self._quiesce_and_check_ledger()
+            self._activate(prev, pm)
+            restored = self._doctor(env)
+        except (SwitchError, OSError) as e:
+            self._safe_stop()
+            self.say({"switched": None, "attempted": ver, "failure": failure, "restored": None, "restore_error": f"{type(e).__name__}: {e}", "state": "STOPPED: nothing is running; "
+                      f"current -> {self.current()}; fix, then 'switch' or 'check' a release"})
+            return 3
+        self.say({"switched": None, "attempted": ver, "failure": failure, "restored": prev, "restored_doctor": "ok" if restored else "failed"})
         return 1
 
     def cmd_self_update(self, ver: str) -> int:
@@ -309,7 +382,11 @@ class Switcher:
         if hashlib.sha256(data).hexdigest() != m["files"]["sbin/forge-node-release"]:
             raise Refused("the release's switcher differs from its manifest")
         tmp = self.self_path + ".new"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o755)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o755)
         try:
             os.write(fd, data)
             os.fsync(fd)
@@ -317,7 +394,15 @@ class Switcher:
             os.close(fd)
         os.chmod(tmp, 0o755)
         if os.path.exists(self.self_path):
-            os.replace(self.self_path, self.self_path + ".prev")        # rollback of the switcher itself: mv forge-node-release.prev forge-node-release
+            # keep the old switcher as .prev WITHOUT a moment in which self_path does not exist: hard-link it under a temporary name, move that over .prev, then rename the new file
+            # over self_path (atomic). Rollback of the switcher itself: mv forge-node-release.prev forge-node-release
+            keep = self.self_path + ".prev.new"
+            try:
+                os.unlink(keep)
+            except FileNotFoundError:
+                pass
+            os.link(self.self_path, keep)
+            os.replace(keep, self.self_path + ".prev")
         os.rename(tmp, self.self_path)
         self.say({"switcher_updated_from_release": ver, "previous_kept_as": self.self_path + ".prev"})
         return 0
@@ -356,7 +441,7 @@ def production() -> int:
         sys.stderr.write("no ssh-keygen\n")
         return 2
     sw = Switcher(base="/opt/forge-node", root="/opt/forge-node", ledger="/var/lib/forge-node-priv/ledger.sqlite", signers="/etc/forge-node/allowed_signers",
-                  policy_dir="/etc/forge-node/policy", ssh_keygen=ssh_keygen, run=run_process, self_path="/usr/local/sbin/forge-node-release", owner_uid=0, out=sys.stdout)
+                  policy_dir="/etc/forge-node/policy", node_env="/etc/forge-node/node.env", ssh_keygen=ssh_keygen, run=run_process, self_path="/usr/local/sbin/forge-node-release", owner_uid=0, out=sys.stdout)
     return main(sys.argv[1:], sw)
 
 

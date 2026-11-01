@@ -16,6 +16,7 @@ from ..t0.runner import FIXED_PATH, RunnerError, trusted_binary
 from . import resolver
 from .client import PrivClient
 from .core import Context, Paths
+from .gate import flush_pending_policy_audit
 from .ledger import Ledger
 from .lease import LeaseStore
 from .optable import build_optable
@@ -106,6 +107,7 @@ def run_privd() -> int:
         sys.stderr.write(f"cannot start: {type(e).__name__}: {e}\n")
         return 2
     recover_all(ctx)
+    flush_pending_policy_audit(ctx)
     Server(ctx).serve(listener_from_systemd())
     return 0
 
@@ -127,6 +129,6 @@ def run_privctl(argv: list) -> int:
     sysctl = trusted_binary("systemctl")
     ctl = Ctl(euid=os.geteuid(), client=PrivClient(PATHS.socket, 0, 60), state_setup=ensure_state_dirs,
               admin_factory=lambda: (AuditAdmin(priv_spec(gid=gid, trust_anchor="/"), node, now), AuditAdmin(agent_spec(gid=gid, trust_anchor="/"), node, now)), ledger_path=PATHS.ledger, local_stop=PATHS.local_stop,
-              systemctl_provider=resolver.systemctl_provider(sysctl, run_process), protected_units=BUILTIN_PROTECTED_UNITS, protected_paths=BUILTIN_PROTECTED_PATHS,
+              systemctl_provider=resolver.systemctl_provider(sysctl, run_process), systemctl_text_provider=resolver.systemctl_text_provider(sysctl, run_process), protected_units=BUILTIN_PROTECTED_UNITS, protected_paths=BUILTIN_PROTECTED_PATHS,
               run_systemctl=lambda a: run_process([sysctl, *a], None, 60), clock=now, out=sys.stdout)
     return ctl_main(argv, ctl)

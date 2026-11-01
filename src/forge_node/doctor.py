@@ -16,7 +16,8 @@ from .privd.client import PrivClient, PrivUnavailable
 from .t0 import hardening
 from .t0.policy import PolicyError, load_installed
 
-PACE_S = 5.0                         # privd rate-limits selfchecks (12/min)
+PACE_S = 6.0                         # privd rate-limits selfchecks (12/min per caller uid); EVERY selfcheck request - the audit one included - is paced, 14 requests in all
+ENVIRONMENTAL = ("clock", "identity", "hub")      # facts about the node's surroundings: a hub outage or an NTP hiccup is not a reason to roll a release back
 
 
 def check(name: str, status: str, detail: str = "", **data) -> dict:
@@ -24,11 +25,14 @@ def check(name: str, status: str, detail: str = "", **data) -> dict:
 
 
 class Doctor:
-    def __init__(self, *, cfg: AgentConfig, clock, runner, ssh_keygen: str, priv: PrivClient, sleep, op_names, fs_stat=os.stat, mountinfo=None, out=sys.stdout):
-        """Everything external is injected (tests pass fakes; main() passes the real ones). `op_names` = the ops of this release's table for the policy's profile."""
+    def __init__(self, *, cfg: AgentConfig, clock, runner, ssh_keygen: str, priv: PrivClient, sleep, op_names, after_switch: bool, fs_stat=os.stat, mountinfo=None, out=sys.stdout):
+        """Everything external is injected (tests pass fakes; main() passes the real ones). `op_names` = the ops of this release's table for the policy's profile. `after_switch`: run by
+        the release switcher to decide whether to keep the new release - failures of ENVIRONMENTAL checks (clock, identity, hub) are reported as warnings then, everything that a release
+        can break (policy, privd, audit, forge root, every probe and op in its unit) still fails."""
         self.cfg, self.clock, self.runner, self.ssh_keygen, self.priv, self.sleep, self.op_names = cfg, clock, runner, ssh_keygen, priv, sleep, op_names
-        self.fs_stat, self.mountinfo, self.out = fs_stat, mountinfo, out
+        self.fs_stat, self.mountinfo, self.out, self.after_switch = fs_stat, mountinfo, out, after_switch
         self.policy = None
+        self._selfchecks = 0
 
     # ---- individual checks -------------------------------------------------------------------------------------------------------
     def clock_check(self) -> dict:
@@ -112,9 +116,16 @@ class Doctor:
         finally:
             c.close()
 
+    def _selfcheck(self, target: str, timeout=None):
+        """Every selfcheck request, paced: the first goes at once, each later one PACE_S after the previous (privd allows 12 per minute per caller)."""
+        if self._selfchecks:
+            self.sleep(PACE_S)
+        self._selfchecks += 1
+        return self.priv.request("selfcheck", {"target": target}, timeout) if timeout else self.priv.request("selfcheck", {"target": target})
+
     def audit_check(self) -> dict:
         try:
-            r = self.priv.request("selfcheck", {"target": "audit"})
+            r = self._selfcheck("audit")
         except PrivUnavailable as e:
             return check("audit", "fail", str(e))
         if not r.get("ok"):
@@ -179,11 +190,9 @@ class Doctor:
         """privd runs each probe's and each op's side-effect-free selfcheck inside its REAL transient unit."""
         targets = [f"probe:{p}" for p in sorted(hardening.RO_PROBES)] + [f"op:{o}" for o in sorted(self.op_names)]
         out = []
-        for i, t in enumerate(targets):
-            if i:
-                self.sleep(PACE_S)
+        for t in targets:
             try:
-                r = self.priv.request("selfcheck", {"target": t}, 150)
+                r = self._selfcheck(t, 150)
             except PrivUnavailable as e:
                 out.append(check(t, "fail", str(e)))
                 continue
@@ -197,6 +206,10 @@ class Doctor:
 
     def run(self) -> list[dict]:
         results = [self.clock_check(), self.identity_check(), self.policy_check(), self.privd_check(), self.hub_check(), self.audit_check(), *self.forge_root_check(), *self.unit_checks()]
+        if self.after_switch:
+            for r in results:
+                if r["check"] in ENVIRONMENTAL and r["status"] == "fail":
+                    r["status"], r["detail"] = "warn", ("environmental, not a reason to roll back: " + r["detail"])[:300]
         for r in results:
             self.out.write(json.dumps(r, sort_keys=True) + "\n")
         failed = [r["check"] for r in results if r["status"] == "fail"]
@@ -207,6 +220,10 @@ class Doctor:
 
 def main(argv=None) -> int:
     import time
+    args = list(sys.argv[2:] if argv is None else argv)
+    if args not in ([], ["--after-switch"]):
+        sys.stderr.write("usage: doctor [--after-switch]\n")
+        return 2
 
     from .privd.optable import build_optable
     from .profile import PROFILE
@@ -218,6 +235,6 @@ def main(argv=None) -> int:
         sys.stderr.write(f"doctor: {e}\n")
         return 2
     d = Doctor(cfg=cfg, clock=lambda: datetime.now(timezone.utc), runner=ReadOnlyRunner(), ssh_keygen=ssh_keygen, priv=PrivClient(cfg.priv_socket, cfg.owner_uid, 150), sleep=time.sleep,
-               op_names=build_optable(PROFILE).names(PROFILE))
+               op_names=build_optable(PROFILE).names(PROFILE), after_switch=bool(args))
     d.run()
     return 1 if d._failed else 0

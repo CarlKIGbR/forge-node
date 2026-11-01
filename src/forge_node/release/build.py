@@ -30,7 +30,11 @@ STATE_MIN, STATE_MAX = 1, 1
 POLICY_SCHEMA = 1
 EPOCH = 1_762_000_000                                       # fixed mtime (2025-11-01): reproducible archives
 EXCLUDE_DIRS = {"hub", "release", "__pycache__"}
-T0_EXCLUDE = {"privd/ops.py", "privd/opworker.py"}
+# A t0 artifact (g1/g4: no workloads, no mutating op) carries only the privd modules LISTED here; anything else - op code today, `ops_*.py` of N5-N7 tomorrow - is not in it unless a reviewer
+# adds it to this list. test_t0_artifacts_contain_only_listed_privd_modules_and_every_module_is_classified fails on a module that is in neither list.
+T0_PRIVD_ALLOWED = ("__init__.py", "__main__.py", "classes.py", "client.py", "core.py", "gate.py", "lease.py", "ledger.py", "main.py", "maintenance.py", "optable.py", "policy_full.py",
+                    "policy_store.py", "privctl.py", "reconcile.py", "resolver.py", "server.py", "units.py", "worker.py")
+T0_PRIVD_EXCLUDED = ("ops.py", "opworker.py")
 
 
 class BuildError(Exception):
@@ -49,7 +53,7 @@ def package_files(src_root: Path, profile: str) -> list[Path]:
         rel = p.relative_to(pkg)
         if any(part in EXCLUDE_DIRS for part in rel.parts) or str(rel) == "profile.py":
             continue
-        if profile == "t0" and str(rel) in T0_EXCLUDE:
+        if profile == "t0" and rel.parts[0] == "privd" and len(rel.parts) == 2 and rel.parts[1] not in T0_PRIVD_ALLOWED:
             continue
         out.append(p)
     return out
@@ -62,10 +66,12 @@ def build_zipapp(src_root: Path, profile: str, target: Path) -> None:
             dst = stage / "forge_node" / p.relative_to(src_root / "forge_node")
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(p, dst)
+            os.chmod(dst, 0o644)                                                   # the zip records the mode: the builder's umask must not reach the artifact
         (stage / "forge_node" / "profile.py").write_text(f'"""Build profile (written by the release builder)."""\nPROFILE = "{profile}"\n')
         # zipapp's own `main=` spec would call main() and DROP its return value (exit status 0 always): write the entry ourselves
         (stage / "__main__.py").write_text("import sys\nfrom forge_node.cli import main\n\nsys.exit(main())\n")
         for d in [stage, *stage.rglob("*")]:
+            os.chmod(d, 0o755 if d.is_dir() else 0o644)
             os.utime(d, (EPOCH, EPOCH))
         zipapp.create_archive(str(stage), str(target), compressed=False)
 

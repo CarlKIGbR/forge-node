@@ -9,11 +9,21 @@ and reports a PROTECTED HIT if a member the transaction would CHANGE is in the p
 missing property): an incomplete resolution is a hit (fail closed). `closure_sha256` binds the COMPLETE resolved sets AND each member's fragment/drop-in/On*= data, so a new drop-in or a new
 Conflicts= changes the hash (DENY_CLOSURE_CHANGED until the owner re-signs).
 
-STATE-AWARE EFFECT SET (refinement of the design text, found by the live check on carlgpu2 - see the N3 report): the literal rule 'any member of F is protected' denies EVERY real unit,
+STATE-AWARE EFFECT SET FOR DEPENDENCIES ONLY (refinement of the design text, found by the live check on carlgpu2 - see the N3 report): the literal rule 'any member of F is protected' denies EVERY real unit,
 because the forward closure of a service reaches sysinit.target, local-fs.target, -.slice ... and even the design's own example forge-edge.service (it `Requires=docker.service`). Starting a
-unit does nothing to a dependency that is already active; what a transaction changes is: the requested unit, forward members that are NOT active (they get started), conflicting units that ARE
-active (they get stopped) and the active members of the stop-closure. Protected-name/path hits, the 'no fragment' rule and the gate-C rule are evaluated on that effect set; completeness is
-required of the whole closure. A protected dependency that is INACTIVE (so the start would start it) is a hit.
+unit does nothing to a dependency that is already active; what a transaction changes is: the requested unit, forward members that are NOT active (they get started), and everything it
+would STOP. The relaxation applies to the START side only (an active dependency is left alone; if it is gone by the time of the start it merely gets started - the harmless direction).
+It does NOT apply to anything a transaction would STOP (conflicts, stop-closures, restart propagation, StopWhenUnneeded= dependencies): a protected member there is a hit whatever its state
+is NOW, because the resolution is made before the action and the state can change in between (the op must re-resolve inside its worker, under the effect lock, immediately before the
+systemctl call, and compare closure_sha256 - N6). Protected-name/path hits, the 'no fragment' rule and the gate-C rule are evaluated on the effect set; completeness is required of the
+whole closure. A protected dependency that is INACTIVE (so the start would start it) is a hit.
+
+ENABLE/DISABLE/MASK read the unit's [Install] section (`systemctl cat`): WantedBy=/RequiredBy=/UpheldBy= targets (whose boot-time start set changes), Alias= names (a symlink under a
+protected name) and Also= units (enabled together, resolved the same way) are part of the transaction; their names are checked against the protected set even when the target unit is not
+loaded. The text of the requested unit and of every unit the transaction changes (fragment AND drop-ins) is bound into the hash by sha256, not just their paths.
+
+MOUNT units are protected by what they mount: a .mount/.automount whose Where= is, or lies under, a protected path - or contains one - is a hit (srv-models.mount comes from a generator
+and matches neither a unit-name pattern nor a fragment path).
 
 GATE C (Betriebsleiter decision): this resolver does NOT follow OnSuccess=/OnFailure= edges or isolate-like job modes. Until it follows them recursively and binds them into the hash
 (N6/N7), it REJECTS - as a hit, like an incomplete resolution - any unit in the closure that uses OnSuccess=/OnFailure= (or an isolate OnSuccessJobMode=/OnFailureJobMode=), and any
@@ -33,12 +43,15 @@ ACTIONS = ("start", "stop", "restart", "try-restart", "reload", "reload-or-resta
 ALLOWED_JOB_MODES = ("replace", "fail")
 STRONG = ("Requires", "Requisite", "BindsTo")
 FORWARD = ("Requires", "Requisite", "BindsTo", "Wants", "Upholds")
-REVERSE_STOP = ("RequiredBy", "BoundBy", "ConsistsOf", "PropagatesStopTo")
-REL_PROPS = ("Requires", "Requisite", "BindsTo", "Wants", "Upholds", "Conflicts", "ConflictedBy", "RequiredBy", "BoundBy", "ConsistsOf", "PropagatesStopTo", "PropagatesReloadTo",
-             "PartOf", "Triggers", "TriggeredBy", "WantedBy", "UpheldBy")
+REVERSE_STOP = ("RequiredBy", "RequisiteOf", "BoundBy", "ConsistsOf", "PropagatesStopTo")
+REL_PROPS = ("Requires", "Requisite", "RequisiteOf", "BindsTo", "Wants", "Upholds", "Conflicts", "ConflictedBy", "RequiredBy", "BoundBy", "ConsistsOf", "PropagatesStopTo",
+             "PropagatesReloadTo", "PartOf", "Triggers", "TriggeredBy", "WantedBy", "UpheldBy")
 GATE_C_PROPS = ("OnSuccess", "OnFailure", "OnSuccessJobMode", "OnFailureJobMode")
-META_PROPS = ("Id", "LoadState", "ActiveState", "FragmentPath", "DropInPaths", "Names")
+META_PROPS = ("Id", "LoadState", "ActiveState", "FragmentPath", "DropInPaths", "Names", "StopWhenUnneeded")
 ALL_PROPS = REL_PROPS + GATE_C_PROPS + META_PROPS
+MOUNT_UNITS = (".mount", ".automount")
+INSTALL_KEYS = ("WantedBy", "RequiredBy", "UpheldBy", "Alias", "Also")
+MAX_ALSO = 16
 MAX_UNITS = 400
 
 
@@ -72,7 +85,7 @@ class Resolution:
         return {self.unit} | self.F | self.C | self.S | self.X
 
     def closure_sha256(self) -> str:
-        doc = {"v": 1, "unit": self.unit, "action": self.action, "F": sorted(self.F), "C": sorted(self.C), "S": sorted(self.S), "X": sorted(self.X),
+        doc = {"v": 2, "unit": self.unit, "action": self.action, "F": sorted(self.F), "C": sorted(self.C), "S": sorted(self.S), "X": sorted(self.X),
                "frag": {u: self.frag[u] for u in sorted(self.frag)}}
         return hashlib.sha256(canon.canonical(doc)).hexdigest()
 
@@ -111,10 +124,39 @@ class Incomplete(Exception):
     pass
 
 
+def _incomplete(name: str) -> dict:
+    """Placeholder for a unit that could not be enumerated: inert (a hit has been recorded), never mistaken for an active or a protected unit."""
+    return {"_incomplete": True, "ActiveState": "inactive", **{k: [] for k in REL_PROPS}, "OnSuccess": [], "OnFailure": [], "OnSuccessJobMode": "", "OnFailureJobMode": "",
+            "FragmentPath": "", "DropInPaths": "", "LoadState": "", "Names": [name], "StopWhenUnneeded": "no", "Where": ""}
+
+
+def parse_install(text: str) -> dict:
+    """The [Install] keys of a unit text (`systemctl cat` output: fragment and drop-ins). Continuation lines (trailing backslash) are joined; comments skipped."""
+    out: dict[str, set] = {k: set() for k in INSTALL_KEYS}
+    section, pending = "", ""
+    for raw in text.splitlines():
+        line = pending + raw.strip()
+        pending = ""
+        if line.endswith("\\"):
+            pending = line[:-1] + " "
+            continue
+        if not line or line[0] in "#;":
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line
+            continue
+        if section == "[Install]":
+            k, sep, v = line.partition("=")
+            if sep and k.strip() in out:
+                out[k.strip()] |= set(split_names(v))
+    return {k: sorted(v) for k, v in out.items()}
+
+
 class _Walker:
-    def __init__(self, provider: Callable[[str], dict | None], protected_units: tuple, protected_paths: tuple, res: Resolution):
-        self.provider, self.pu, self.pp, self.res = provider, protected_units, protected_paths, res
+    def __init__(self, provider: Callable[[str], dict | None], text_of: Callable[[str], str | None], protected_units: tuple, protected_paths: tuple, res: Resolution):
+        self.provider, self.text_of, self.pu, self.pp, self.res = provider, text_of, protected_units, protected_paths, res
         self.cache: dict[str, dict | None] = {}
+        self.texts: dict[str, str | None] = {}
         self.via: dict[str, str] = {}                              # how a unit was reached first (for the edge text of a hit)
 
     def props(self, name: str, edge: str, strong: bool = True) -> dict | None:
@@ -137,17 +179,19 @@ class _Walker:
     def _normalise(self, name: str, raw: dict | None, edge: str) -> dict | None:
         if raw is None:
             self.res.hits.append(Hit(name, "cannot be enumerated (systemctl show failed)", edge))
-            return {"_incomplete": True, "ActiveState": "inactive", **{k: [] for k in REL_PROPS}, "OnSuccess": [], "OnFailure": [], "OnSuccessJobMode": "", "OnFailureJobMode": "",
-                    "FragmentPath": "", "DropInPaths": "", "LoadState": "", "Names": [name]}
+            return _incomplete(name)
         if raw.get("LoadState") == "not-found":
             return {"_notfound": True}
         missing = [k for k in ALL_PROPS if k not in raw]
         if missing:
             self.res.hits.append(Hit(name, f"incomplete resolution: systemctl show lacks {missing[:3]}", edge))
-            return {"_incomplete": True, "ActiveState": "inactive", **{k: [] for k in REL_PROPS}, "OnSuccess": [], "OnFailure": [], "OnSuccessJobMode": "", "OnFailureJobMode": "",
-                    "FragmentPath": "", "DropInPaths": "", "LoadState": "", "Names": [name]}
+            return _incomplete(name)
+        if name.endswith(MOUNT_UNITS) and not raw.get("Where"):
+            self.res.hits.append(Hit(name, "incomplete resolution: a mount unit without Where=", edge))
+            return _incomplete(name)
         p = {k: split_names(raw[k]) for k in REL_PROPS}
         p.update({k: raw[k] for k in META_PROPS + GATE_C_PROPS if k not in ("Names",)})
+        p["Where"] = raw.get("Where", "")
         p["Names"] = split_names(raw["Names"])
         p["OnSuccess"], p["OnFailure"] = split_names(raw["OnSuccess"]), split_names(raw["OnFailure"])
         p["DropInPaths"] = " ".join(split_names(raw["DropInPaths"]))
@@ -163,6 +207,24 @@ class _Walker:
         if not p.get("_incomplete"):
             self.res.frag[name] = {"fragment": p.get("FragmentPath", ""), "dropins": sorted(p.get("DropInPaths", "").split()), "onsuccess": sorted(p["OnSuccess"]), "onfailure": sorted(p["OnFailure"])}
 
+    def text(self, name: str) -> str | None:
+        """`systemctl cat` of a unit (fragment and drop-ins); None is recorded as a hit - an effect whose text cannot be read cannot be bound into the hash."""
+        if name not in self.texts:
+            try:
+                t = self.text_of(name)
+            except Exception:  # noqa: BLE001
+                t = None
+            self.texts[name] = t
+            if t is None:
+                self.res.hits.append(Hit(name, "unit text cannot be read (systemctl cat failed)", self.via.get(name, "")))
+        return self.texts[name]
+
+    def check_name(self, name: str, why: str) -> None:
+        """A protected NAME is a hit even when no such unit is loaded (an Alias= or a WantedBy= target that does not exist yet is still a name under the protected set)."""
+        g = next((g for g in self.pu if fnmatchcase(name, g)), None)
+        if g:
+            self.res.hits.append(Hit(name, f"protected unit name ({g})", why))
+
     def check_effect(self, name: str, why: str) -> None:
         """Hits for a member the transaction would CHANGE: protected name or path, a loaded unit without any fragment, gate C (On*= / isolate job modes)."""
         edge = f"{self.via[name]}; {why}" if name in self.via else why
@@ -174,6 +236,15 @@ class _Walker:
             if g:
                 self.res.hits.append(Hit(name, f"protected unit ({g})", edge))
                 break
+        t = self.text(name)
+        if t is not None:
+            self.res.frag.setdefault(name, {})["text_sha256"] = hashlib.sha256(t.encode("utf-8", "replace")).hexdigest()
+        where = p.get("Where", "")
+        if where and name.endswith(MOUNT_UNITS):
+            for pp in self.pp:
+                if where == "/" or where == pp or where.startswith(pp.rstrip("/") + "/") or pp.startswith(where.rstrip("/") + "/"):
+                    self.res.hits.append(Hit(name, f"mounts {where}, which is or contains the protected path {pp}", edge))
+                    break
         frag, drop = p.get("FragmentPath", ""), p.get("DropInPaths", "")
         if not frag and p.get("LoadState") == "loaded":
             self.res.hits.append(Hit(name, "loaded unit without a fragment file cannot be enumerated", edge))
@@ -211,8 +282,8 @@ class _Walker:
         return seen
 
 
-def resolve(provider: Callable[[str], dict | None], unit: str, action: str, *, job_mode: str, protected_units: tuple, protected_paths: tuple) -> Resolution:
-    """All arguments required. `provider(name)` returns the `systemctl show` properties of one unit as {Key: 'value'} (None on failure)."""
+def resolve(provider: Callable[[str], dict | None], text_of: Callable[[str], str | None], unit: str, action: str, *, job_mode: str, protected_units: tuple, protected_paths: tuple) -> Resolution:
+    """All arguments required. `provider(name)` returns the `systemctl show` properties of one unit as {Key: 'value'} (None on failure); `text_of(name)` the `systemctl cat` text."""
     res = Resolution(unit, action)
     if action not in ACTIONS:
         res.hits.append(Hit(unit, f"unknown action {action!r}"))
@@ -220,7 +291,7 @@ def resolve(provider: Callable[[str], dict | None], unit: str, action: str, *, j
     if job_mode not in ALLOWED_JOB_MODES:
         res.hits.append(Hit(unit, f"job mode {job_mode!r} is not allowed (only replace/fail; isolate-like modes are rejected: gate C)"))
         return res
-    w = _Walker(provider, tuple(protected_units), tuple(protected_paths), res)
+    w = _Walker(provider, text_of, tuple(protected_units), tuple(protected_paths), res)
     root = w.props(unit, "requested unit")
     if root is None:
         res.hits.append(Hit(unit, "requested unit is not loaded"))
@@ -251,37 +322,51 @@ def resolve(provider: Callable[[str], dict | None], unit: str, action: str, *, j
             S |= w.closure(c, REVERSE_STOP, ())
         return F, C, S
 
+    def unneeded_deps(u: str) -> set:
+        """Dependencies of `u` with StopWhenUnneeded=yes: stopping `u` can make them unneeded and systemd stops them too. Over-approximated (whether anything else still needs them is not
+        asked): a protected one is a hit."""
+        out = set()
+        for d in w.closure(u, FORWARD, ()):
+            q = w.cache.get(d)
+            if q and not q.get("_incomplete") and not q.get("_notfound") and q.get("StopWhenUnneeded") == "yes":
+                out.add(d)
+        return out
+
     effect: dict[str, str] = {}                                    # member -> why the transaction changes it (the edge text of the hit)
 
     def mark(names, why, only_active=None):
+        """Members the transaction changes. `only_active=False`: only those that are INACTIVE now (the start side: an active dependency is left alone). Everything that would be STOPPED is
+        marked whatever its state is now (the state can change between this check and the action)."""
         for n in names:
             if only_active is None or w.is_active(n) == only_active:
                 effect.setdefault(n, why)
 
-    if action in ("start", "try-restart", "reload-or-restart"):
+    if action == "start":
         res.F, res.C, res.S = start_sets()
         mark({unit}, "requested unit")
         mark(res.F, "would be started (inactive dependency)", only_active=False)
-        mark(res.C, "would be stopped (conflict)", only_active=True)
-        mark(res.S, "would be stopped (stop-closure of a conflict)", only_active=True)
+        mark(res.C, "would be stopped (conflict)")
+        mark(res.S, "would be stopped (stop-closure of a conflict)")
     elif action == "stop":
-        res.S = w.closure(unit, REVERSE_STOP, ())
+        res.S = w.closure(unit, REVERSE_STOP, ()) | unneeded_deps(unit)
         mark({unit}, "requested unit")
-        mark(res.S, "would be stopped (stop-closure)", only_active=True)
-    elif action == "restart":
+        mark(res.S, "would be stopped (stop-closure / unneeded dependency)")
+    elif action in ("restart", "try-restart", "reload-or-restart"):          # try-restart / reload-or-restart act as a restart on an active unit: the union is resolved
         stop = w.closure(unit, REVERSE_STOP, ())
         F, C, S = start_sets()
         res.F, res.C, res.S = F, C, stop | S
         res.X = set(root.get("ConsistsOf", []))
+        if action == "reload-or-restart":
+            res.X |= {v for v in root.get("PropagatesReloadTo", []) if w.props(v, f"{unit} —PropagatesReloadTo→ {v}", strong=False) is not None}
         for v in res.X:
             q = w.props(v, f"{unit} —ConsistsOf→ {v}", strong=False)
             if q is not None:
                 w.record(v, q)
         mark({unit}, "requested unit")
         mark(F, "would be started (inactive dependency)", only_active=False)
-        mark(C, "would be stopped (conflict)", only_active=True)
-        mark(res.S, "would be stopped/restarted (stop-closure)", only_active=True)
-        mark(res.X, "restarted with it (PartOf)", only_active=True)
+        mark(C, "would be stopped (conflict)")
+        mark(res.S, "would be stopped/restarted (stop-closure)")
+        mark(res.X, "restarted/reloaded with it")
     elif action == "reload":
         for v in root.get("PropagatesReloadTo", []):
             q = w.props(v, f"{unit} —PropagatesReloadTo→ {v}", strong=False)
@@ -289,19 +374,50 @@ def resolve(provider: Callable[[str], dict | None], unit: str, action: str, *, j
                 res.X.add(v)
                 w.record(v, q)
         mark({unit}, "requested unit")
-        mark(res.X, "reloaded with it", only_active=True)
-    else:                                                          # enable disable mask unmask: boot-time effect + the stop-closure of a running unit
+        mark(res.X, "reloaded with it")
+    else:                                                          # enable disable mask unmask: boot-time effect (+ [Install]) and the stop-closure of a running unit
+        install: dict[str, dict] = {}
+        if action in ("enable", "disable"):
+            todo, seen_units = [unit], {unit}
+            while todo:
+                u = todo.pop()
+                t = w.text(u)
+                if t is None:
+                    continue
+                install[u] = parse_install(t)
+                for a in install[u]["Also"]:
+                    if a not in seen_units:
+                        if len(seen_units) >= MAX_ALSO:
+                            res.hits.append(Hit(a, "too many Also= units to enumerate", f"{u} —Also→ {a}"))
+                            continue
+                        seen_units.add(a)
+                        todo.append(a)
+                        q = w.props(a, f"{u} —Also→ {a}", strong=False)
+                        if q is not None:
+                            w.record(a, q)
+                            mark({a}, f"enabled/disabled together with it (Also= of {u})")
+                        else:
+                            w.check_name(a, f"{u} —Also→ {a}")
+            for u, inst in install.items():
+                res.frag.setdefault(u, {})["install"] = inst
+                for al in inst["Alias"]:
+                    w.check_name(al, f"{u} —Alias→ {al}")
+        boot_targets = set()
         for k in ("WantedBy", "RequiredBy", "UpheldBy"):
-            for v in root.get(k, []):
-                q = w.props(v, f"{unit} —{k}→ {v}", strong=False)
-                if q is not None:
-                    res.X.add(v)
-                    w.record(v, q)
+            boot_targets |= set(root.get(k, []))                 # symlinks that exist now (disable/mask remove them)
+            for u, inst in install.items():
+                boot_targets |= set(inst[k])                     # symlinks enable would create / disable would remove
+        for v in sorted(boot_targets):
+            w.check_name(v, f"{unit} —boot-time start set→ {v}")
+            q = w.props(v, f"{unit} —WantedBy/RequiredBy→ {v}", strong=False)
+            if q is not None:
+                res.X.add(v)
+                w.record(v, q)
         mark({unit}, "requested unit")
-        mark(res.X, "its boot-time start set changes", only_active=None)
+        mark(res.X, "its boot-time start set changes")
         if action in ("disable", "mask"):
-            res.S = w.closure(unit, REVERSE_STOP, ())
-            mark(res.S, "would be stopped (stop-closure)", only_active=True)
+            res.S = w.closure(unit, REVERSE_STOP, ()) | unneeded_deps(unit)
+            mark(res.S, "would be stopped (stop-closure / unneeded dependency)")
     for name in sorted(effect):
         w.check_effect(name, effect[name])
     seen, uniq = set(), []
@@ -316,12 +432,23 @@ def resolve(provider: Callable[[str], dict | None], unit: str, action: str, *, j
 _UNIT = re.compile(r"^(?:-\.(?:mount|slice)|[A-Za-z0-9:_@\\][A-Za-z0-9:_.@\\-]{0,255}\.(?:service|socket|timer|target|mount|path|slice|scope|automount|swap|device))\Z")
 
 
+def systemctl_text_provider(systemctl: str, run: Callable) -> Callable[[str], str | None]:
+    """`systemctl cat -- <unit>`: the fragment and every drop-in as the manager would read them. `run(argv, stdin, timeout_s) -> (rc, out, err)` is injected."""
+    def provider(name: str):
+        if not _UNIT.match(name):
+            return None
+        rc, out, _ = run([systemctl, "cat", "--no-pager", "--", name], None, 20)
+        return out.decode("utf-8", "replace") if rc == 0 else None
+    return provider
+
+
 def systemctl_provider(systemctl: str, run: Callable) -> Callable[[str], dict | None]:
     """Live provider: `systemctl show` on the live manager (drop-ins, templates and generated units are included). `run(argv, stdin, timeout_s) -> (rc, out, err)` is injected."""
     def provider(name: str):
         if not _UNIT.match(name):
             return None
-        rc, out, _ = run([systemctl, "show", "--no-pager", "-p", ",".join(ALL_PROPS), "--", name], None, 20)
+        props = ALL_PROPS + (("Where",) if name.endswith(MOUNT_UNITS) else ())
+        rc, out, _ = run([systemctl, "show", "--no-pager", "-p", ",".join(props), "--", name], None, 20)
         if rc != 0:
             return None
         d = {}

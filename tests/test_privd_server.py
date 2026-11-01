@@ -174,7 +174,7 @@ def make_ctl(e, euid=0, **kw):
     out = io.StringIO()
     calls = []
     ctl = privctl.Ctl(euid=euid, client=PrivClient(e.paths.socket, 0, 30), state_setup=lambda: None, admin_factory=lambda: (e.priv_log, e.agent_log), ledger_path=e.paths.ledger,
-                      local_stop=e.paths.local_stop, systemctl_provider=kw.get("provider", lambda n: None), protected_units=("kmu-*",), protected_paths=("/opt/kmu-ai",),
+                      local_stop=e.paths.local_stop, systemctl_provider=kw.get("provider", lambda n: None), systemctl_text_provider=kw.get("text_provider", lambda n: ""), protected_units=("kmu-*",), protected_paths=("/opt/kmu-ai",),
                       run_systemctl=lambda a: (calls.append(a) or (0, b"", b"")), clock=e.clock, out=out)
     return ctl, out, calls
 
@@ -270,7 +270,7 @@ def test_privctl_lockdown_audit_rotate_verify_and_closure(served):
     ctl2, out2, _ = make_ctl(e, provider=graph(U("forge-x.service", Wants="kmu-a.service"), U("kmu-a.service", ActiveState="inactive")))        # starting forge-x would start the protected unit
     assert privctl.main(["unit-closure", "forge-x.service", "start"], ctl2) == 1
     doc = json.loads(out2.getvalue())
-    assert doc["denied"] and doc["closure_sha256"] is None and any("kmu-a.service" in h for h in doc["hits"])
+    assert doc["denied"] and len(doc["closure_sha256"]) == 64 and any("kmu-a.service" in h for h in doc["hits"])      # the hash is shown for a denied closure too (T3 frozen_ack needs it)
     ctl3, out3, _ = make_ctl(e, provider=graph(U("forge-x.service", Wants="forge-w.service"), U("forge-w.service")))
     assert privctl.main(["unit-closure", "forge-x.service", "start"], ctl3) == 0 and len(json.loads(out3.getvalue())["closure_sha256"]) == 64
 
@@ -283,7 +283,7 @@ def test_privctl_audit_init_proves_the_filesystem_and_refuses_without_creating_a
     specs = make_specs(realfs)
     adm = (AuditAdmin(specs["priv"], NODE, lambda: __import__("privd_helpers").NOW), AuditAdmin(specs["agent"], NODE, lambda: __import__("privd_helpers").NOW))
     out = io.StringIO()
-    ctl = privctl.Ctl(euid=0, client=None, state_setup=lambda: None, admin_factory=lambda: adm, ledger_path="", local_stop="", systemctl_provider=None, protected_units=(),
+    ctl = privctl.Ctl(euid=0, client=None, state_setup=lambda: None, admin_factory=lambda: adm, ledger_path="", local_stop="", systemctl_provider=None, systemctl_text_provider=None, protected_units=(),
                       protected_paths=(), run_systemctl=None, clock=lambda: None, out=out)
     assert privctl.main(["audit-init"], ctl) == 0
     doc = json.loads(out.getvalue())

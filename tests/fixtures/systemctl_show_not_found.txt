@@ -25,3 +25,5 @@ FragmentPath=
 DropInPaths=
 OnSuccessJobMode=fail
 OnFailureJobMode=replace
+RequisiteOf=
+StopWhenUnneeded=no

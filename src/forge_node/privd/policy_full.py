@@ -25,6 +25,8 @@ _TOP = {"schema", "serial", "not_before", "node", "profile", "global_mode", "tie
 _PROT = {"paths", "units", "containers", "networks", "ports", "users", "gpu"}
 _ROOT = {"path", "quota_backend", "backing_image", "size_bytes", "log_budget_bytes", "min_free_bytes"}
 _T1 = {"label_selector", "stack_roots", "lint", "workloads_enabled", "vram_budget_mib", "vm_pool", "ops"}
+_T0 = {"units_for_logs", "cert_paths", "backup_units", "backup_dirs", "repos", "model_dirs"}
+_WINDOWS = {"blackout", "sunday_open"}
 _T2 = {"ops"}
 _T3 = {"manifests_enabled", "opaque_enabled"}
 _OPCFG = {"op", "mode", "requires", "rate", "window", "targets"}
@@ -108,6 +110,27 @@ def _closed(d, allowed: set, what: str):
     extra = set(d) - allowed
     if extra:
         _bad(f"{what}: unknown keys {sorted(extra)}")
+
+
+def _t1_shapes(t1: dict) -> None:
+    """The T1 workload fields have no executable meaning before N5; until then they are accepted only in a bounded, typed form (never an open-ended blob a later slice would have to
+    guess the meaning of)."""
+    if "label_selector" in t1 and (not isinstance(t1["label_selector"], str) or not re.match(r"^[A-Za-z0-9._/-]{1,128}\Z", t1["label_selector"])):
+        _bad("t1.label_selector must be a label name")
+    if "stack_roots" in t1:
+        sr = t1["stack_roots"]
+        if not isinstance(sr, list) or len(sr) > 16:
+            _bad("t1.stack_roots must be a list of at most 16 paths")
+        for i, p in enumerate(sr):
+            _norm_abs(p, f"t1.stack_roots[{i}]")
+    if "vram_budget_mib" in t1 and (isinstance(t1["vram_budget_mib"], bool) or not isinstance(t1["vram_budget_mib"], int) or not 0 <= t1["vram_budget_mib"] <= 1 << 20):
+        _bad("t1.vram_budget_mib must be 0..1048576")
+    for k in ("lint", "vm_pool"):
+        if k in t1:
+            o = t1[k]
+            if not isinstance(o, dict) or len(o) > 32 or any(not isinstance(a, str) or not re.match(r"^[a-z][a-z0-9_]{0,63}\Z", a) or isinstance(b, (dict, list)) or isinstance(b, str) and len(b) > 256
+                                                              or isinstance(b, float) for a, b in o.items()):
+                _bad(f"t1.{k} must be a flat object of at most 32 scalar settings")
 
 
 def _under(path: str, base: str) -> bool:
@@ -218,8 +241,11 @@ def parse_full(raw: bytes, *, expect_node: str, file_serial: int, now: datetime,
         roots.append(ForgeRoot(path, img, r["size_bytes"], r["log_budget_bytes"], r["min_free_bytes"]))
     if profile == "t0" and roots:
         _bad("profile t0 has no forge roots")
+    _closed(doc.get("t0", {}), _T0, "t0")
+    _closed(doc.get("windows", {}), _WINDOWS, "windows")
     t1 = doc.get("t1", {})
     _closed(t1, _T1, "t1")
+    _t1_shapes(t1)
     wl = t1.get("workloads_enabled", False)
     if not isinstance(wl, bool):
         _bad("t1.workloads_enabled must be a boolean")

@@ -52,6 +52,17 @@ def test_unknown_keys_are_rejected_at_every_level():
     bad("unknown keys", protected={"paths": [], "wat": []})
     bad("unknown keys", circuit={"fail_threshold": 3, "x": 1})
     bad("unknown keys", t1_ops=[{"op": "selftest.noop", "sudo": True}])
+    bad("unknown keys", t0={"units_for_logs": [], "bogus": []})                                  # review: t0 and windows were open
+    bad("unknown keys", windows={"blackout": "02:00-05:45", "sunday_open": "06:00", "bogus": "x"})
+
+
+def test_t1_workload_fields_are_typed_and_bounded_even_before_they_mean_anything():
+    ok = {"workloads_enabled": False, "ops": [], "label_selector": "forge.managed", "stack_roots": ["/srv/forge/stacks"], "vram_budget_mib": 0, "lint": {"allow_root": False, "max_pids": 512}}
+    parse(t1=ok)
+    for patch in ({"label_selector": "has space"}, {"label_selector": 5}, {"stack_roots": ["rel/path"]}, {"stack_roots": "x"}, {"vram_budget_mib": -1}, {"vram_budget_mib": True},
+                  {"lint": {"bogus": {"nested": 1}}}, {"lint": {"bad key": 1}}, {"lint": []}, {"lint": {"a": 1.5}}, {"lint": {f"k{i}": 1 for i in range(40)}}):
+        with pytest.raises(PolicyError):
+            parse(t1={**ok, **patch})
 
 
 def test_policy_schema_rejects_apt_apply_op_or_flag():

@@ -46,11 +46,11 @@ class Ctl:
     """Everything a command needs, injected: nothing is read from the environment inside a command."""
 
     def __init__(self, *, euid: int, client: PrivClient, state_setup, admin_factory, ledger_path: str, local_stop: str,
-                 systemctl_provider, protected_units: tuple, protected_paths: tuple, run_systemctl, clock, out):
+                 systemctl_provider, systemctl_text_provider, protected_units: tuple, protected_paths: tuple, run_systemctl, clock, out):
         """state_setup(): create the root-only state directories (audit-init only). admin_factory() -> (priv AuditAdmin, agent AuditAdmin): built when a command needs them, because
         before audit-init the directories they open do not exist."""
         self.euid, self.client, self.state_setup, self.admin_factory = euid, client, state_setup, admin_factory
-        self.ledger_path, self.local_stop, self.systemctl_provider = ledger_path, local_stop, systemctl_provider
+        self.ledger_path, self.local_stop, self.systemctl_provider, self.systemctl_text_provider = ledger_path, local_stop, systemctl_provider, systemctl_text_provider
         self.protected_units, self.protected_paths, self.run_systemctl, self.clock, self.out = protected_units, protected_paths, run_systemctl, clock, out
 
     def emit(self, doc) -> None:
@@ -131,8 +131,9 @@ class Ctl:
     def cmd_unit_closure(self, unit: str, action: str) -> int:
         """The closure_sha256 the owner puts into the policy for a unit.* target, computed from the live unit graph by the resolver the node itself uses."""
         require_root(self.euid)
-        r = resolver.resolve(self.systemctl_provider, unit, action, job_mode="replace", protected_units=self.protected_units, protected_paths=self.protected_paths)
-        self.emit({"unit": unit, "action": action, "denied": r.denied, "hits": [h.text() for h in r.hits], "closure_sha256": None if r.denied else r.closure_sha256(),
+        r = resolver.resolve(self.systemctl_provider, self.systemctl_text_provider, unit, action, job_mode="replace", protected_units=self.protected_units, protected_paths=self.protected_paths)
+        # the hash is printed for a denied closure too (the owner needs it to acknowledge a known hit - T3 frozen_ack); `denied` and `hits` say that it must not be used as an ordinary target
+        self.emit({"unit": unit, "action": action, "denied": r.denied, "hits": [h.text() for h in r.hits], "closure_sha256": r.closure_sha256(),
                    "F": sorted(r.F), "C": sorted(r.C), "S": sorted(r.S), "X": sorted(r.X)})
         return 1 if r.denied else 0
 

@@ -154,7 +154,11 @@ def reconcile_locked(ctx: Context, job_id: str) -> tuple[str, dict | None]:
     if ex.kind == "active":
         started = protocol.parse_ts(row.worker_started_at) if row.worker_started_at else None
         limit = entry.timeout_s if entry else 30
-        if started is None or (ctx.now() - started).total_seconds() < limit:
+        mono = ctx.worker_started.get((row.job_id, row.attempt))
+        elapsed = None if started is None else (ctx.now() - started).total_seconds()
+        if mono is not None:
+            elapsed = min(elapsed, ctx.monotonic() - mono)               # this process started the unit: a wall clock stepping forward cannot make the budget look spent
+        if elapsed is None or elapsed < limit:
             return "in_progress", None                                    # NEVER reconcile a worker that is still within its time budget
     if ex.kind == "finished" and ex.status["outcome"] != "fenced" and row.state in ("started", "effect_done"):
         res = finalize_from_status(ctx, row, ex.status)

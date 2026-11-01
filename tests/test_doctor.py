@@ -38,6 +38,19 @@ def served(privd_env, monkeypatch):
     sock.close()
 
 
+@pytest.fixture
+def served_all_probes(privd_env):
+    e = privd_env
+    assert e.install(tiers=(0,))["ok"]
+    assert e.put_lease()["ok"]
+    sock = listen(e.paths.socket, AGENT_GID)
+    srv = Server(e.ctx)
+    threading.Thread(target=srv.serve, args=(sock,), daemon=True).start()
+    yield e
+    srv.stop()
+    sock.close()
+
+
 def doctor(e, tmp_path, *, runner=None, op_names=(), mountinfo=None, **over):
     state = tmp_path / "state"
     state.mkdir(exist_ok=True)
@@ -49,7 +62,7 @@ def doctor(e, tmp_path, *, runner=None, op_names=(), mountinfo=None, **over):
     cfg = AgentConfig("g2", "127.0.0.1", 1, str(tmp_path / "node.crt"), str(key), str(tmp_path / "ca.crt"), e.paths.policy_dir, e.paths.allowed_signers, str(state), e.paths.socket, 0, os.getuid())
     runner = runner or FakeRunner({"timedatectl": "Timezone=Europe/Berlin\nNTPSynchronized=yes\nNTP=yes\n", "openssl_x509_file": CERT_OK})
     out = io.StringIO()
-    kw = dict(cfg=cfg, clock=e.clock, runner=runner, ssh_keygen=e.ssh_keygen, priv=PrivClient(e.paths.socket, 0, 60), sleep=lambda s: None, op_names=op_names, mountinfo=mountinfo, out=out)
+    kw = dict(cfg=cfg, clock=e.clock, runner=runner, ssh_keygen=e.ssh_keygen, priv=PrivClient(e.paths.socket, 0, 60), sleep=lambda s: None, op_names=op_names, after_switch=False, mountinfo=mountinfo, out=out)
     kw.update(over)
     return D.Doctor(**kw), out
 
@@ -185,3 +198,45 @@ def test_main_without_configuration_exits_2(monkeypatch, capsys):
         monkeypatch.delenv(k)
     assert D.main([]) == 2
     assert "FORGE_NODE_NODE_ID" in capsys.readouterr().err
+
+
+def test_doctor_paces_every_selfcheck_so_that_the_real_set_of_14_requests_never_hits_the_rate_limit(served_all_probes, tmp_path, monkeypatch):
+    """Review: 12 probes + the op + the audit request go into ONE bucket of 12 per minute. With a sleep that really advances time (privd's clock here) the doctor must never be denied."""
+    e = served_all_probes
+    monkeypatch.setattr(D, "HubClient", FakeHub)
+    FakeHub.behaviour = None
+    advance = lambda s: e.clock.advance(seconds=s)                   # noqa: E731 - a sleep that moves the clock the rate buckets read
+    d, out = doctor(e, tmp_path, op_names=("selftest.noop",), sleep=advance)
+    res = d.run()
+    unit = [r for r in res if r["check"].startswith(("probe:", "op:"))]
+    assert len(unit) == len(hardening.RO_PROBES) + 1 and len(unit) + 1 == 14                  # every probe, the op, and the audit request
+    denied = [r for r in res if "DENY_RATE" in r["detail"]]
+    assert not denied, denied
+    # and the proof that the test can fail: without any pacing the same run is rate limited
+    e.clock.advance(seconds=120)
+    d2, _ = doctor(e, tmp_path, op_names=("selftest.noop",), sleep=lambda s: None)
+    assert [r["check"] for r in d2.run() if "DENY_RATE" in r["detail"]]
+
+
+def test_after_a_switch_only_what_a_release_can_break_fails_the_doctor(served, tmp_path, monkeypatch):
+    """The switcher rolls a release back when doctor fails. A hub outage, an unsynchronised clock or an old certificate are not the release's fault."""
+    FakeHub.behaviour = D.HubUnreachable("no route")
+    monkeypatch.setattr(D, "HubClient", FakeHub)
+    runner = FakeRunner({"timedatectl": "Timezone=Europe/Berlin\nNTPSynchronized=no\nNTP=yes\n", "openssl_x509_file": CERT_OK})
+    d, out = doctor(served, tmp_path, runner=runner, after_switch=True)
+    res = by_name(d.run())
+    assert res["hub"]["status"] == "warn" and res["clock"]["status"] == "warn" and "not a reason to roll back" in res["hub"]["detail"]
+    assert d._failed == [] and lines(out)[-1]["doctor"] == "OK"
+    d2, _ = doctor(served, tmp_path, runner=runner, after_switch=False)
+    d2.run()
+    assert sorted(d2._failed) == ["clock", "hub"]
+    # a release-attributable failure still fails after a switch
+    served.clock.advance(seconds=61)
+    d3, _ = doctor(served, tmp_path, runner=runner, after_switch=True, priv=PrivClient(served.paths.socket, 12345, 2))
+    d3.run()
+    assert "privd" in d3._failed
+    FakeHub.behaviour = None
+
+
+def test_doctor_main_accepts_only_the_after_switch_flag(monkeypatch, capsys):
+    assert D.main(["--bogus"]) == 2 and "usage" in capsys.readouterr().err

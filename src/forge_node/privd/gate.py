@@ -366,12 +366,34 @@ def s_started(st: State) -> None:
 
 
 def _fresh_stop_check(st: State) -> None:
-    """G28: starting the unit is irreversible, so STOP is re-observed NOW (LOCAL_STOP file, the stored lease re-read and re-verified), not carried over from steps 3/4 which ran
-    before the audit intent, the policy, the rate buckets and the work directory. Same codes as the early steps."""
+    """G28: starting the unit is irreversible, so everything that can have changed since steps 2-16 is re-observed NOW from root-protected state, not carried over: LOCAL_STOP, the
+    installed policy (a revocation, a disabled op/tier, a new protected entry, a new blocking mode), the stored lease re-verified under the CURRENT policy's gate keys. Same codes as the
+    early steps."""
     ctx = st.ctx
     if _local_stop_active(ctx):
         raise Deny("DENY_LOCAL_STOP", "LOCAL_STOP appeared before the unit started")
-    p = ctx.leases.current(_gate_keys(st))
+    try:
+        fresh = ctx.policies.current()
+    except PolicyError as e:
+        raise Deny("DENY_POLICY_INVALID", e.detail) from e
+    if fresh.raw_sha256 != st.policy.raw_sha256:
+        j = st.job
+        op_policy = fresh.ops.get(j["op"])
+        if j["tier"] not in fresh.tiers or op_policy is None:
+            raise Deny("DENY_TIER_DISABLED", "the policy changed before the unit started: the op or its tier is no longer enabled")
+        if not st.dry_run and (fresh.global_mode == "observe" or op_policy.mode == "dry_run_only"):
+            raise Deny("DENY_TIER_DISABLED", "the policy changed before the unit started: the op may only dry-run now")
+        try:
+            if st.entry.protected is not None:
+                st.entry.protected(fresh, st.params)
+            if st.entry.allowlist is not None:
+                st.entry.allowlist(op_policy, st.params)
+        except ProtoError as e:
+            raise Deny("DENY_PROTECTED" if e.code == "DENY_PROTECTED" else "DENY_NOT_ALLOWLISTED", e.detail) from e
+        if st.entry.mutating and fresh.view.window.in_blackout(ctx.now()):
+            raise Deny("DENY_WINDOW", "the blackout window began before the unit started")
+        st.policy = fresh
+    p = ctx.leases.current(fresh.view.hub_gate_keys)
     if p is None or ctx.now() > protocol.parse_ts(p["valid_until"]):
         raise Deny("DENY_STALE_LEASE", "lease no longer valid before the unit started")
     if p["stop"] or (st.job["requester"]["project"] is not None and st.job["requester"]["project"] in p["stopped_projects"]):
@@ -393,6 +415,7 @@ def s_effect(st: State) -> None:
         raise Done({"ok": True, "in_progress": True, "job_id": row.job_id}) from e
     except UnitError as e:
         raise Deny("FAIL_EXEC", f"unit did not start: {e}") from e
+    ctx.worker_started[(row.job_id, row.attempt)] = ctx.monotonic()
     ctx.ledger.set_invocation(row.job_id, row.attempt, inv, ctx.now())
     st.row = ctx.ledger.get(row.job_id)
     outcome = rec.wait_unit(ctx, st.row, entry.timeout_s + 5)
@@ -556,6 +579,7 @@ def s_status(st: State) -> None:
         except (AuditDown, AuditCorrupt) as e:
             heads[name] = {"error": type(e).__name__}
     out["audit_heads"] = heads
+    out["policy_audit_pending"] = bool(ctx.ledger.meta_get("policy_audit_pending"))
     out["open_jobs"] = [{"job_id": r.job_id, "state": r.state, "attempt": r.attempt} for r in ctx.ledger.open_rows()][:64]
     out["ledger_schema"] = STATE_SCHEMA
     st.reply = {"ok": True, "status": out}
@@ -612,6 +636,20 @@ def s_reconcile(st: State) -> None:
 
 
 # --------------------------------------------------------------------------------------------------------------------- policy.apply
+def flush_pending_policy_audit(ctx: Context) -> bool:
+    """A policy that was installed while the audit log could not be written is recorded late (with `late: true`) at the next opportunity: the next policy.apply and privd's start."""
+    pending = ctx.ledger.meta_get("policy_audit_pending")
+    if not pending:
+        return False
+    serial, _, sha = pending.partition(":")
+    try:
+        ctx.audit("policy", {"action": "apply", "serial": int(serial), "sha256": sha, "late": True, "caller_uid": None})
+    except Deny:
+        return False
+    ctx.ledger.meta_set("policy_audit_pending", "")
+    return True
+
+
 def s_policy_apply(st: State) -> None:
     ctx, b = st.ctx, st.req.body
     if set(b) != {"policy_b64", "sig"} or not isinstance(b["policy_b64"], str) or not isinstance(b["sig"], str):
@@ -625,6 +663,7 @@ def s_policy_apply(st: State) -> None:
         ctx.priv_log.head()
     except (AuditDown, AuditCorrupt) as e:
         raise Deny("DENY_AUDIT_DOWN", "audit not writable: refusing to change the policy") from e
+    flush_pending_policy_audit(ctx)
     prev = ctx.policies.installed_serial()
     try:
         pol = ctx.policies.apply(raw, b["sig"])
@@ -736,6 +775,9 @@ def _record_denial(st: State, d: Deny) -> dict:
             res["audit_seq_range"] = [st.first_seq or r["seq"], r["seq"]]
             ctx.ledger.finish(row.job_id, row.attempt, "denied_retryable" if retry else ("denied" if res["status"] == "denied" else "failed"), res, ctx.now(),
                               frm=("received", "started"))
+            if d.code.startswith("FAIL_") and st.entry is not None:                 # the op itself failed (unit did not start, internal error): counts towards the circuit like a worker failure
+                thr = st.policy.circuit_threshold if st.policy is not None else 3
+                ctx.ledger.circuit_record(row.op, False, thr, ctx.now())
             return {"ok": True, "result": {"job_id": row.job_id, **res}}
         if _denial_audit_allowed(ctx):
             # `job_id` (what the hub's cross-check matches on) only for a job whose hub signature verified; whatever else the caller named is untrusted and goes into `claimed_job_id`
