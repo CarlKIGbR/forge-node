@@ -289,3 +289,24 @@ def test_privctl_audit_init_proves_the_filesystem_and_refuses_without_creating_a
     doc = json.loads(out.getvalue())
     assert doc["priv"]["fs_proof"]["ok"] and doc["priv"]["fs_proof"]["fstype"] == "ext4" and doc["priv"]["generation"] == 1
     assert doc["agent"]["generation"] == 1
+
+
+def test_privctl_finds_the_node_id_in_node_env_when_sudo_scrubbed_the_environment(tmp_path):
+    """Round 2 (MAJOR): `sudo privctl …` runs with a clean environment; the wrapper never loaded node.env and every command exited 2 on a real host."""
+    from forge_node.privd.main import node_id_from_file
+    f = tmp_path / "node.env"
+    f.write_text('# installer\nFORGE_NODE_HUB_HOST=192.168.10.4\nFORGE_NODE_NODE_ID="g2"\n')
+    os.chmod(f, 0o644)
+    assert node_id_from_file(str(f), 0) == "g2"
+    f.write_text("FORGE_NODE_NODE_ID=g3\n")
+    assert node_id_from_file(str(f), 0) == "g3"
+    f.write_text("FORGE_NODE_NODE_ID=../etc\n")
+    assert node_id_from_file(str(f), 0) == ""                                                  # not a node id
+    f.write_text("FORGE_NODE_NODE_ID=g2\n")
+    os.chmod(f, 0o666)
+    assert node_id_from_file(str(f), 0) == ""                                                  # others can write it: it decides which node this is
+    os.chmod(f, 0o644)
+    assert node_id_from_file(str(f), 4242) == ""                                               # not owned by the expected uid
+    link = tmp_path / "link.env"
+    os.symlink(f, link)
+    assert node_id_from_file(str(link), 0) == "" and node_id_from_file(str(tmp_path / "missing"), 0) == ""

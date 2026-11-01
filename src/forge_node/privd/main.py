@@ -2,7 +2,9 @@
 configurable from a request; the environment supplies only the node id (set by the unit). Tests build Context themselves with the same constructor - this module is what the units run."""
 import os
 import pwd
+import re
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -120,8 +122,35 @@ def ensure_state_dirs() -> None:
         os.chmod(d, 0o700)
 
 
+NODE_ENV = "/etc/forge-node/node.env"
+
+
+def node_id_from_file(path: str, owner_uid: int) -> str:
+    """FORGE_NODE_NODE_ID from node.env (the file the units use as EnvironmentFile): `sudo privctl …` runs with a scrubbed environment, so the wrapper cannot rely on it. The file must be a
+    regular root-owned file that others cannot write (it decides which node this is). '' when it is missing, unsafe or has no valid id."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except OSError:
+        return ""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != owner_uid or st.st_mode & 0o022 or st.st_size > 64 * 1024:
+            return ""
+        text = os.read(fd, 64 * 1024 + 1).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+    for line in text.splitlines():
+        m = re.match(r"^FORGE_NODE_NODE_ID=(?:\"([^\"]*)\"|'([^']*)'|(\S+))\s*$", line.strip())
+        if m:
+            v = next(g for g in m.groups() if g is not None)
+            return v if protocol.is_node_id(v) else ""
+    return ""
+
+
 def run_privctl(argv: list) -> int:
     node = os.environ.get("FORGE_NODE_NODE_ID", "")
+    if not protocol.is_node_id(node):
+        node = node_id_from_file(NODE_ENV, 0)
     if not protocol.is_node_id(node):
         sys.stderr.write("FORGE_NODE_NODE_ID missing or invalid\n")
         return 2

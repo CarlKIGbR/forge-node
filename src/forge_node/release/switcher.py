@@ -29,7 +29,7 @@ SWITCHER_API = 1
 VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}\Z")
 PRINCIPAL = "owner@forge"
 NAMESPACE = "forge-node-release"
-NONTERMINAL = ("received", "started", "effect_done", "reconciling")
+NONTERMINAL = ("received", "started", "effect_done", "reconciling")      # `indeterminate` is deliberately NOT here: its worker is confirmed dead, nothing can be orphaned (its target stays locked in the ledger)
 PROFILES = ("full", "t0")
 UNITS_START = ("forge-node-privd.socket", "forge-node-agent.service", "forge-node-audit-rotate.timer")
 UNITS_STOP = ("forge-node-agent.service", "forge-node-audit-rotate.timer", "forge-node-audit-rotate.service", "forge-node-privd.socket", "forge-node-privd.service")
@@ -52,14 +52,14 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def _read_nofollow(path: str, limit: int, owner_uid: int | None = None) -> bytes:
-    """Read a regular file without following a symlink. With `owner_uid`: also one link, that owner, not writable by group/others (checked on the open descriptor)."""
+def _read_nofollow(path: str, limit: int, owner_uid: int) -> bytes:
+    """Read a regular file without following a symlink: one link, owned by `owner_uid`, not writable by group/others (checked on the open descriptor). No default: no caller can skip it."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
             raise Refused(f"{path}: not a regular file or too large")
-        if owner_uid is not None and (st.st_nlink != 1 or st.st_uid != owner_uid or st.st_mode & 0o022):
+        if st.st_nlink != 1 or st.st_uid != owner_uid or st.st_mode & 0o022:
             raise Refused(f"{path}: not a root-owned file with one link that only root can write")
         return os.read(fd, limit + 1)
     finally:
@@ -467,7 +467,7 @@ class Switcher:
             raise Refused("the release carries no switcher")
         if m["switcher_api"] < SWITCHER_API:
             raise Refused("refusing to downgrade the switcher")
-        data = _read_nofollow(src, 1 << 20)
+        data = _read_nofollow(src, 1 << 20, self.owner_uid)
         if hashlib.sha256(data).hexdigest() != m["files"]["sbin/forge-node-release"]:
             raise Refused("the release's switcher differs from its manifest")
         tmp = self.self_path + ".new"

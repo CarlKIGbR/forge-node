@@ -240,3 +240,51 @@ def test_after_a_switch_only_what_a_release_can_break_fails_the_doctor(served, t
 
 def test_doctor_main_accepts_only_the_after_switch_flag(monkeypatch, capsys):
     assert D.main(["--bogus"]) == 2 and "usage" in capsys.readouterr().err
+
+
+def test_after_a_switch_a_hub_that_answers_but_is_refused_still_fails_and_so_does_a_broken_policy(served, tmp_path, monkeypatch):
+    """Round 2: every hub failure was downgraded after a switch - a release that breaks the agent's TLS client (wrong pin handling, 5xx) would have passed. Only unreachability is environmental."""
+    monkeypatch.setattr(D, "HubClient", FakeHub)
+    for behaviour in (PinError("not pinned"), HubError(500, "boom")):
+        FakeHub.behaviour = behaviour
+        d, _ = doctor(served, tmp_path, after_switch=True)
+        res = by_name(d.run())
+        assert res["hub"]["status"] == "fail" and "hub" in d._failed, behaviour
+    FakeHub.behaviour = HubUnreachable("no route")
+    d, _ = doctor(served, tmp_path, after_switch=True)
+    assert by_name(d.run())["hub"]["status"] == "warn"                                           # the environmental one
+    FakeHub.behaviour = None
+    # a policy the release cannot read is the release's problem
+    served.clock.advance(seconds=61)
+    d, _ = doctor(served, tmp_path, after_switch=True)
+    d.cfg = d.cfg.__class__(*[(str(tmp_path / "no-policy") if i == 6 else v) for i, v in enumerate(dataclass_values(d.cfg))])
+    res = by_name(d.run())
+    assert res["policy"]["status"] == "fail" and "policy" in d._failed
+
+
+def dataclass_values(obj):
+    import dataclasses
+    return [getattr(obj, f.name) for f in dataclasses.fields(obj)]
+
+
+def test_doctor_main_exits_with_the_verdict_the_switcher_depends_on(monkeypatch, tmp_path):
+    """Round 2: the switcher rolls back on a non-zero exit; only usage errors were tested."""
+    import sys as _sys
+    class FakeDoctor:
+        failed = []
+        seen = {}
+
+        def __init__(self, **kw):
+            FakeDoctor.seen = kw
+            self._failed = list(FakeDoctor.failed)
+
+        def run(self):
+            return []
+    monkeypatch.setattr(D, "Doctor", FakeDoctor)
+    monkeypatch.setattr("forge_node.agent.config.AgentConfig.from_environ", classmethod(lambda cls, *a, **k: type("Cfg", (), {"priv_socket": "/nonexistent.sock", "owner_uid": 0})()))
+    monkeypatch.setattr("forge_node.t0.runner.trusted_binary", lambda name: "/usr/bin/ssh-keygen")
+    FakeDoctor.failed = []
+    assert D.main(["--after-switch"]) == 0 and FakeDoctor.seen["after_switch"] is True
+    assert D.main([]) == 0 and FakeDoctor.seen["after_switch"] is False
+    FakeDoctor.failed = ["privd"]
+    assert D.main(["--after-switch"]) == 1

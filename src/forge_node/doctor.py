@@ -17,7 +17,6 @@ from .t0 import hardening
 from .t0.policy import PolicyError, load_installed
 
 PACE_S = 6.0                         # privd rate-limits selfchecks (12/min per caller uid); EVERY selfcheck request - the audit one included - is paced, 14 requests in all
-ENVIRONMENTAL = ("clock", "identity", "hub")      # facts about the node's surroundings: a hub outage or an NTP hiccup is not a reason to roll a release back
 
 
 def check(name: str, status: str, detail: str = "", **data) -> dict:
@@ -28,7 +27,8 @@ class Doctor:
     def __init__(self, *, cfg: AgentConfig, clock, runner, ssh_keygen: str, priv: PrivClient, sleep, op_names, after_switch: bool, fs_stat=os.stat, mountinfo=None, out=sys.stdout):
         """Everything external is injected (tests pass fakes; main() passes the real ones). `op_names` = the ops of this release's table for the policy's profile. `after_switch`: run by
         the release switcher to decide whether to keep the new release - failures of ENVIRONMENTAL checks (clock, identity, hub) are reported as warnings then, everything that a release
-        can break (policy, privd, audit, forge root, every probe and op in its unit) still fails."""
+        can break (policy, privd, audit, forge root, every probe and op in its unit, a hub that answers but is refused: pin, HTTP status) still fails. Only results marked `environmental` are
+        downgraded: the clock, the node's own certificate and key files, and a hub that cannot be REACHED."""
         self.cfg, self.clock, self.runner, self.ssh_keygen, self.priv, self.sleep, self.op_names = cfg, clock, runner, ssh_keygen, priv, sleep, op_names
         self.fs_stat, self.mountinfo, self.out, self.after_switch = fs_stat, mountinfo, out, after_switch
         self.policy = None
@@ -38,10 +38,10 @@ class Doctor:
     def clock_check(self) -> dict:
         r = self.runner.run("timedatectl")
         if not r.ok:
-            return check("clock", "fail", f"timedatectl unusable ({r.reason})")
+            return check("clock", "fail", f"timedatectl unusable ({r.reason})", environmental=True)
         kv = dict(line.partition("=")[::2] for line in r.text.splitlines())
         if kv.get("NTPSynchronized") != "yes":
-            return check("clock", "fail", "the system clock is not NTP-synchronised (leases and jobs are rejected beyond 60 s of skew)")
+            return check("clock", "fail", "the system clock is not NTP-synchronised (leases and jobs are rejected beyond 60 s of skew)", environmental=True)
         return check("clock", "ok", f"NTP synchronised, time zone {kv.get('Timezone', '?')}")
 
     def identity_check(self) -> dict:
@@ -55,10 +55,10 @@ class Doctor:
             if secret and (st.st_mode & 0o077 or st.st_uid != os.getuid()):
                 problems.append("node key must be owned by the agent user and not accessible by others")
         if problems:
-            return check("identity", "fail", "; ".join(problems))
+            return check("identity", "fail", "; ".join(problems), environmental=True)
         r = self.runner.run("openssl_x509_file", {"path": self.cfg.node_cert})
         if not r.ok:
-            return check("identity", "fail", f"cannot read the node certificate ({r.reason})")
+            return check("identity", "fail", f"cannot read the node certificate ({r.reason})", environmental=True)
         import re
         from email.utils import parsedate_to_datetime
         m = re.search(r"notAfter=(.+)", r.text)
@@ -68,11 +68,11 @@ class Doctor:
         except (TypeError, ValueError):
             end = None
         if end is None:
-            return check("identity", "fail", "cannot parse the certificate expiry")
+            return check("identity", "fail", "cannot parse the certificate expiry", environmental=True)
         days = (end - self.clock()).days
         info = {"fingerprint": fp.group(1) if fp else None, "days_left": days}
         if days < 0:
-            return check("identity", "fail", "the node certificate has expired", **info)
+            return check("identity", "fail", "the node certificate has expired", environmental=True, **info)
         return check("identity", "warn" if days < 14 else "ok", f"certificate valid for {days} more days (note the fingerprint for the Cockpit approval)", **info)
 
     def policy_check(self) -> dict:
@@ -112,7 +112,7 @@ class Doctor:
                 return check("hub", "warn", "reachable and pinned; the node is not registered/approved yet (expected until the Cockpit approval)")
             return check("hub", "fail", f"hub answered {e.status}")
         except HubUnreachable as e:
-            return check("hub", "fail", f"hub unreachable: {e}")
+            return check("hub", "fail", f"hub unreachable: {e}", environmental=True)
         finally:
             c.close()
 
@@ -208,7 +208,7 @@ class Doctor:
         results = [self.clock_check(), self.identity_check(), self.policy_check(), self.privd_check(), self.hub_check(), self.audit_check(), *self.forge_root_check(), *self.unit_checks()]
         if self.after_switch:
             for r in results:
-                if r["check"] in ENVIRONMENTAL and r["status"] == "fail":
+                if r.get("environmental") and r["status"] == "fail":
                     r["status"], r["detail"] = "warn", ("environmental, not a reason to roll back: " + r["detail"])[:300]
         for r in results:
             self.out.write(json.dumps(r, sort_keys=True) + "\n")
