@@ -795,3 +795,8 @@ def test_g28_the_switch_moves_current_directly_after_a_ledger_read_that_follows_
     assert sw2.cmd_switch("0.3.2") == 0
     with pytest.raises(AssertionError):
         assert_observed_before(log2, "repoint-current", "ledger")
+
+
+def test_every_template_lists_the_model_directory_for_the_round_0_model_inventory():
+    for nid in policies.NODES:
+        assert policies.template(nid)["t0"]["model_dirs"] == ["/srv/models"], nid          # inv.models is round-0 scope on all four hosts (T0 nodes included)

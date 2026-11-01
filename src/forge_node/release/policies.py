@@ -1,6 +1,7 @@
 """Policy templates shipped in the release (Design 13.C C5, 13.D, 7.4). The owner fills the two hub trust values, reads the file once, signs it. Every template is `observe` with
 tier 0 only: gated features (Betriebsleiter decision) cannot be switched on by any signature until their gates are met in code. Unfilled placeholders make a template INVALID
-(not a hex pin, not a key), so an unfilled template can never be applied."""
+(not a hex pin, not a key), so an unfilled template can never be applied. `inv.models` (Round 0, §14.1) reads `/srv/models` metadata on ALL four nodes: the second SSD is KMU model
+storage everywhere (M-99), so `model_dirs` is in every template, T0-only nodes included."""
 GATE_KEY_NOT_AFTER = "2027-10-31"
 NODES = {
     "g1": {"profile": "t0", "forge_root": None, "logs": []},
@@ -21,7 +22,7 @@ def template(node_id: str) -> dict:
     doc = {"schema": 1, "serial": 1, "not_before": "2026-10-31T00:00:00Z", "node": node_id, "profile": n["profile"], "global_mode": "observe", "tiers_enabled": [0],
            "hub_tls_pins": ["__HUB_TLS_PIN__"], "hub_gate_keys": [{"id": "hub-gate-1", "pub": "__HUB_GATE_PUB__", "not_after": GATE_KEY_NOT_AFTER}],
            "protected": PROTECTED,
-           "t0": {"units_for_logs": n["logs"], "cert_paths": [], "backup_units": ["kmu-sicherung-*"], "backup_dirs": [], "repos": [], "model_dirs": ["/srv/models"] if n["profile"] == "full" else []},
+           "t0": {"units_for_logs": n["logs"], "cert_paths": [], "backup_units": ["kmu-sicherung-*"], "backup_dirs": [], "repos": [], "model_dirs": ["/srv/models"]},
            "t1": {"workloads_enabled": False}, "t2": {"ops": []}, "t3": {"manifests_enabled": [], "opaque_enabled": False},
            "windows": {"blackout": "02:00-05:45", "sunday_open": "06:00"}, "redaction_version": 2, "circuit": {"fail_threshold": 3}}
     if n["forge_root"]:
