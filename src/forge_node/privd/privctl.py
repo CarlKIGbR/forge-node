@@ -11,7 +11,7 @@ import stat
 import sys
 
 from ..audit import fsproof
-from ..audit.spec import AuditCorrupt, AuditDown
+from ..audit.spec import AuditCorrupt, AuditDown, AuditNotInitialised
 from . import resolver
 from .client import PrivClient, PrivUnavailable
 
@@ -75,7 +75,12 @@ class Ctl:
 
     def cmd_audit_verify(self) -> int:
         require_root(self.euid)
-        res = {n: a.verify() for n, a in zip(("priv", "agent"), self.admin_factory())}
+        res = {}
+        for n, a in zip(("priv", "agent"), self.admin_factory()):
+            try:
+                res[n] = a.verify()
+            except (AuditDown, AuditCorrupt, AuditNotInitialised) as e:          # one log that cannot be verified (a hostile holder of its lock, a damaged directory) must not hide the other's result
+                res[n] = [f"verification could not run: {type(e).__name__}: {e}"]
         self.emit(res)
         return 0 if not any(res.values()) else 1
 

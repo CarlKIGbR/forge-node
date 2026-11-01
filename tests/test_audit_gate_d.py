@@ -418,7 +418,7 @@ def test_live_file_with_a_successor_or_unsealed_predecessor_is_corrupt(specs):
         admin(sub).recover()
 
 
-def test_missing_append_flag_on_the_active_file_is_set_by_recovery(specs):
+def test_missing_append_flag_on_the_active_file_is_answered_by_sealing_and_rotating(specs):
     sub = _scenario(specs, "noflag")
     a = admin(sub)
     f = live(sub, 1)
@@ -428,8 +428,8 @@ def test_missing_append_flag_on_the_active_file_is_set_by_recovery(specs):
     with pytest.raises(AuditDown):
         appender(sub).append("t0", {})                                      # an Appender cannot and must not fix it
     actions = a.recover()
-    assert any("append-only flag" in x for x in actions)
-    assert fsflags.is_live(flags_of(f))
+    assert any("lacked the append-only flag" in x for x in actions)         # round 3: sealed (+a +i) and rotated, not merely re-flagged: a writable descriptor that predates +a would stay usable
+    assert fsflags.is_sealed(flags_of(f)) and fsflags.is_live(flags_of(live(sub, 2))) and a._read_current() == 2
     assert a.verify() == []
 
 

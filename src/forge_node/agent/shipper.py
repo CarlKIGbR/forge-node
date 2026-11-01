@@ -19,6 +19,7 @@ class AuditShipper:
         self.specs, self.node, self.state_dir, self.log = specs, node, state_dir, log
         self.acked = self._load()
         self.cursors: dict[str, reader.Cursor | None] = {}
+        self.warned: set[str] = set()
 
     def _load(self) -> dict:
         try:
@@ -40,6 +41,12 @@ class AuditShipper:
         finally:
             os.close(sfd)
 
+    def _warn(self, source: str, why: str) -> None:
+        """The ack file is agent-writable state: a reset or inflated value must not make shipping stop SILENTLY (said once until it clears); the hub's audit_heads cross-check is the alarm."""
+        if source not in self.warned:
+            self.warned.add(source)
+            self.log(f"audit shipping: {why}; nothing is shipped for this log")
+
     def ship_once(self, client) -> dict:
         """One cycle: for each log up to BATCHES_PER_CYCLE batches. Returns {source: records stored}. HubUnreachable propagates (the caller backs off)."""
         stored = {}
@@ -50,6 +57,8 @@ class AuditShipper:
                 try:
                     cur = self.cursors.get(source) or reader.start_cursor(spec.dir, spec.prefix, self.node, spec.source, after)
                     if cur is None:
+                        if reader.has_generations(spec.dir, spec.prefix):
+                            self._warn(source, f"no generation of the {source} log continues from the local ack {after} (ack file reset, or the needed generation was purged)")
                         break
                     self.cursors[source] = cur
                     recs = reader.read_batch(spec.dir, spec.prefix, self.node, spec.source, cur, after, BATCH)
@@ -58,6 +67,10 @@ class AuditShipper:
                     self.cursors.pop(source, None)
                     break
                 if not recs:
+                    if cur.next_seq - 1 < after:
+                        self._warn(source, f"the local ack {after} is ahead of the log (its last record is seq {cur.next_seq - 1})")
+                    else:
+                        self.warned.discard(source)
                     break
                 try:
                     resp = client.post_audit({"source": source, "records": recs})

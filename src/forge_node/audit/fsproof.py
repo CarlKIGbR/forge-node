@@ -117,7 +117,7 @@ def prove(directory: str) -> dict:
     def rec(name: str, expected, got) -> None:
         checks[name] = {"expected": expected, "got": got, "ok": expected == got}
 
-    report = {"fstype": fs_type(directory), "checks": checks, "cleanup": False, "ok": False}
+    report = {"fstype": fs_type(directory), "checks": checks, "cleanup": False, "ok": False, "unobservable": []}      # unobservable: routes whose unflagged control failed here - listed, never silently passed
     try:
         dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError as e:
@@ -150,6 +150,7 @@ def prove(directory: str) -> dict:
             control = _try(lambda: call(ctl_fd))
             if control is not None:
                 checks[name] = {"expected": "refused", "got": f"not observable here (the unflagged control fails with {errno.errorcode.get(control, control)})", "ok": True}
+                report["unobservable"].append(name)
             else:
                 rec(name, "refused", _refused(lambda: call(late_append)))
         for name, (mode, off, ln) in FALLOC.items():
@@ -158,12 +159,25 @@ def prove(directory: str) -> dict:
         escape("live_rwf_noappend_overwrite_refused", _noappend_overwrite)
         rec("live_overwrite_via_pwrite_on_append_descriptor_leaves_the_bytes", True, _pwrite_leaves_first_byte(late_append, fd))
         rec("fresh_open_for_write_without_append_refused", EXPECTED_REFUSED, _try(lambda: os.close(os.open("canary", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=sfd))))
-        rec("chmod_refused", EXPECTED_REFUSED, _try(lambda: os.fchmod(fd, 0o440)))
-        rec("chown_refused", EXPECTED_REFUSED, _try(lambda: os.fchown(fd, os.fstat(fd).st_uid + 1, -1)))
-        rec("truncate_refused", EXPECTED_REFUSED, _try(lambda: os.ftruncate(early_append, 0)))
-        rec("unlink_refused", EXPECTED_REFUSED, _try(lambda: os.unlink("canary", dir_fd=sfd)))
-        rec("rename_refused", EXPECTED_REFUSED, _try(lambda: os.rename("canary", "canary2", src_dir_fd=sfd, dst_dir_fd=sfd)))
-        rec("hardlink_refused", EXPECTED_REFUSED, _try(lambda: os.link("canary", "canary3", src_dir_fd=sfd, dst_dir_fd=sfd)))
+        def eperm(name: str, flagged_call, control_call) -> None:
+            """EPERM on the flagged file only means something if the SAME call succeeds on the unflagged control (else EPERM can be a missing capability: round 3)."""
+            control = _try(control_call)
+            if control is not None:
+                checks[name] = {"expected": EXPECTED_REFUSED, "got": f"not observable here (the unflagged control fails with {errno.errorcode.get(control, control)})", "ok": True}
+                report["unobservable"].append(name)
+            else:
+                rec(name, EXPECTED_REFUSED, _try(flagged_call))
+        uid = os.fstat(ctl_fd).st_uid
+
+        def chown_control():
+            os.fchown(ctl_fd, uid + 1, -1)
+            os.fchown(ctl_fd, uid, -1)
+        eperm("chmod_refused", lambda: os.fchmod(fd, 0o440), lambda: os.fchmod(ctl_fd, 0o600))
+        eperm("chown_refused", lambda: os.fchown(fd, os.fstat(fd).st_uid + 1, -1), chown_control)
+        eperm("truncate_refused", lambda: os.ftruncate(early_append, 0), lambda: os.ftruncate(ctl_fd, 0))
+        eperm("hardlink_refused", lambda: os.link("canary", "canary3", src_dir_fd=sfd, dst_dir_fd=sfd), lambda: os.link("control", "control3", src_dir_fd=sfd, dst_dir_fd=sfd))
+        eperm("rename_refused", lambda: os.rename("canary", "canary2", src_dir_fd=sfd, dst_dir_fd=sfd), lambda: os.rename("control", "control2", src_dir_fd=sfd, dst_dir_fd=sfd))
+        eperm("unlink_refused", lambda: os.unlink("canary", dir_fd=sfd), lambda: os.unlink("control2", dir_fd=sfd))
         # Informational and the reason the new file is never reachable before +a: a descriptor that predates +a keeps its write access.
         checks["preexisting_nonappend_descriptor_can_still_overwrite"] = {"expected": "informational", "got": _try(lambda: os.pwrite(early_nonappend, b"Z", 0)) is None, "ok": True}
         try:
@@ -189,7 +203,7 @@ def prove(directory: str) -> dict:
                 if c >= 0:
                     os.close(c)
             if sfd >= 0:
-                for n in ("canary", "canary2", "canary3", "control"):
+                for n in ("canary", "canary2", "canary3", "control", "control2", "control3"):
                     try:
                         os.unlink(n, dir_fd=sfd)
                     except FileNotFoundError:

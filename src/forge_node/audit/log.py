@@ -65,6 +65,10 @@ def _write_all(fd: int, data: bytes) -> None:
         raise AuditDown("short write")
 
 
+MAX_TERMINATE_TRIES = 4
+VERIFY_ATTEMPTS = 3
+
+
 class Appender:
     """One writer for one log. `node`, `spec` and `clock` are required."""
 
@@ -314,15 +318,32 @@ class Appender:
         self._tail, self._key = t2, (st.st_ino, t2.size)
 
     def _repair_tail_locked(self) -> dict | None:
+        """Account for a damaged tail by a `tail_repair` record. An UNTERMINATED rest is first terminated by a newline in a write of its own and the chain is followed again: if the rest was a
+        valid continuation (a forged record without its newline - a newline would have completed it), it IS part of the chain now, and the record we are about to write must continue IT, not
+        collide with its seq (round 3, BLOCKER: the writer's warm head and every cold reader disagreed, everything written afterwards was damage to the readers)."""
         t = self._refresh_tail()
         if t.clean:
             return None
-        # the bytes OBSERVED now (streamed: the damage can be arbitrarily large); a hostile writer may still append before our write lands: the verifier tolerates that
-        ins = os.pread(self._fd, 1, t.end + t.damaged - 1) != b"\n"
-        rec = chain.seal_record({"ts": self._ts(), "node": self.node, "type": "tail_repair", "bytes": t.damaged, "inserted_newline": ins, "sha256": region_digest(self._fd, t.end, t.damaged)},
-                                t.seq + 1, t.hash)
+        inserted = False
+        for _ in range(MAX_TERMINATE_TRIES):
+            if os.pread(self._fd, 1, t.end + t.damaged - 1) == b"\n":
+                break
+            try:
+                _write_all(self._fd, b"\n")
+                os.fsync(self._fd)
+            except (OSError, AuditDown) as e:
+                self._tail = self._key = None
+                raise AuditDown(f"tail repair failed ({type(e).__name__})") from e
+            inserted = True
+            t = self._refresh_tail()                               # follows the chain over the bytes that are there now
+            if t.clean:
+                return None
+        else:
+            raise AuditDown("the damaged tail could not be terminated: a concurrent writer keeps extending it - retry")
+        n = t.damaged - 1 if inserted else t.damaged               # (the last byte is the newline we wrote - or, if a hostile writer ended its own line after it, one we count as ours: the digest covers the rest)
+        rec = chain.seal_record({"ts": self._ts(), "node": self.node, "type": "tail_repair", "bytes": n, "inserted_newline": inserted, "sha256": region_digest(self._fd, t.end, n)}, t.seq + 1, t.hash)
         chain.validate_record(rec, self.node, self.spec.source)
-        self._write_chain_record(t, b"\n" if ins else b"", rec, "tail repair")
+        self._write_chain_record(t, b"", rec, "tail repair")
         return rec
 
     def _append_locked(self, type_: str, fields: dict) -> dict:
@@ -677,17 +698,20 @@ class AuditAdmin(Appender):
                 actions += self._complete_successor(cur + 1, prev)
                 self._write_current(cur + 1)
                 actions.append(f"rotation to generation {cur + 1} completed (CURRENT switched)")
-            elif fsflags.is_sealed(fl):
+            elif fsflags.is_sealed(fl) or not fsflags.is_append_only(fl):
+                if not fsflags.is_sealed(fl):
+                    # A reachable file WITHOUT +a: a process of the agent uid may hold a descriptor that was opened without O_APPEND (the file is group-writable) and that can still pwrite after
+                    # +a is set (observed, fsproof). Re-adding +a would "heal" it and leave that hole open until the next rotation: SEAL it (+a +i refuses every write through any descriptor)
+                    # and rotate (round 3). The state afterwards is the ordinary sealed one, so a crash from here on resumes through the branch below.
+                    self._write_pending()
+                    fsflags.add_flags(fd, fsflags.APPEND | fsflags.IMMUTABLE)
+                    actions.append("sealed a live log file that lacked the append-only flag (a descriptor opened before the flag could still write)")
                 prev = self._sealed_description(fd)
                 self._write_pending()
                 self._build_generation(cur + 1, prev)
                 self._write_current(cur + 1)
                 actions.append(f"rotation to generation {cur + 1} resumed after the seal and completed")
             else:
-                if not fsflags.is_append_only(fl):
-                    self._write_pending()
-                    fsflags.add_flags(fd, fsflags.APPEND)
-                    actions.append("set the missing append-only flag on the active log file")
                 first = os.pread(fd, chain.MAX_RECORD_BYTES + 64, 0).split(b"\n", 1)[0]
                 rec = parse_record(first, self.node, s.source)
                 if rec is None or rec["type"] != "chain_link":
@@ -730,19 +754,22 @@ class AuditAdmin(Appender):
                 self._write_pending()
                 gfd, fd = self._open_ro(n)
                 try:
-                    sha, size = file_summary(fd)
-                    link = self._first_record(n + 1)
-                    if link is None or link.get("prev_file_sha256") != sha or link.get("prev_file_bytes") != size:
-                        # a descriptor that predates the seal can write once the flags are gone: sealing whatever is there would launder a modification
-                        raise AuditCorrupt(f"generation {n} was without flags and its content no longer matches the chain_link of generation {n + 1}")
+                    # SEAL FIRST, then look (round 3): the flags are the only thing that stops a descriptor that predates the seal (or a read-only descriptor re-opened for writing through
+                    # /proc/self/fd - the file is group-writable in the agent log), so the bytes that are hashed afterwards are the bytes that are sealed - no write can land between the look and the seal.
                     if not fsflags.is_sealed(fsflags.add_flags(fd, fsflags.APPEND | fsflags.IMMUTABLE)):
                         raise AuditCorrupt(f"could not re-seal generation {n}")
+                    sha, size = file_summary(fd)
+                    link = self._first_record(n + 1)
+                    matches = link is not None and link.get("prev_file_sha256") == sha and link.get("prev_file_bytes") == size
                     os.fchmod(gfd, s.dir_mode)
                     os.fsync(gfd)
                 finally:
                     os.close(gfd)
                     os.close(fd)
-                actions.append(f"re-sealed generation {n} (an interrupted purge cleared its flags; content verified against the next chain_link)")
+                # A mismatch is NOT a reason to refuse every later recovery and rotation (a hostile uid could use that to stop the log for good): the generation is sealed, i.e. frozen as evidence;
+                # `verify` reports the broken link ("chain_link does not match the sealed predecessor file") and the recovery record names it.
+                actions.append(f"re-sealed generation {n} (an interrupted purge cleared its flags; content " + ("verified against the next chain_link)" if matches else
+                                                                                                             "DOES NOT MATCH the next chain_link: it was modified while it had no flags; kept sealed as evidence)"))
             elif st["dir_mode"] != s.dir_mode:
                 self._write_pending()
                 gfd = self._open_gen_dir(n)
@@ -800,7 +827,7 @@ class AuditAdmin(Appender):
             # own log in that window - those bytes are damage after the chain_link, not a reason to quarantine
             if rec is None or not (data.startswith(line + b"\n") if flagged else data == line + b"\n") or not self._expected_link_ok(rec, n, prev):
                 raise AuditCorrupt("successor generation does not continue the sealed predecessor (chain_link mismatch)")
-            if flagged and follow(fd, self.node, s.source, None).seq != rec["seq"]:
+            if flagged and s.source == "priv" and follow(fd, self.node, s.source, None).seq != rec["seq"]:      # the agent can write its OWN log: records there are its words like any other, not a reason to quarantine
                 raise AuditCorrupt(f"generation {n} holds chained records beyond its chain_link although CURRENT never named it: it has been used")      # junk is damage, records are use
             if st["flags"] & fsflags.IMMUTABLE:
                 raise AuditCorrupt("successor generation is sealed before it was ever live")
@@ -875,6 +902,14 @@ class AuditAdmin(Appender):
         the active one), and that no byte of a file is unaccounted for. Hostile bytes in the agent log are counted but tolerated (`foreign`); in the priv log they are a problem.
         The log's lock is held only while CURRENT and the generation list are read and while a NOT-SEALED generation is read (it can still grow); sealed files are immutable and are
         verified without it - a 64 MiB file takes seconds, and the writers' lock wait is 10."""
+        for _ in range(VERIFY_ATTEMPTS):
+            problems, stable = self._verify_once()
+            if stable:
+                return problems
+        return ["verification was overtaken by a rotation on every attempt: run it again"]
+
+    def _verify_once(self) -> tuple[list[str], bool]:
+        """One pass; `stable` is False when a rotation/recovery/purge changed CURRENT or the generation list while it ran (the findings would be about a state that no longer exists)."""
         problems: list[str] = []
         s = self.spec
         strict = s.source == "priv"
@@ -886,7 +921,7 @@ class AuditAdmin(Appender):
             finally:
                 self._unlock()
             if cur is None:
-                return ["CURRENT missing"]
+                return ["CURRENT missing"], True
             prev = None
             for n in gens:
                 try:
@@ -901,6 +936,7 @@ class AuditAdmin(Appender):
                     if not fsflags.is_sealed(fl):
                         self._lock()
                         locked = True
+                        fl = fsflags.get_flags(fd)                  # the flags that count are the ones read under the lock (a rotation may have sealed the file since)
                     if n < cur and not fsflags.is_sealed(fl):
                         problems.append(f"generation {n}: not sealed")
                     if n == cur and not fsflags.is_live(fl):
@@ -930,4 +966,9 @@ class AuditAdmin(Appender):
                         self._unlock()
                     os.close(gfd)
                     os.close(fd)
-        return problems
+            self._lock()
+            try:
+                stable = self._read_current() == cur and sorted(self._list_gens()) == gens
+            finally:
+                self._unlock()
+        return problems, stable

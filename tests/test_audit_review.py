@@ -389,14 +389,16 @@ def test_recovery_never_deletes_an_unflagged_file_in_a_reachable_directory(specs
 
 
 # ----------------------------------------------------------------------------------------------------- round 2: the window BEFORE our write
-def _hostile_before_the_write(monkeypatch, s, payload):
-    """Make `payload` land in the log file after the writer looked at the tail and before its write()."""
+def _hostile_before_the_write(monkeypatch, s, payload, skip=0):
+    """Make `payload` land in the log file after the writer looked at the tail and before its write() (the `skip`-th write of the writer, 0 = the first)."""
     from forge_node.audit import log as audit_log
     real = audit_log._write_all
     fired = []
+    count = []
 
     def hostile_then_real(fd, data):
-        if not fired:
+        count.append(1)
+        if not fired and len(count) > skip:
             fired.append(1)
             append_raw(live(s), payload() if callable(payload) else payload)
         return real(fd, data)
@@ -434,17 +436,57 @@ def test_junk_before_our_write_does_not_fail_the_append_and_both_views_of_the_he
 
 
 def test_the_same_race_while_repairing_a_tail(specs, monkeypatch):
+    """The torn tail is first terminated (write 1) and then accounted for (write 2). A forger who takes the repair record's chain position before write 2 lands: AuditDown, nothing claimed."""
     s = specs["agent"]
     a = agent_log(specs)
     append_raw(live(s), b'{"torn":')
     head = a.head()
-    # the repair record's chain position is head+1; a forger takes it first
-    _hostile_before_the_write(monkeypatch, s, lambda: b"\n" + forged(head[0] + 1, head[1]))
+    _hostile_before_the_write(monkeypatch, s, lambda: forged(head[0] + 1, head[1]), skip=1)
     with pytest.raises(AuditDown, match="concurrent writer"):
         a.append("t0", {"during": "repair"})
     monkeypatch.undo()
     r = a.append("t0", {"after": "repair"})
     assert [x["seq"] for x in read_chain(s)][-1] == r["seq"] and chain.verify_chain(read_chain(s)) == []
+
+
+def test_a_forger_in_front_of_the_newline_that_terminates_a_torn_tail_is_followed_not_collided_with(specs, monkeypatch):
+    """The forger wins the race against the terminating newline: its record becomes the head, the repair and our record continue IT; nothing is lost and the views agree."""
+    s = specs["agent"]
+    a = agent_log(specs)
+    append_raw(live(s), b'{"torn":')
+    head = a.head()
+    _hostile_before_the_write(monkeypatch, s, lambda: b"\n" + forged(head[0] + 1, head[1]))
+    r = a.append("t0", {"during": "repair"})
+    monkeypatch.undo()
+    assert a.head()[0] == r["seq"] == admin(s).head()[0] and [x["seq"] for x in read_chain(s)][-1] == r["seq"]
+    assert chain.verify_chain(read_chain(s)) == [] and a.verify() == []
+
+
+def test_a_valid_record_without_its_newline_does_not_fork_the_writer_from_the_readers(specs):
+    """Round 3 (BLOCKER): a hostile agent-uid process appends a VALID continuation (seq N+1, prev = head) without its newline. The writer treated it as damage and wrote "\n" + tail_repair(N+1):
+    the newline completed the forged line, so the forged record took N+1, the tail_repair and everything after it became damage to every cold reader, while the warm writer kept 'recording'.
+    Now the newline is its own write, the chain is followed again, and the forged record IS the head the writer continues."""
+    s = specs["agent"]
+    a = agent_log(specs)
+    head = a.head()
+    forged_rec = forged(head[0] + 1, head[1])
+    append_raw(live(s), forged_rec.rstrip(b"\n"))
+    rs = [a.append("t0", {"n": i}) for i in range(3)]
+    assert [r["seq"] for r in rs] == [head[0] + 2, head[0] + 3, head[0] + 4]               # they continue the forged record
+    cold = admin(s)
+    assert cold.head() == a.head() == (rs[-1]["seq"], rs[-1]["hash"])                    # warm writer and cold reader agree
+    assert [x["seq"] for x in read_chain(s)][-1] == rs[-1]["seq"] and chain.verify_chain(read_chain(s)) == []
+    assert a.verify() == []
+
+
+def test_a_torn_valid_looking_record_that_is_not_a_continuation_is_still_accounted_for(specs):
+    s = specs["agent"]
+    a = agent_log(specs)
+    head = a.head()
+    append_raw(live(s), forged(head[0] + 5, head[1]).rstrip(b"\n"))                      # valid-looking but does not continue the chain
+    r = a.append("t0", {"x": 1})
+    assert admin(s).head() == a.head() == (r["seq"], r["hash"]) and r["seq"] == head[0] + 2
+    assert a.verify() == [] and any(x["type"] == "tail_repair" and x["inserted_newline"] for x in read_chain(s))
 
 
 def test_fsproof_says_so_when_a_route_cannot_be_observed_instead_of_passing_it_silently(realfs, monkeypatch):
@@ -523,11 +565,15 @@ def test_recovery_refuses_to_reseal_a_generation_that_changed_while_it_had_no_fl
     os.pwrite(old_fd, b"X", 5)                                                              # the old descriptor writes
     os.close(old_fd)
     os.close(ro)
-    with pytest.raises(AuditCorrupt, match="no longer matches"):
-        admin(sub).recover()
+    actions = admin(sub).recover()                                                           # round 3: NOT a quarantine of the whole log - the generation is sealed first, then looked at
+    assert any("DOES NOT MATCH" in x for x in actions)
     fd = os.open(f"{gdir}/priv.000001.jsonl", os.O_RDONLY)
-    assert not fsflags.is_sealed(fsflags.get_flags(fd))                                      # not laundered into a sealed file
+    assert fsflags.is_sealed(fsflags.get_flags(fd))                                          # frozen as evidence
     os.close(fd)
+    assert [p for p in admin(sub).verify() if p.startswith("generation 1")]                    # ... and verify names the break loudly (generation 1 no longer parses)
+    admin(sub).append("t0", {})                                                              # the log goes on
+    with pytest.raises(OSError):
+        os.open(f"{gdir}/priv.000001.jsonl", os.O_WRONLY)
 
 
 def test_an_unmodified_flagless_generation_is_resealed(specs):
@@ -750,3 +796,165 @@ def test_a_successor_whose_chain_link_has_the_right_fields_but_a_wrong_prev_hash
     with pytest.raises(AuditCorrupt, match="chain_link mismatch"):
         admin(s).recover()
     assert os.path.exists(live(s, 2))
+
+
+# ================================================================================================================= round 3
+def test_a_hostile_uid_cannot_make_the_scan_cost_one_python_iteration_per_two_bytes(tmp_path):
+    """Round 3 (MAJOR): `x\\n` * 8M cost 37 s in `follow()` - under the agent log's flock, so root's rotation/recovery/peek timed out (AuditDown) for as long as the scan ran."""
+    import time
+    from forge_node.audit import scan
+    path = tmp_path / "junk"
+    with open(path, "wb") as f:
+        f.write(b"x\n" * (8 << 20))
+    fd = os.open(path, os.O_RDONLY)
+    t0 = time.monotonic()
+    t = scan.follow(fd, NODE, "agent", None)
+    took = time.monotonic() - t0
+    os.close(fd)
+    assert t.seq is None and took < 5, took                                                  # 0.2 s measured; 37 s before
+
+
+@pytest.mark.parametrize("chunk", [1 << 20, 4096, 997, 61])
+def test_linescan_yields_exactly_the_records_whatever_the_chunking_and_the_junk(tmp_path, monkeypatch, chunk):
+    import random
+    from forge_node.audit import scan
+    monkeypatch.setattr(scan, "READ_CHUNK", chunk)
+    rnd = random.Random(7)
+    buf, expect, seq, prev = bytearray(), [], 0, chain.GENESIS_HASH
+    for _ in range(120):
+        for _ in range(rnd.randint(0, 4)):
+            buf += rnd.choice([b"x\n", b"\n\n\n", b"y" * rnd.randint(1, 20000) + b"\n", b"z" * 170 + b"\n", b"q" * (scan.MAX_LINE + 5) + b"\n", b"torn\n"])
+        rec = chain.seal_record({"ts": "2026-10-31T13:40:10Z", "node": NODE, "type": "chain_link" if seq == 0 else "t0"}, seq + 1, prev) if seq == 0 else forged_rec(seq + 1, prev)
+        line = canon.canonical(rec)
+        expect.append((line, len(buf)))
+        buf += line + b"\n"
+        seq, prev = seq + 1, rec["hash"]
+    buf += b"unterminated rest"
+    path = tmp_path / "f"
+    path.write_bytes(bytes(buf))
+    fd = os.open(path, os.O_RDONLY)
+    sc = scan.LineScan(fd, 0, len(buf))
+    got = [(ln, st) for ln, st, _n in sc if scan.parse_record(ln, NODE, "agent")]
+    os.close(fd)
+    assert got == expect and sc.scanned_to == len(buf) - len(b"unterminated rest")
+
+
+def forged_rec(seq, prev):
+    return chain.seal_record({"ts": "2026-10-31T13:40:10Z", "node": NODE, "type": "t0"}, seq, prev)
+
+
+def test_no_record_can_be_shorter_than_the_scan_minimum():
+    """LineScan skips lines shorter than MIN_RECORD_LINE in bulk: that is only sound if no valid record can be that short."""
+    from forge_node import protocol
+    from forge_node.audit import scan
+    shortest = None
+    for source, types in chain.SOURCE_TYPES.items():
+        for t in types:
+            for node in ("a", "g1", "ab"):
+                if not protocol.is_node_id(node):
+                    continue
+                rec = chain.seal_record({"ts": "2026-10-31T13:40:10Z", "node": node, "type": t}, 1, chain.GENESIS_HASH)
+                n = len(canon.canonical(rec))
+                shortest = n if shortest is None else min(shortest, n)
+    assert shortest is not None and shortest >= scan.MIN_RECORD_LINE + 40, (shortest, scan.MIN_RECORD_LINE)       # and real ones carry more fields than these bare ones
+
+
+def test_recovery_seals_and_rotates_a_reachable_file_without_the_append_flag(specs):
+    """Round 3 (MAJOR): recovery only re-added +a; a writable descriptor of the group-writable agent log that predates the flag stays able to pwrite until the next rotation."""
+    s = specs["agent"]
+    a = agent_log(specs, 3)
+    path = live(s)
+    ro = os.open(path, os.O_RDONLY)
+    fsflags.clear_flags(ro, fsflags.APPEND | fsflags.IMMUTABLE)                              # an operator's `chattr -a`
+    old_fd = os.open(path, os.O_RDWR)                                                        # no O_APPEND: can pwrite once the file is merely +a
+    a.close()
+    actions = admin(s).recover()
+    assert any("sealed a live log file that lacked the append-only flag" in x for x in actions) and any("rotation to generation 2" in x for x in actions)
+    with pytest.raises(OSError):
+        os.pwrite(old_fd, b"X", 10)                                                          # +a +i: no descriptor, however old, can write
+    os.close(old_fd)
+    os.close(ro)
+    r = admin(s)
+    assert r.verify() == [] and r._read_current() == 2 and fsflags.is_live(fsflags.get_flags(os.open(live(s, 2), os.O_RDONLY)))
+    assert r.append("t0", {})["seq"] > 3
+
+
+def test_verify_is_repeated_when_a_rotation_overtakes_it(specs, monkeypatch):
+    """Round 3 (MINOR): CURRENT and the generation list were read once; a rotation during the pass made the previously live file 'not live' - a false alarm."""
+    from forge_node.audit import log as audit_log
+    sub = _scenario(specs, "v3")
+    a = admin(sub)
+    a.rotate()                                                                               # generations 1 (sealed) and 2 (live)
+    real, fired = audit_log.verify_file, []
+
+    def overtaken(fd, node, source, **kw):
+        if not fired:
+            fired.append(1)
+            admin(sub).rotate()                                                              # while generation 1 (sealed, read WITHOUT the lock) is being verified
+        return real(fd, node, source, **kw)
+    monkeypatch.setattr(audit_log, "verify_file", overtaken)
+    assert a.verify() == [] and fired
+
+
+def test_a_chained_record_in_the_unswitched_agent_successor_is_the_agents_own_use_and_not_a_quarantine(specs):
+    """Round 3 (MINOR): a crash between 'reachable' and 'CURRENT switched', then one chained record appended by the agent uid to its own new file, made every later recovery raise."""
+    s = specs["agent"]
+    a = admin(s)
+    a.init()
+    for i in range(2):
+        a.append("t0", {"i": i})
+    probe = make_specs(os.path.join(os.path.dirname(s.dir), "m5p"), max_file_bytes=10 ** 7)["agent"]
+    ap = admin(probe)
+    ap.init()
+    ap.append("t0", {})
+    killed, total, calls = in_child(lambda: ap.rotate())
+    assert not killed
+    a.close()
+    sub = make_specs(os.path.join(os.path.dirname(s.dir), "m5"), max_file_bytes=10 ** 7)["agent"]
+    b = admin(sub)
+    b.init()
+    b.append("t0", {})
+    b.close()
+    idx = max(i for i, c in enumerate(calls, 1) if c == "rename")
+    kd, _, _ = in_child(lambda: admin(sub).rotate(), kill_at=idx, when="before")
+    assert kd and admin(sub)._read_current() == 1
+    link = file_records(live(sub, 2))[0]
+    append_raw(live(sub, 2), forged(link["seq"] + 1, link["hash"]))
+    actions = admin(sub).recover()
+    assert any("rotation to generation 2" in x for x in actions)
+    r = admin(sub)
+    assert r.verify() == [] and r.append("t0", {})["seq"] > link["seq"] + 1                  # the appender continues after the agent's own record
+
+
+def test_fsproof_has_a_positive_control_for_every_flagged_route(realfs, monkeypatch):
+    """Round 3 (MINOR): chmod/chown/truncate/unlink/rename/link counted EPERM as 'refused' without showing that the same call works on an unflagged file (a missing capability is EPERM too)."""
+    from forge_node.audit import fsproof
+    rep = fsproof.prove(realfs)
+    assert rep["ok"] and rep["unobservable"] == [], rep
+    real_chown = os.fchown
+
+    def no_cap(fd, uid, gid):                                                                # as inside a unit without CAP_CHOWN
+        raise PermissionError(1, "EPERM")
+    monkeypatch.setattr(os, "fchown", no_cap)
+    rep = fsproof.prove(realfs)
+    monkeypatch.setattr(os, "fchown", real_chown)
+    assert rep["ok"] and rep["unobservable"] == ["chown_refused"], rep                       # reported, not silently passed
+    assert rep["checks"]["chown_refused"]["got"].startswith("not observable here")
+
+
+def test_the_shipper_says_so_when_the_agent_writable_ack_file_makes_it_stop(tmp_path, specs):
+    """Round 3 (MINOR): an ack of 1e9 (or a reset one after a purge) made start_cursor return None and the shipper skipped the log without a word."""
+    from forge_node.agent.shipper import AuditShipper
+    a = agent_log(specs, 3)
+    lines = []
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "audit-acks.json").write_bytes(b'{"agent": 1000000000}')
+    sh = AuditShipper(specs={"agent": specs["agent"]}, node=NODE, state_dir=str(state), log=lines.append)
+
+    class Hub:
+        def post_audit(self, body):
+            raise AssertionError("nothing may be sent")
+    assert sh.ship_once(Hub()) == {"agent": 0} and sh.ship_once(Hub()) == {"agent": 0}
+    assert len([x for x in lines if "ahead of the log" in x]) == 1                              # said once, not every cycle
+    a.close()

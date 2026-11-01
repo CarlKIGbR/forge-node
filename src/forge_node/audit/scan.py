@@ -17,8 +17,9 @@ from .. import canon, chain
 from .spec import AuditCorrupt
 
 READ_CHUNK = 1 << 20
-_NL_RUN = re.compile(rb"\n+")
 MAX_LINE = chain.MAX_RECORD_BYTES + 64
+MIN_RECORD_LINE = 160                                               # the smallest valid record is > 200 bytes (fmt, two 64-hex hashes, ts, node, seq, type); pinned by a test
+_CANDIDATE = re.compile(rb"(?<![^\n])([^\n]{%d,%d})\n" % (MIN_RECORD_LINE, MAX_LINE))
 
 
 @dataclass(frozen=True)
@@ -73,42 +74,46 @@ def region_digest(fd: int, start: int, length: int) -> str:
     return h.hexdigest()
 
 
-def iter_lines(fd: int, start: int, size: int):
-    """(line | None, line_start, next_offset) for every COMPLETE NON-EMPTY line in [start, size) (a run of bare newlines is skipped in one step: it can never be a record, and a hostile
-    process must not be able to make the scan cost one Python iteration per byte). A line longer than MAX_LINE is yielded as None and never held in memory; an unterminated rest is not
-    yielded (the writer may still be writing it)."""
-    off, line_start, buf, long_ = start, start, bytearray(), False
-    while off < size:
-        chunk = os.pread(fd, min(READ_CHUNK, size - off), off)
-        if not chunk:
-            break
-        pos = 0
-        while True:
-            if not buf and not long_:
-                m = _NL_RUN.match(chunk, pos)                         # empty lines: skipped, not yielded
-                if m:
-                    pos = m.end()
-                    line_start = off + pos
-                if pos >= len(chunk):
-                    break
-            nl = chunk.find(b"\n", pos)
-            if nl < 0:
-                rest = chunk[pos:]
-                if not long_:
-                    buf += rest
-                    if len(buf) > MAX_LINE:
-                        long_, buf = True, bytearray()
+class LineScan:
+    """The COMPLETE lines in [start, size) that can be a record: at least MIN_RECORD_LINE and at most MAX_LINE bytes. Everything else - empty lines, short junk, an over-long line - can never
+    be a record and is skipped IN BULK by the regex engine: the cost of a scan is bounded by the number of bytes, not by the number of lines (a hostile process of the agent uid must not
+    be able to make the scan cost one Python iteration per two bytes while it holds the log's lock: `x\\n` * 8M cost 37 s). An unterminated rest is not yielded (the writer may still be
+    writing it). Iterating yields (line, line_start, next_offset); `scanned_to` is the offset after the last COMPLETE line looked at (valid when the iteration ran to its end)."""
+
+    def __init__(self, fd: int, start: int, size: int):
+        self.fd, self.start, self.size = fd, start, size
+        self.scanned_to = start
+
+    def __iter__(self):
+        fd, off, size = self.fd, self.start, self.size
+        carry, carry_off, discarding = b"", off, False                 # carry: the unterminated rest of the previous window, starting at carry_off; discarding: inside a line already too long
+        while off < size:
+            chunk = os.pread(fd, min(READ_CHUNK, size - off), off)
+            if not chunk:
                 break
-            piece = chunk[pos:nl]
-            if not long_:
-                buf += piece
-                if len(buf) > MAX_LINE:
-                    long_, buf = True, bytearray()
-            nxt = off + nl + 1
-            yield (None if long_ else bytes(buf)), line_start, nxt
-            line_start, buf, long_ = nxt, bytearray(), False
-            pos = nl + 1
-        off += len(chunk)
+            off += len(chunk)
+            if discarding:
+                nl = chunk.find(b"\n")
+                if nl < 0:
+                    continue
+                discarding, carry = False, b""
+                carry_off = off - len(chunk) + nl + 1
+                chunk = chunk[nl + 1:]
+            data = carry + chunk
+            last = data.rfind(b"\n")
+            if last < 0:
+                if len(data) > MAX_LINE:
+                    carry, discarding = b"", True
+                else:
+                    carry = data
+                continue
+            complete, carry = data[:last + 1], data[last + 1:]
+            for m in _CANDIDATE.finditer(complete):
+                yield m.group(1), carry_off + m.start(1), carry_off + m.end()
+            carry_off += len(complete)
+            self.scanned_to = carry_off
+            if len(carry) > MAX_LINE:
+                carry, discarding = b"", True
 
 
 def follow(fd: int, node: str, source: str, tail: Tail | None) -> Tail:
@@ -116,8 +121,8 @@ def follow(fd: int, node: str, source: str, tail: Tail | None) -> Tail:
     offset 0). Cost: the bytes after the starting point."""
     size = os.fstat(fd).st_size
     seq, prev, end = (None, None, 0) if tail is None else (tail.seq, tail.hash, tail.end)
-    for line, start, nxt in iter_lines(fd, end, size):
-        rec = parse_record(line, node, source) if line is not None else None
+    for line, start, nxt in LineScan(fd, end, size):
+        rec = parse_record(line, node, source)
         if rec is None:
             continue
         if seq is None:
@@ -180,8 +185,8 @@ def verify_file(fd: int, node: str, source: str, *, start_seq: int | None, start
     expect_seq = 1 if start_seq is None else start_seq
     expect_prev = chain.GENESIS_HASH if start_prev is None else start_prev
     end_of_chain = 0
-    for line, line_start, nxt in iter_lines(fd, 0, size):
-        rec = parse_record(line, node, source) if line is not None else None
+    for line, line_start, nxt in LineScan(fd, 0, size):
+        rec = parse_record(line, node, source)
         if rec is not None and rep.first is None:
             rep.first = rec                                          # the very first record of the file decides where the chain starts
         if rec is None or rec["seq"] != expect_seq or rec["prev_hash"] != expect_prev:

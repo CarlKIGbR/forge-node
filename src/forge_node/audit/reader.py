@@ -5,7 +5,7 @@ import os
 import stat
 from dataclasses import dataclass
 
-from .scan import MAX_LINE, iter_lines, parse_record
+from .scan import MAX_LINE, LineScan, parse_record
 from .spec import gen_file, gen_re
 
 
@@ -60,6 +60,14 @@ def start_cursor(dir_path: str, prefix: str, node: str, source: str, after_seq: 
         os.close(dfd)
 
 
+def has_generations(dir_path: str, prefix: str) -> bool:
+    dfd = os.open(dir_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        return bool(_gens(dfd, prefix))
+    finally:
+        os.close(dfd)
+
+
 def read_batch(dir_path: str, prefix: str, node: str, source: str, cur: Cursor, after_seq: int, limit: int) -> list[dict]:
     """Up to `limit` chain-continuing records with seq > after_seq, starting at the cursor; advances the cursor. Records at or below after_seq are skipped (already acknowledged).
     A generation that has a successor is SEALED (the successor is only created after the seal): its end is final, so an unterminated fragment at its end is skipped, not waited for."""
@@ -81,8 +89,9 @@ def read_batch(dir_path: str, prefix: str, node: str, source: str, cur: Cursor, 
             try:
                 size = os.fstat(fd).st_size
                 finished = True
-                for line, _start, after in iter_lines(fd, cur.offset, size):
-                    rec = parse_record(line, node, source) if line is not None else None
+                scan = LineScan(fd, cur.offset, size)
+                for line, _start, after in scan:
+                    rec = parse_record(line, node, source)
                     if rec is not None and rec["seq"] == cur.next_seq and (cur.prev_hash is None or rec["prev_hash"] == cur.prev_hash):
                         cur.next_seq, cur.prev_hash = rec["seq"] + 1, rec["hash"]
                         if rec["seq"] > after_seq:
@@ -91,6 +100,8 @@ def read_batch(dir_path: str, prefix: str, node: str, source: str, cur: Cursor, 
                     if len(out) >= limit:
                         finished = False
                         break
+                else:
+                    cur.offset = scan.scanned_to                       # the lines after the last candidate were skipped in bulk
                 at_end = finished and (nxt or cur.offset == size)
             finally:
                 os.close(fd)
