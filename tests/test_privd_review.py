@@ -503,5 +503,6 @@ def test_a_stored_plan_is_bound_to_the_op_and_parameters_it_was_computed_for(pri
     res = r["result"] if r.get("ok") else r
     assert res.get("reason_code", res.get("code")) == "DENY_STALE_PLAN", r
     assert not [d for d in os.listdir(e.paths.work) if os.path.exists(f"{e.paths.work}/{d}/effect.mark")]       # nothing ran
+    assert e.ledger.get(job["job_id"]).state == "denied" and e.backend.show(op_unit_name(job["job_id"], 1)) is None      # refused at the gate: no worker was even started (the worker's own re-check is a second layer)
     env2, _ = e.job_env(plan_hash=plan["plan_hash"], params={"note": "a"})
     assert result(e.call("exec", {"job": env2}))["status"] == "committed"                                    # the plan it was computed for still works
