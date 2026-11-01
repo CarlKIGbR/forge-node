@@ -158,7 +158,7 @@ M = [
  ("n3-gate-window-ignored", "privd/gate.py", "    if st.entry.mutating and _policy(st).view.window.in_blackout(st.ctx.now()):", "    if False:", "tests/test_n3_named.py"),
  ("n3-gate-node-rate-ignored", "privd/gate.py", "        _rate(st, \"node.mutating\", NODE_MUTATING_RATE)", "        pass", "tests/test_privd_gate.py"),
  ("n3-gate-approval-namespace", "privd/gate.py", "sshsig.NS_APPROVAL, OWNER_PRINCIPAL", "sshsig.NS_POLICY, OWNER_PRINCIPAL", "tests/test_privd_gate.py"),
- ("n3-gate-plan-not-required", "privd/gate.py", "    if ph is None or st.ctx.ledger.plan_get(ph, st.ctx.now().timestamp()) is None:", "    if False:", "tests/test_privd_gate.py"),
+ ("n3-gate-plan-not-required", "privd/gate.py", "    if plan is None:\n        raise Deny(\"DENY_STALE_PLAN\", \"no stored, unexpired plan for this plan_hash\")", "    if False:\n        raise Deny(\"DENY_STALE_PLAN\", \"no stored, unexpired plan for this plan_hash\")", "tests/test_privd_gate.py"),
  ("n3-gate-no-fresh-stop", "privd/gate.py", "    _fresh_stop_check(st)\n    props", "    props", "tests/test_privd_gate.py"),
  ("n3-gate-replay-reexecutes", "privd/gate.py", "    elif c.kind == \"replay\":", "    elif False:", "tests/test_privd_ledger.py"),
  ("n3-gate-job-unverified", "privd/gate.py", "        st.job = protocol.verify_job(env, _gate_keys(st), st.ctx.node, st.ctx.now(), st.ctx.ssh_keygen)", "        st.job = __import__(\"json\").loads(env[\"payload\"])", "tests/test_n3_named.py"),
