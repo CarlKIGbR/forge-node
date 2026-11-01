@@ -153,7 +153,7 @@ def test_resolver_incomplete_resolution_is_protected_hit():
     assert res(graph(U("forge-x.service", Requires="gone.service"))).denied
     assert not res(graph(U("forge-x.service", Wants="gone.service"))).denied
     # an oversized closure is a hit
-    units = [U("forge-x.service", Wants=" ".join(f"w{i}.service" for i in range(450)))] + [U(f"w{i}.service") for i in range(450)]
+    units = [U("forge-x.service", Wants=" ".join(f"w{i}.service" for i in range(R.MAX_UNITS + 50)))] + [U(f"w{i}.service") for i in range(R.MAX_UNITS + 50)]
     assert res(graph(*units)).denied
 
 
@@ -418,3 +418,69 @@ def test_real_mount_unit_output_of_this_systemd():
     seen = []
     R.systemctl_provider("/usr/bin/systemctl", lambda argv, *a: seen.append(argv) or (0, b"Id=x\n", b""))("srv-models.mount")
     assert "Where" in seen[0][seen[0].index("-p") + 1].split(",")
+
+
+# ================================================================================================================= round 2 findings
+def test_a_restart_starts_the_dependents_again_so_their_dependencies_and_conflicts_are_part_of_it():
+    """Round 2 (MAJOR): systemd restarts each active dependent of x (RequiredBy/BoundBy/ConsistsOf); the dependent's START pulls in its closure and applies its Conflicts=."""
+    g = graph(U("forge-x.service", RequiredBy="forge-d.service"), U("forge-d.service", Wants="kmu-p.service"), U("kmu-p.service", ActiveState="inactive"))
+    for action in ("restart", "try-restart", "reload-or-restart"):
+        assert "kmu-p.service" in hit_units(res(g, action=action)), action
+    g = graph(U("forge-x.service", RequiredBy="forge-d.service"), U("forge-d.service", Conflicts="kmu-q.service"), U("kmu-q.service", ActiveState="inactive"))
+    assert "kmu-q.service" in hit_units(res(g, action="restart"))
+    # a plain dependent without such edges stays clean
+    g = graph(U("forge-x.service", RequiredBy="forge-d.service"), U("forge-d.service"))
+    assert not res(g, action="restart").denied
+
+
+def test_reload_propagation_is_transitive():
+    g = graph(U("forge-x.service", PropagatesReloadTo="forge-y.service"), U("forge-y.service", PropagatesReloadTo="kmu-z.service"), U("kmu-z.service"))
+    for action in ("reload", "reload-or-restart"):
+        r = res(g, action=action)
+        assert "kmu-z.service" in hit_units(r) and "kmu-z.service" in r.X, action
+
+
+def test_units_that_stop_when_unneeded_are_found_below_the_whole_stop_closure():
+    g = graph(U("forge-x.service", RequiredBy="forge-y.service"), U("forge-y.service", Requires="kmu-z.service"), U("kmu-z.service", StopWhenUnneeded="yes"))
+    r = res(g, action="stop")
+    assert "kmu-z.service" in hit_units(r) and "kmu-z.service" in r.S
+    for action in ("disable", "mask"):
+        assert "kmu-z.service" in hit_units(res(g, action=action)), action
+
+
+def test_enable_resolves_the_boot_time_start_of_the_unit_dependencies_and_conflicts():
+    """Round 2 (design gap): `enable forge-x` with Conflicts=ollama.service stops ollama at the next boot - it must not be 'clean'."""
+    text = lambda n: "[Install]\nWantedBy=multi-user.target\n"                                    # noqa: E731
+    g = graph(U("forge-x.service", Conflicts="ollama.service"), U("ollama.service"), U("multi-user.target"))
+    assert "ollama.service" in hit_units(res(g, action="enable", text=text))
+    g = graph(U("forge-x.service", Requires="kmu-db.service"), U("kmu-db.service", ActiveState="inactive"), U("multi-user.target"))
+    assert "kmu-db.service" in hit_units(res(g, action="enable", text=text))
+    g = graph(U("forge-x.service"), U("multi-user.target"))
+    assert not res(g, action="enable", text=text).denied
+
+
+def test_the_size_limit_counts_everything_that_was_enumerated():
+    units = [U("forge-x.service", Wants=" ".join(f"w{i}.service" for i in range(50)))] + [U(f"w{i}.service", Wants=" ".join(f"w{i}x{j}.service" for j in range(40))) for i in range(50)]
+    units += [U(f"w{i}x{j}.service") for i in range(50) for j in range(40)]
+    g = graph(*units)
+    r = res(g)
+    assert r.denied and any("too large" in h.reason for h in r.hits)
+
+
+def test_mutations_the_round_2_reviewer_found_to_pass_all_tests():
+    """BoundBy / PropagatesStopTo / ConsistsOf as stop edges, a Conflicts= on a TRANSITIVE dependency, the Names alias check, UpheldBy at enable, On*= data in the hash."""
+    for key in ("BoundBy", "PropagatesStopTo", "ConsistsOf"):
+        g = graph(U("forge-x.service", **{key: "kmu-a.service"}), U("kmu-a.service"))
+        assert "kmu-a.service" in hit_units(res(g, action="stop")), key
+    g = graph(U("forge-x.service", Wants="forge-y.service"), U("forge-y.service", Conflicts="ollama.service"), U("ollama.service"))
+    assert "ollama.service" in hit_units(res(g))                                                  # the conflict is on a dependency, not on the requested unit
+    g = graph(U("forge-x.service"), U("kmu-main.service", Names='kmu-main.service "alias.service"', ActiveState="inactive"))
+    g2 = graph(U("forge-x.service", Wants="alias-holder.service"), U("alias-holder.service", Names="alias-holder.service kmu-hidden.service", ActiveState="inactive"))
+    assert "alias-holder.service" in hit_units(res(g2))                                           # protected under another of its names (kmu-*)
+    g3 = graph(U("forge-x.service", UpheldBy="kmu-u.service"), U("kmu-u.service"))
+    assert "kmu-u.service" in hit_units(res(g3, action="enable", text=lambda n: "[Install]\nWantedBy=multi-user.target\n"))
+    base = graph(U("forge-x.service", Wants="forge-y.service"), U("forge-y.service", OnFailure="x.service"), U("x.service"))
+    other = graph(U("forge-x.service", Wants="forge-y.service"), U("forge-y.service"), U("x.service"))
+    h1 = R.resolve(base, NOTEXT, "forge-x.service", "start", job_mode="replace", protected_units=PU, protected_paths=PP)
+    h2 = R.resolve(other, NOTEXT, "forge-x.service", "start", job_mode="replace", protected_units=PU, protected_paths=PP)
+    assert h1.closure_sha256() != h2.closure_sha256()                                              # On*= data of members is bound into the hash (gate C's future recursion starts from it)

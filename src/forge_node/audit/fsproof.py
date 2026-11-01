@@ -28,12 +28,16 @@ def _refused(fn) -> str:
     return "SUCCEEDED" if _try(fn) is None else "refused"
 
 
-FALLOC = {"punch_hole": 0x01 | 0x02, "zero_range": 0x10, "collapse_range": 0x08, "insert_range": 0x20}      # FALLOC_FL_*: PUNCH_HOLE|KEEP_SIZE, ZERO_RANGE, COLLAPSE_RANGE, INSERT_RANGE
+BLOCK = 4096
+# FALLOC_FL_*: PUNCH_HOLE|KEEP_SIZE, ZERO_RANGE, COLLAPSE_RANGE, INSERT_RANGE - with BLOCK-ALIGNED offsets and lengths on a file of several blocks (collapse/insert reject anything else with
+# EINVAL even on an unflagged file, which would make "refused" meaningless)
+FALLOC = {"punch_hole": (0x01 | 0x02, 0, BLOCK), "zero_range": (0x10, 0, BLOCK), "collapse_range": (0x08, BLOCK, BLOCK), "insert_range": (0x20, BLOCK, BLOCK)}
+RWF_NOAPPEND = 0x20                                  # pwritev2 flag (Linux 6.9+): write at the given offset even on an O_APPEND descriptor; Python 3.12 has no os.RWF_NOAPPEND
 
 
-def _fallocate(fd: int, mode: int) -> None:
+def _fallocate(fd: int, mode: int, off: int, length: int) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
-    if libc.fallocate(fd, mode, ctypes.c_longlong(0), ctypes.c_longlong(1)) != 0:
+    if libc.fallocate(fd, mode, ctypes.c_longlong(off), ctypes.c_longlong(length)) != 0:
         e = ctypes.get_errno()
         raise OSError(e, os.strerror(e))
 
@@ -44,10 +48,7 @@ def _clear_append_then_overwrite(fd: int) -> None:
 
 
 def _noappend_overwrite(fd: int) -> None:
-    flag = getattr(os, "RWF_NOAPPEND", None)
-    if flag is None:
-        raise OSError(errno.ENOSYS, "RWF_NOAPPEND is not available")
-    os.pwritev(fd, [b"Z"], 0, flag)
+    os.pwritev(fd, [b"Z"], 0, RWF_NOAPPEND)
 
 
 def _pwrite_leaves_first_byte(fd_append: int, fd_read: int) -> bool:
@@ -124,12 +125,14 @@ def prove(directory: str) -> dict:
         return report
     _sweep_stale(dfd)
     sub = f".fsproof-{os.getpid()}-{secrets.token_hex(4)}"
-    sfd = fd = early_nonappend = early_append = late_append = -1
+    sfd = fd = early_nonappend = early_append = late_append = ctl_fd = -1
     try:
         os.mkdir(sub, 0o700, dir_fd=dfd)
         sfd = os.open(sub, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
         fd = os.open("canary", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=sfd)
-        os.write(fd, b"canary\n")
+        os.write(fd, b"canary\n" + b"\0" * (3 * BLOCK))                                                     # several blocks: the range operations below need room
+        ctl_fd = os.open("control", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=sfd)          # same content, NEVER flagged
+        os.write(ctl_fd, b"canary\n" + b"\0" * (3 * BLOCK))
         early_nonappend = os.open("canary", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=sfd)                     # opened BEFORE +a, no O_APPEND
         early_append = os.open("canary", os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW, dir_fd=sfd)
         try:
@@ -142,10 +145,17 @@ def prove(directory: str) -> dict:
         checks["append_through_descriptor_opened_before_flag"] = {"expected": "informational", "got": _try(lambda: os.write(early_append, b"x\n")) is None, "ok": True}
         late_append = os.open("canary", os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=sfd)         # what a live writer holds: opened after +a
         rec("append_through_descriptor_opened_after_flag", None, _try(lambda: os.write(late_append, b"x\n")))
-        for name, mode in FALLOC.items():
-            rec(f"live_{name}_refused", "refused", _refused(lambda m=mode: _fallocate(late_append, m)))
-        rec("live_clear_o_append_then_overwrite_refused", "refused", _refused(lambda: _clear_append_then_overwrite(late_append)))
-        rec("live_rwf_noappend_overwrite_refused", "refused", _refused(lambda: _noappend_overwrite(late_append)))
+        def escape(name: str, call) -> None:
+            """The route must be refused on the flagged file; a positive control on an unflagged file shows that this kernel/filesystem performs it at all (else: not observable here)."""
+            control = _try(lambda: call(ctl_fd))
+            if control is not None:
+                checks[name] = {"expected": "refused", "got": f"not observable here (the unflagged control fails with {errno.errorcode.get(control, control)})", "ok": True}
+            else:
+                rec(name, "refused", _refused(lambda: call(late_append)))
+        for name, (mode, off, ln) in FALLOC.items():
+            escape(f"live_{name}_refused", lambda f, m=mode, o=off, n=ln: _fallocate(f, m, o, n))
+        escape("live_clear_o_append_then_overwrite_refused", _clear_append_then_overwrite)
+        escape("live_rwf_noappend_overwrite_refused", _noappend_overwrite)
         rec("live_overwrite_via_pwrite_on_append_descriptor_leaves_the_bytes", True, _pwrite_leaves_first_byte(late_append, fd))
         rec("fresh_open_for_write_without_append_refused", EXPECTED_REFUSED, _try(lambda: os.close(os.open("canary", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=sfd))))
         rec("chmod_refused", EXPECTED_REFUSED, _try(lambda: os.fchmod(fd, 0o440)))
@@ -175,11 +185,11 @@ def prove(directory: str) -> dict:
         try:
             if fd >= 0:
                 fsflags.clear_flags(fd, fsflags.APPEND | fsflags.IMMUTABLE)
-            for c in (early_nonappend, early_append, late_append):
+            for c in (early_nonappend, early_append, late_append, ctl_fd):
                 if c >= 0:
                     os.close(c)
             if sfd >= 0:
-                for n in ("canary", "canary2", "canary3"):
+                for n in ("canary", "canary2", "canary3", "control"):
                     try:
                         os.unlink(n, dir_fd=sfd)
                     except FileNotFoundError:

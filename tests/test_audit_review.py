@@ -9,7 +9,7 @@ from test_audit_gate_d import _check_recovered, _scenario
 from forge_node import canon, chain
 from forge_node.audit import fsflags, reader
 from forge_node.audit.log import AuditAdmin
-from forge_node.audit.spec import AuditCorrupt
+from forge_node.audit.spec import AuditCorrupt, AuditDown
 
 
 @pytest.fixture
@@ -310,14 +310,16 @@ def test_fsproof_covers_the_live_file_escape_routes_and_does_not_demand_the_kern
     assert rep["ok"] and rep["cleanup"], rep
     c = rep["checks"]
     for k in ("live_punch_hole_refused", "live_zero_range_refused", "live_collapse_range_refused", "live_insert_range_refused", "live_clear_o_append_then_overwrite_refused",
-              "live_rwf_noappend_overwrite_refused", "live_overwrite_via_pwrite_on_append_descriptor_leaves_the_bytes", "append_through_descriptor_opened_after_flag"):
+              "live_rwf_noappend_overwrite_refused"):
+        assert c[k]["ok"] and c[k]["got"] == "refused", (k, c[k])                                  # on this ext4 the route EXISTS (the unflagged control performs it) and is refused when flagged
+    for k in ("live_overwrite_via_pwrite_on_append_descriptor_leaves_the_bytes", "append_through_descriptor_opened_after_flag"):
         assert c[k]["ok"], (k, c[k])
     assert c["append_through_descriptor_opened_before_flag"]["expected"] == "informational"            # a stricter future kernel must not make doctor fail
 
 
 def test_fsproof_fails_when_a_live_escape_route_works(realfs, monkeypatch):
     from forge_node.audit import fsproof
-    monkeypatch.setattr(fsproof, "_fallocate", lambda fd, mode: None)                                 # as if the kernel let a punch-hole through
+    monkeypatch.setattr(fsproof, "_fallocate", lambda *a: None)                                       # as if the kernel let every range operation through (the control succeeds too)
     rep = fsproof.prove(realfs)
     assert not rep["ok"] and not rep["checks"]["live_punch_hole_refused"]["ok"]
 
@@ -384,3 +386,367 @@ def test_recovery_never_deletes_an_unflagged_file_in_a_reachable_directory(specs
     os.chmod(f"{s.dir}/priv.000002", 0o700)
     assert any("rebuilt" in x or "removed the incomplete" in x or "built generation 2" in x for x in admin(s).recover())
     assert admin(s).verify() == []
+
+
+# ----------------------------------------------------------------------------------------------------- round 2: the window BEFORE our write
+def _hostile_before_the_write(monkeypatch, s, payload):
+    """Make `payload` land in the log file after the writer looked at the tail and before its write()."""
+    from forge_node.audit import log as audit_log
+    real = audit_log._write_all
+    fired = []
+
+    def hostile_then_real(fd, data):
+        if not fired:
+            fired.append(1)
+            append_raw(live(s), payload() if callable(payload) else payload)
+        return real(fd, data)
+    monkeypatch.setattr(audit_log, "_write_all", hostile_then_real)
+    return fired
+
+
+@pytest.mark.parametrize("kind", ["valid-continuation", "fragment"])
+def test_a_forged_head_that_wins_the_race_before_our_write_makes_the_append_fail_instead_of_losing_the_record(specs, monkeypatch, kind):
+    """Round 2 (MAJOR): the O_APPEND write went after the forger's bytes, the writer cached its own record as the head and kept 'recording' records that were not in the chain. A valid
+    forged continuation takes the head; an unterminated fragment merges with our line. Either way our record is not chained: AuditDown, nothing claimed, the retry works."""
+    s = specs["agent"]
+    a = agent_log(specs)
+    head = a.head()
+    payload = (lambda: forged(head[0] + 1, head[1])) if kind == "valid-continuation" else b'{"junk":'
+    fired = _hostile_before_the_write(monkeypatch, s, payload)
+    with pytest.raises(AuditDown, match="concurrent writer"):
+        a.append("t0", {"lost": "race"})
+    assert fired
+    monkeypatch.undo()
+    r = a.append("t0", {"after": "race"})
+    shipped = read_chain(s)
+    assert shipped[-1]["seq"] == r["seq"] and chain.verify_chain(shipped) == []
+    assert a.head()[0] == r["seq"] == admin(s).head()[0]                                  # a warm and a cold writer agree on the head
+
+
+def test_junk_before_our_write_does_not_fail_the_append_and_both_views_of_the_head_agree(specs, monkeypatch):
+    s = specs["agent"]
+    a = agent_log(specs)
+    _hostile_before_the_write(monkeypatch, s, b"GARBAGE LINE\n")
+    r = a.append("t0", {"x": 1})
+    monkeypatch.undo()
+    assert a.head()[0] == r["seq"] == admin(s).head()[0] and [x["seq"] for x in read_chain(s)][-1] == r["seq"]
+    assert a.verify() == []                                                               # the agent log tolerates (and counts) bytes it did not write
+
+
+def test_the_same_race_while_repairing_a_tail(specs, monkeypatch):
+    s = specs["agent"]
+    a = agent_log(specs)
+    append_raw(live(s), b'{"torn":')
+    head = a.head()
+    # the repair record's chain position is head+1; a forger takes it first
+    _hostile_before_the_write(monkeypatch, s, lambda: b"\n" + forged(head[0] + 1, head[1]))
+    with pytest.raises(AuditDown, match="concurrent writer"):
+        a.append("t0", {"during": "repair"})
+    monkeypatch.undo()
+    r = a.append("t0", {"after": "repair"})
+    assert [x["seq"] for x in read_chain(s)][-1] == r["seq"] and chain.verify_chain(read_chain(s)) == []
+
+
+def test_fsproof_says_so_when_a_route_cannot_be_observed_instead_of_passing_it_silently(realfs, monkeypatch):
+    """Round 2: three checks were vacuous (EINVAL on any file, a missing constant) and read 'refused' whatever the kernel did. Now a positive control on an unflagged file decides."""
+    from forge_node.audit import fsproof
+
+    def always_einval(fd, mode, off, ln):
+        raise OSError(22, "EINVAL")
+    monkeypatch.setattr(fsproof, "_fallocate", always_einval)
+    rep = fsproof.prove(realfs)
+    c = rep["checks"]["live_punch_hole_refused"]
+    assert rep["ok"] and c["got"].startswith("not observable here") and "EINVAL" in c["got"]
+
+
+def test_fsproof_controls_prove_the_routes_work_on_an_unflagged_file(realfs):
+    """The ranges are block-aligned on a multi-block file: the same calls succeed on an unflagged file of this filesystem."""
+    import ctypes
+    from forge_node.audit import fsproof
+    path = os.path.join(realfs, "ctl")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    os.write(fd, b"\0" * (4 * fsproof.BLOCK))
+    for name, (mode, off, ln) in fsproof.FALLOC.items():
+        fsproof._fallocate(fd, mode, off, ln)                                          # raises if the parameters are not valid for this filesystem
+    fsproof._noappend_overwrite(fd)
+    fsproof._clear_append_then_overwrite(fd)
+    os.close(fd)
+    os.unlink(path)
+
+
+# ----------------------------------------------------------------------------------------------------- round 2: recovery and purge corner cases
+def _killed_rotation_before_current(specs, name):
+    """Rotation killed right before CURRENT is switched: generation 2 complete, flagged and REACHABLE, CURRENT still names generation 1 (sealed)."""
+    sub = _scenario(specs, name)
+    probe = _scenario(specs, name + "-probe")
+    killed, total, calls = in_child(lambda: admin(probe).rotate())
+    assert not killed
+    idx = max(i for i, c in enumerate(calls, 1) if c == "rename")                           # the CURRENT.tmp -> CURRENT rename is the last rename of a rotation
+    kd, _, _ = in_child(lambda: admin(sub).rotate(), kill_at=idx, when="before")
+    assert kd and admin(sub)._read_current() == 1
+    return sub
+
+
+def test_agent_bytes_in_the_reachable_but_not_yet_switched_successor_are_damage_not_a_quarantine(specs):
+    """Round 2 (MINOR): between step 5 (reachable) and step 6 (CURRENT) a hostile agent can append to its own new file; a crash there used to leave the agent log un-recoverable."""
+    sub = _killed_rotation_before_current(specs, "m2")
+    append_raw(live(sub, 2), b'{"junk":1}\n')
+    actions = admin(sub).recover()
+    assert any("rotation to generation 2" in a for a in actions)
+    r = admin(sub)
+    assert r.verify() == []                                                                 # the junk was accounted for by a tail_repair, before the recovery record
+    assert [x["type"] for x in file_records(live(sub, 2)) if "hash" in x][:3] == ["chain_link", "tail_repair", "recovery"]
+    assert r.append("t0", {})["seq"] > 1
+
+
+def test_a_successor_that_holds_chained_records_was_used_and_is_not_adopted(specs):
+    sub = _killed_rotation_before_current(specs, "m2b")
+    a = admin(sub)
+    # a forger (or a bug) wrote a VALID continuation of the chain_link into the not-yet-current file
+    link = file_records(live(sub, 2))[0]
+    append_raw(live(sub, 2), forged(link["seq"] + 1, link["hash"]))
+    with pytest.raises(AuditCorrupt, match="has been used"):
+        a.recover()
+
+
+def test_recovery_refuses_to_reseal_a_generation_that_changed_while_it_had_no_flags(specs):
+    """Round 2 (MINOR): a descriptor that predates the seal can write once purge has cleared the flags; recover() re-sealed whatever was there."""
+    from datetime import timedelta
+    sub = _purge_scenario_for(specs, "m3")
+    gdir = f"{sub.dir}/priv.000001"
+    os.chmod(gdir, 0o700)
+    ro = os.open(f"{gdir}/priv.000001.jsonl", os.O_RDONLY)
+    fsflags.clear_flags(ro, fsflags.APPEND | fsflags.IMMUTABLE)
+    old_fd = os.open(f"{gdir}/priv.000001.jsonl", os.O_RDWR)                                # a descriptor that PREDATES the seal (permissions are checked at open())
+    fsflags.add_flags(ro, fsflags.APPEND | fsflags.IMMUTABLE)                               # ... the generation is sealed again, as it was
+    fsflags.clear_flags(ro, fsflags.APPEND | fsflags.IMMUTABLE)                             # purge clears the flags, then dies before the unlink
+    os.pwrite(old_fd, b"X", 5)                                                              # the old descriptor writes
+    os.close(old_fd)
+    os.close(ro)
+    with pytest.raises(AuditCorrupt, match="no longer matches"):
+        admin(sub).recover()
+    fd = os.open(f"{gdir}/priv.000001.jsonl", os.O_RDONLY)
+    assert not fsflags.is_sealed(fsflags.get_flags(fd))                                      # not laundered into a sealed file
+    os.close(fd)
+
+
+def test_an_unmodified_flagless_generation_is_resealed(specs):
+    sub = _purge_scenario_for(specs, "m3ok")
+    gdir = f"{sub.dir}/priv.000001"
+    os.chmod(gdir, 0o700)
+    fd = os.open(f"{gdir}/priv.000001.jsonl", os.O_RDONLY)
+    fsflags.clear_flags(fd, fsflags.APPEND | fsflags.IMMUTABLE)
+    os.close(fd)
+    assert any("re-sealed generation 1" in a for a in admin(sub).recover())
+    assert admin(sub).verify() == []
+
+
+def _purge_scenario_for(specs, name):
+    sub = make_specs(os.path.join(os.path.dirname(specs["priv"].dir), name), max_file_bytes=10 ** 7)["priv"]
+    a = admin(sub)
+    a.init()
+    for _ in range(4):
+        a.append("t0", {})
+        a.rotate()
+    a.append("t0", {})
+    a.close()
+    return sub
+
+
+def test_a_recovery_that_was_killed_after_it_changed_something_is_still_recorded(specs):
+    """Round 2 (MINOR): killed between the CURRENT switch and the `recovery` record, the next recovery found nothing to do and the record never existed."""
+    sub = _killed_rotation_before_current(specs, "m4")
+    probe = _killed_rotation_before_current(specs, "m4p")
+    killed, total, calls = in_child(lambda: admin(probe).recover())
+    assert not killed
+    cur_switch = max(i for i, c in enumerate(calls, 1) if c == "rename")                    # the recovery's own CURRENT rename
+    kd, _, _ = in_child(lambda: admin(sub).recover(), kill_at=cur_switch, when="after")
+    assert kd and admin(sub)._read_current() == 2                                          # CURRENT was switched; the record was not written
+    assert not [r for r in file_records(live(sub, 2)) if r["type"] == "recovery"]
+    actions = admin(sub).recover()
+    assert actions and "interrupted" in actions[0]
+    rec = [r for r in file_records(live(sub, 2)) if r["type"] == "recovery"]
+    assert len(rec) == 1 and "interrupted" in rec[0]["actions"][0]
+    assert admin(sub).recover() == [] and not os.path.exists(f"{sub.dir}/RECOVERY.pending")
+
+
+def test_verify_reads_sealed_generations_without_the_lock_and_the_live_one_with_it(specs, monkeypatch):
+    """Round 2 (minor): verify() held the log's lock across every generation; a 64 MiB file takes seconds and the writers wait 10."""
+    import fcntl
+    from forge_node.audit import log as audit_log
+    s = specs["priv"]
+    a = admin(s)
+    a.init()
+    for _ in range(3):
+        a.append("t0", {})
+        a.rotate()
+    a.append("t0", {})
+    real = audit_log.verify_file
+    seen = []
+
+    def spy(fd, *args, **kw):
+        probe = os.open(s.lock, os.O_RDWR)
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            seen.append("free")
+            fcntl.flock(probe, fcntl.LOCK_UN)
+        except BlockingIOError:
+            seen.append("held")
+        finally:
+            os.close(probe)
+        return real(fd, *args, **kw)
+    monkeypatch.setattr(audit_log, "verify_file", spy)
+    assert a.verify() == []
+    assert seen == ["free", "free", "free", "held"]                                               # three sealed generations, then the live one
+
+
+def test_the_reader_returns_what_it_read_when_the_next_generation_is_not_reachable_yet(specs):
+    """Round 2 (minor): a hidden successor (rotation between steps 4 and 5, a purge in progress) raised PermissionError and threw away the records already read from the previous file."""
+    s = specs["agent"]
+    a = agent_log(specs, 3)
+    os.mkdir(f"{s.dir}/audit.000002", 0o700)                                                      # a successor the agent uid could not enter
+    os.chown(f"{s.dir}/audit.000002", 0, 0)
+    fd = os.open(live(s, 1), os.O_RDONLY)
+    fsflags.add_flags(fd, fsflags.IMMUTABLE)
+    os.close(fd)
+
+    def as_agent():
+        cur = reader.start_cursor(s.dir, s.prefix, NODE, s.source, 0)
+        got = reader.read_batch(s.dir, s.prefix, NODE, s.source, cur, 0, 100)
+        return [x["seq"] for x in got]
+    from audit_helpers import run_as_agent
+    assert run_as_agent(as_agent) == [1, 2, 3, 4]
+    fd = os.open(live(s, 1), os.O_RDONLY)
+    fsflags.clear_flags(fd, fsflags.IMMUTABLE)
+    os.close(fd)
+    os.rmdir(f"{s.dir}/audit.000002")
+
+
+# ----------------------------------------------------------------------------------------------------- round 2: tests that claimed more than they proved
+def sealed_record(typ, seq, prev, **fields):
+    return canon.canonical(chain.seal_record({"ts": "2026-10-31T13:40:10Z", "node": NODE, "type": typ, **fields}, seq, prev)) + b"\n"
+
+
+@pytest.mark.parametrize("kind", ["right-seq-wrong-prev", "right-prev-wrong-seq"])
+def test_a_forgery_that_matches_only_half_of_the_chain_position_is_damage(specs, kind):
+    """Round 2: the earlier forgery tests got BOTH fields wrong at once, so a head finder that ignored one of them still passed."""
+    s = specs["agent"]
+    a = agent_log(specs)
+    head = a.head()
+    forged_line = sealed_record("t0", head[0] + 1, "e" * 64) if kind == "right-seq-wrong-prev" else sealed_record("t0", head[0] + 7, head[1])
+    append_raw(live(s), forged_line)
+    r = a.append("t0", {"after": kind})
+    assert r["seq"] == head[0] + 2 and r["prev_hash"] != head[1] or r["seq"] == head[0] + 2                      # seq head+1 is the tail_repair that names the forgery
+    shipped = read_chain(s)
+    assert [x["seq"] for x in shipped] == list(range(1, head[0] + 3)) and chain.verify_chain(shipped) == []
+    assert admin(s).head() == a.head()
+
+
+@pytest.mark.parametrize("kind", ["right-seq-wrong-prev", "right-prev-wrong-seq"])
+def test_verify_does_not_accept_a_half_matching_record_into_the_chain(specs, kind):
+    s = specs["priv"]
+    a = admin(s)
+    a.init()
+    a.append("t0", {})
+    head = a.head()
+    append_raw(live(s), sealed_record("t0", head[0] + 1, "e" * 64) if kind == "right-seq-wrong-prev" else sealed_record("t0", head[0] + 7, head[1]))
+    problems = a.verify()
+    assert any("damaged bytes" in p for p in problems), problems                                  # it is trailing damage, not a chain record
+
+
+def test_the_priv_log_is_strict_damage_between_chain_records_without_a_tail_repair_is_a_problem(specs):
+    s = specs["priv"]
+    a = admin(s)
+    a.init()
+    a.append("t0", {})
+    head = a.head()
+    append_raw(live(s), b"JUNK LINE\n")
+    append_raw(live(s), sealed_record("t0", head[0] + 1, head[1]))                              # a valid next record, hand-written: no tail_repair names the junk
+    assert any("not accounted for" in p for p in a.verify())
+    # the agent log tolerates and counts the same thing
+    s2 = specs["agent"]
+    b = agent_log(specs, 1)
+    h2 = b.head()
+    append_raw(live(s2), b"JUNK LINE\n")
+    append_raw(live(s2), sealed_record("t0", h2[0] + 1, h2[1]))
+    assert b.verify() == []
+
+
+def test_a_tail_repair_that_does_not_describe_the_damage_is_a_problem(specs):
+    s = specs["priv"]
+    a = admin(s)
+    a.init()
+    a.append("t0", {})
+    head = a.head()
+    append_raw(live(s), b"TORN")
+    append_raw(live(s), b"\n" + sealed_record("tail_repair", head[0] + 1, head[1], bytes=4, inserted_newline=True, sha256="0" * 64))      # the right length, the wrong digest
+    assert any("does not describe" in p for p in a.verify())
+
+
+def test_verify_notices_a_sealed_predecessor_that_no_longer_matches_the_chain_link(specs):
+    s = specs["priv"]
+    a = admin(s)
+    a.init()
+    a.append("t0", {})
+    a.rotate()
+    fd = os.open(live(s, 1), os.O_RDONLY)
+    fsflags.clear_flags(fd, fsflags.APPEND | fsflags.IMMUTABLE)
+    append_raw(live(s, 1), b"X")                                                                  # the sealed file changes after its successor recorded its sha256
+    fsflags.add_flags(fd, fsflags.APPEND | fsflags.IMMUTABLE)
+    os.close(fd)
+    assert any("chain_link does not match the sealed predecessor" in p for p in a.verify())
+
+
+def test_purge_never_removes_a_generation_that_is_not_sealed(specs):
+    from datetime import timedelta
+    sub = _purge_scenario(specs, "unsealed")
+    a = admin(sub)
+    fd = os.open(f"{sub.dir}/priv.000001/priv.000001.jsonl", os.O_RDONLY)
+    fsflags.clear_flags(fd, fsflags.APPEND | fsflags.IMMUTABLE)
+    os.close(fd)
+    assert a.purge(a.head()[0], Clock()() + timedelta(days=200)) == []
+    assert os.path.exists(f"{sub.dir}/priv.000001/priv.000001.jsonl")
+
+
+def test_recovery_will_not_touch_a_reachable_generation_that_lost_its_seal(specs):
+    sub = _purge_scenario(specs, "lostseal")
+    fd = os.open(f"{sub.dir}/priv.000001/priv.000001.jsonl", os.O_RDONLY)
+    fsflags.clear_flags(fd, fsflags.APPEND | fsflags.IMMUTABLE)
+    os.close(fd)
+    with pytest.raises(AuditCorrupt, match="lost its seal while reachable"):
+        admin(sub).recover()
+
+
+def _sealed_gen1_with_a_hand_made_successor(specs, name, successor_bytes):
+    s = _scenario(specs, name)
+    a = admin(s)
+    fd = os.open(live(s, 1), os.O_RDONLY)
+    fsflags.add_flags(fd, fsflags.IMMUTABLE)
+    prev = a._sealed_description(fd)
+    os.close(fd)
+    fields, seq, prev_hash = a._chain_link_fields(2, prev)
+    os.mkdir(f"{s.dir}/priv.000002", 0o700)
+    os.chown(f"{s.dir}/priv.000002", 0, s.gid)
+    with open(live(s, 2), "wb") as f:
+        f.write(successor_bytes(fields, seq, prev_hash))
+    os.chmod(live(s, 2), s.file_mode)
+    os.chown(live(s, 2), 0, s.gid)
+    return s
+
+
+def test_an_incomplete_successor_in_the_private_directory_is_rebuilt_even_when_it_has_extra_bytes(specs):
+    """The unflagged successor sits in a 0700 directory: it must be EXACTLY its chain_link, else it is a torn write and is rebuilt."""
+    s = _sealed_gen1_with_a_hand_made_successor(specs, "torn2", lambda fields, seq, prev_hash: sealed_record("chain_link", seq, prev_hash, **fields) + b"x")
+    actions = admin(s).recover()
+    assert any("removed the incomplete successor" in a for a in actions) and admin(s).verify() == []
+
+
+def test_a_successor_whose_chain_link_has_the_right_fields_but_a_wrong_prev_hash_is_quarantined_once_it_is_flagged(specs):
+    """An UNFLAGGED wrong successor in the 0700 directory is simply rebuilt; a FLAGGED one (+a: it may have been live) is never touched - it is quarantined."""
+    s = _sealed_gen1_with_a_hand_made_successor(specs, "wrongprev", lambda fields, seq, prev_hash: sealed_record("chain_link", seq, "f" * 64, **fields))
+    fd = os.open(live(s, 2), os.O_RDONLY)
+    fsflags.add_flags(fd, fsflags.APPEND)
+    os.close(fd)
+    with pytest.raises(AuditCorrupt, match="chain_link mismatch"):
+        admin(s).recover()
+    assert os.path.exists(live(s, 2))

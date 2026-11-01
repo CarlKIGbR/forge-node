@@ -52,7 +52,7 @@ ALL_PROPS = REL_PROPS + GATE_C_PROPS + META_PROPS
 MOUNT_UNITS = (".mount", ".automount")
 INSTALL_KEYS = ("WantedBy", "RequiredBy", "UpheldBy", "Alias", "Also")
 MAX_ALSO = 16
-MAX_UNITS = 400
+MAX_UNITS = 1200
 
 
 @dataclass(frozen=True)
@@ -275,7 +275,7 @@ class _Walker:
                     if q is None:
                         continue
                     seen.add(v)
-                    if len(seen) + len(self.res.members) > MAX_UNITS:
+                    if len(self.cache) > MAX_UNITS:
                         self.res.hits.append(Hit(v, "closure too large to enumerate", f"{u} —{k}→ {v}"))
                         return seen
                     todo.append((v, f"{u} —{k}→ {v}"))
@@ -298,9 +298,10 @@ def resolve(provider: Callable[[str], dict | None], text_of: Callable[[str], str
         return res
     w.record(unit, root)
 
-    def start_sets():
-        F = w.closure(unit, FORWARD, STRONG)
-        for u in {unit} | F:                                       # sockets/timers: whatever they trigger is activated later
+    def start_sets(u0: str = unit):
+        """F, C, S of STARTING `u0` (the requested unit, or a dependent that a restart restarts)."""
+        F = w.closure(u0, FORWARD, STRONG)
+        for u in {u0} | F:                                       # sockets/timers: whatever they trigger is activated later
             p = w.props(u, "", strong=False)
             if p:
                 for t in p.get("Triggers", []):
@@ -308,7 +309,7 @@ def resolve(provider: Callable[[str], dict | None], text_of: Callable[[str], str
                         F.add(t)
                         F |= w.closure(t, FORWARD, STRONG)
         C = set()
-        for u in {unit} | F:
+        for u in {u0} | F:
             p = w.props(u, "", strong=False)
             if not p:
                 continue
@@ -348,18 +349,25 @@ def resolve(provider: Callable[[str], dict | None], text_of: Callable[[str], str
         mark(res.C, "would be stopped (conflict)")
         mark(res.S, "would be stopped (stop-closure of a conflict)")
     elif action == "stop":
-        res.S = w.closure(unit, REVERSE_STOP, ()) | unneeded_deps(unit)
+        stop = w.closure(unit, REVERSE_STOP, ())
+        res.S = stop | set().union(*(unneeded_deps(u) for u in {unit} | stop))      # what the stopped units needed may become unneeded and be stopped too
         mark({unit}, "requested unit")
         mark(res.S, "would be stopped (stop-closure / unneeded dependency)")
     elif action in ("restart", "try-restart", "reload-or-restart"):          # try-restart / reload-or-restart act as a restart on an active unit: the union is resolved
         stop = w.closure(unit, REVERSE_STOP, ())
         F, C, S = start_sets()
+        for dep in sorted(stop):                                   # every dependent that is restarted with it is STARTED again: its own dependencies and conflicts are part of the transaction
+            f_d, c_d, s_d = start_sets(dep)
+            F |= f_d
+            C |= c_d
+            S |= s_d
         res.F, res.C, res.S = F, C, stop | S
+        res.S |= set().union(*(unneeded_deps(u) for u in {unit} | stop))
         res.X = set(root.get("ConsistsOf", []))
         if action == "reload-or-restart":
-            res.X |= {v for v in root.get("PropagatesReloadTo", []) if w.props(v, f"{unit} —PropagatesReloadTo→ {v}", strong=False) is not None}
+            res.X |= {v for v in w.closure(unit, ("PropagatesReloadTo",), ())}
         for v in res.X:
-            q = w.props(v, f"{unit} —ConsistsOf→ {v}", strong=False)
+            q = w.props(v, f"{unit} —ConsistsOf/PropagatesReloadTo→ {v}", strong=False)
             if q is not None:
                 w.record(v, q)
         mark({unit}, "requested unit")
@@ -368,11 +376,9 @@ def resolve(provider: Callable[[str], dict | None], text_of: Callable[[str], str
         mark(res.S, "would be stopped/restarted (stop-closure)")
         mark(res.X, "restarted/reloaded with it")
     elif action == "reload":
-        for v in root.get("PropagatesReloadTo", []):
-            q = w.props(v, f"{unit} —PropagatesReloadTo→ {v}", strong=False)
-            if q is not None:
-                res.X.add(v)
-                w.record(v, q)
+        for v in w.closure(unit, ("PropagatesReloadTo",), ()):      # systemd propagates a reload transitively
+            res.X.add(v)
+            w.record(v, w.cache[v])
         mark({unit}, "requested unit")
         mark(res.X, "reloaded with it")
     else:                                                          # enable disable mask unmask: boot-time effect (+ [Install]) and the stop-closure of a running unit
@@ -415,8 +421,15 @@ def resolve(provider: Callable[[str], dict | None], text_of: Callable[[str], str
                 w.record(v, q)
         mark({unit}, "requested unit")
         mark(res.X, "its boot-time start set changes")
+        if action == "enable":                                       # at the next boot the unit is STARTED: its dependencies, and the units its conflicts stop, are the transaction of that start
+            F, C, S = start_sets()
+            res.F, res.C, res.S = F, C, S
+            mark(F, "would be started at boot (dependency)", only_active=False)
+            mark(C, "would be stopped when it starts at boot (conflict)")
+            mark(S, "would be stopped when it starts at boot (stop-closure of a conflict)")
         if action in ("disable", "mask"):
-            res.S = w.closure(unit, REVERSE_STOP, ()) | unneeded_deps(unit)
+            stop = w.closure(unit, REVERSE_STOP, ())
+            res.S = stop | set().union(*(unneeded_deps(u) for u in {unit} | stop))
             mark(res.S, "would be stopped (stop-closure / unneeded dependency)")
     for name in sorted(effect):
         w.check_effect(name, effect[name])

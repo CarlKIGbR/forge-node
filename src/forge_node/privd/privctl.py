@@ -61,12 +61,14 @@ class Ctl:
         require_root(self.euid)
         res = {}
         self.state_setup()
-        for name, admin in zip(("priv", "agent"), self.admin_factory()):
-            proof = fsproof.prove(admin.spec.dir)                                      # the seal protocol must work on THIS filesystem, else nothing is created
+        admins = list(zip(("priv", "agent"), self.admin_factory()))
+        for name, admin in admins:                                                     # the seal protocol must work on EVERY log's filesystem, else nothing is created at all
+            proof = fsproof.prove(admin.spec.dir)
             res[name] = {"fs_proof": proof}
             if not proof["ok"]:
                 self.emit(res)
                 raise CtlError(f"{name} log: the filesystem does not support the seal protocol (see fs_proof)")
+        for name, admin in admins:
             res[name]["generation"] = admin.init()
         self.emit(res)
         return 0

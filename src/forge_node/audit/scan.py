@@ -10,12 +10,14 @@ write; bytes a hostile writer slips in after that observation but before the rep
 No size limit applies to damage: it is streamed, never held in memory."""
 import hashlib
 import os
+import re
 from dataclasses import dataclass, field
 
 from .. import canon, chain
 from .spec import AuditCorrupt
 
 READ_CHUNK = 1 << 20
+_NL_RUN = re.compile(rb"\n+")
 MAX_LINE = chain.MAX_RECORD_BYTES + 64
 
 
@@ -72,8 +74,9 @@ def region_digest(fd: int, start: int, length: int) -> str:
 
 
 def iter_lines(fd: int, start: int, size: int):
-    """(line | None, line_start, next_offset) for every COMPLETE line in [start, size). A line longer than MAX_LINE is yielded as None and never held in memory; an unterminated
-    rest is not yielded (the writer may still be writing it)."""
+    """(line | None, line_start, next_offset) for every COMPLETE NON-EMPTY line in [start, size) (a run of bare newlines is skipped in one step: it can never be a record, and a hostile
+    process must not be able to make the scan cost one Python iteration per byte). A line longer than MAX_LINE is yielded as None and never held in memory; an unterminated rest is not
+    yielded (the writer may still be writing it)."""
     off, line_start, buf, long_ = start, start, bytearray(), False
     while off < size:
         chunk = os.pread(fd, min(READ_CHUNK, size - off), off)
@@ -81,6 +84,13 @@ def iter_lines(fd: int, start: int, size: int):
             break
         pos = 0
         while True:
+            if not buf and not long_:
+                m = _NL_RUN.match(chunk, pos)                         # empty lines: skipped, not yielded
+                if m:
+                    pos = m.end()
+                    line_start = off + pos
+                if pos >= len(chunk):
+                    break
             nl = chunk.find(b"\n", pos)
             if nl < 0:
                 rest = chunk[pos:]
@@ -169,21 +179,17 @@ def verify_file(fd: int, node: str, source: str, *, start_seq: int | None, start
     size = rep.size = os.fstat(fd).st_size
     expect_seq = 1 if start_seq is None else start_seq
     expect_prev = chain.GENESIS_HASH if start_prev is None else start_prev
-    dmg_start, dmg_len = None, 0
     end_of_chain = 0
     for line, line_start, nxt in iter_lines(fd, 0, size):
         rec = parse_record(line, node, source) if line is not None else None
-        # a record that does not continue the chain is damage (except that the very first record of the file decides where the chain starts)
         if rec is not None and rep.first is None:
-            rep.first = rec
+            rep.first = rec                                          # the very first record of the file decides where the chain starts
         if rec is None or rec["seq"] != expect_seq or rec["prev_hash"] != expect_prev:
-            if rec is not None and dmg_start is None and rep.records == 0:
+            if rec is not None and rep.records == 0 and line_start == end_of_chain:
                 rep.problems.append(f"seq {rec['seq']}: the first record does not continue the chain (expected seq {expect_seq})")
                 return rep
-            if dmg_start is None:
-                dmg_start = line_start
-            dmg_len += nxt - line_start
-            continue
+            continue                                                 # not part of the chain: damage (accounted for when the next chain record, or the end of the file, is reached)
+        dmg_start, dmg_len = end_of_chain, line_start - end_of_chain  # EVERY byte between the last chain record and this one (junk lines, empty lines, forgeries) is damage
         if rec["type"] == "tail_repair" and dmg_len:
             n, ins = rec.get("bytes"), rec.get("inserted_newline")
             ok = isinstance(n, int) and not isinstance(n, bool) and isinstance(ins, bool) and isinstance(rec.get("sha256"), str) and n >= 0
@@ -204,7 +210,6 @@ def verify_file(fd: int, node: str, source: str, *, start_seq: int | None, start
                 rep.problems.append(f"offset {dmg_start}: {dmg_len} damaged bytes not accounted for by a tail_repair record")
                 return rep
             rep.foreign_bytes += dmg_len                  # slipped in between the writer's last look at the tail and its write; the chain itself is intact
-        dmg_start, dmg_len = None, 0
         rep.records += 1
         rep.head_seq, rep.head_hash = rec["seq"], rec["hash"]
         expect_seq, expect_prev = rec["seq"] + 1, rec["hash"]

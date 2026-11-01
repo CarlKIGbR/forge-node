@@ -35,7 +35,7 @@ from typing import Callable
 from .. import canon, chain, protocol
 from . import fsflags
 from .scan import Tail, file_summary, follow, last_record, parse_record, region_digest, tail_state, verify_file
-from .spec import (CURRENT_NAME, CURRENT_TMP, LOCK_TIMEOUT_S, MAX_CURRENT_BYTES, MIN_AGE_PURGE_S, AuditCorrupt, AuditDown, AuditNotInitialised, LogSpec, gen_file, gen_name, gen_re)
+from .spec import (CURRENT_NAME, CURRENT_TMP, LOCK_TIMEOUT_S, RECOVERY_PENDING, MAX_CURRENT_BYTES, MIN_AGE_PURGE_S, AuditCorrupt, AuditDown, AuditNotInitialised, LogSpec, gen_file, gen_name, gen_re)
 
 Clock = Callable[[], datetime]
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -287,23 +287,31 @@ class Appender:
         t = self._tail
         rec = chain.seal_record({"ts": self._ts(), "node": self.node, **fields}, t.seq + 1, t.hash)
         chain.validate_record(rec, self.node, self.spec.source)
-        line = canon.canonical(rec) + b"\n"
+        self._write_chain_record(t, b"", rec, "append")
+        return rec
+
+    def _write_chain_record(self, t: Tail, prefix: bytes, rec: dict, what: str) -> None:
+        """ONE write of `prefix + record` after the tail `t` that was just looked at. An O_APPEND write goes to the real end of the file, wherever another writer (a hostile process of the
+        agent uid) has put it since: if our line did not land exactly where we looked (`t.size + len`), the chain is FOLLOWED from the old head to see whether our record is still the
+        next link - junk in front of it does not matter, a valid-looking record forged there does (it takes the head, ours is then damage). A record that is not in the chain is not
+        recorded: AuditDown, nothing claimed written, the caller retries."""
+        line = prefix + canon.canonical(rec) + b"\n"
         try:
             _write_all(self._fd, line)
             os.fsync(self._fd)
+            end = os.lseek(self._fd, 0, os.SEEK_CUR)
         except (OSError, AuditDown) as e:
             self._tail = self._key = None
-            raise AuditDown(f"append failed ({type(e).__name__})") from e
-        self._cache_after_write(rec)
-        return rec
-
-    def _cache_after_write(self, rec: dict) -> None:
-        """The head is cached at the offset where OUR write ended (an O_APPEND write leaves the descriptor's offset there, whatever another writer appends afterwards), not at the current size:
-        bytes a hostile writer appended in between stay visible to the next refresh instead of being swallowed into the cache."""
-        end = os.lseek(self._fd, 0, os.SEEK_CUR)
+            raise AuditDown(f"{what} failed ({type(e).__name__})") from e
         st = os.fstat(self._fd)
-        self._tail = Tail(rec["seq"], rec["hash"], end, end, 0)
-        self._key = (st.st_ino, end)
+        if end == t.size + len(line):
+            self._tail, self._key = Tail(rec["seq"], rec["hash"], end, end, 0), (st.st_ino, end)
+            return
+        t2 = follow(self._fd, self.node, self.spec.source, t)
+        if t2.seq != rec["seq"] or t2.hash != rec["hash"]:
+            self._tail = self._key = None
+            raise AuditDown(f"{what}: a concurrent writer took the head of the log; the record was not chained and is not recorded - retry")
+        self._tail, self._key = t2, (st.st_ino, t2.size)
 
     def _repair_tail_locked(self) -> dict | None:
         t = self._refresh_tail()
@@ -314,13 +322,7 @@ class Appender:
         rec = chain.seal_record({"ts": self._ts(), "node": self.node, "type": "tail_repair", "bytes": t.damaged, "inserted_newline": ins, "sha256": region_digest(self._fd, t.end, t.damaged)},
                                 t.seq + 1, t.hash)
         chain.validate_record(rec, self.node, self.spec.source)
-        try:
-            _write_all(self._fd, (b"\n" if ins else b"") + canon.canonical(rec) + b"\n")
-            os.fsync(self._fd)
-        except (OSError, AuditDown) as e:
-            self._tail = self._key = None
-            raise AuditDown(f"tail repair failed ({type(e).__name__})") from e
-        self._cache_after_write(rec)
+        self._write_chain_record(t, b"\n" if ins else b"", rec, "tail repair")
         return rec
 
     def _append_locked(self, type_: str, fields: dict) -> dict:
@@ -587,23 +589,67 @@ class AuditAdmin(Appender):
         if self._recovering:
             return []
         self._recovering = True
+        earlier = self._read_pending()                                            # a recovery that was killed after it had begun to change something, before it wrote its record
         try:
             actions = self._recover_steps()
         finally:
             self._recovering = False
+        if earlier is not None:
+            actions.insert(0, f"an earlier recovery was interrupted before it could be recorded ({earlier})")
         if actions:
             self._drop()
             self._append_locked("recovery", {"actions": actions})
+        self._clear_pending()
         return actions
+
+    def _write_pending(self) -> None:
+        try:
+            fd = os.open(RECOVERY_PENDING, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self._dfd)
+        except FileExistsError:
+            return                                                                   # the first marker (the oldest unrecorded recovery) stays
+        try:
+            os.write(fd, canon.canonical({"fmt": 1, "started": self._ts()}) + b"\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(self._dfd)
+
+    def _read_pending(self) -> str | None:
+        try:
+            fd = os.open(RECOVERY_PENDING, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self._dfd)
+        except FileNotFoundError:
+            return None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != self.spec.owner_uid or st.st_size > 512:
+                return "marker unreadable"
+            return "started " + str((canon.loads(os.read(fd, 513).rstrip(b"\n")) or {}).get("started", "?"))
+        except (canon.CanonError, OSError, AttributeError):
+            return "marker unreadable"
+        finally:
+            os.close(fd)
+
+    def _clear_pending(self) -> None:
+        try:
+            os.unlink(RECOVERY_PENDING, dir_fd=self._dfd)
+        except FileNotFoundError:
+            return
+        os.fsync(self._dfd)
 
     def _recover_steps(self) -> list[str]:
         s = self.spec
         actions: list[str] = []
         try:
-            os.unlink(CURRENT_TMP, dir_fd=self._dfd)
-            actions.append("removed a stale CURRENT.tmp")
+            os.stat(CURRENT_TMP, dir_fd=self._dfd, follow_symlinks=False)
         except FileNotFoundError:
             pass
+        else:
+            self._write_pending()
+            try:
+                os.unlink(CURRENT_TMP, dir_fd=self._dfd)
+                actions.append("removed a stale CURRENT.tmp")
+            except FileNotFoundError:
+                pass
         cur = self._read_current()
         gens = self._list_gens()
         if cur is None:
@@ -627,16 +673,19 @@ class AuditAdmin(Appender):
                 if not fsflags.is_sealed(fl):
                     raise AuditCorrupt("a successor generation exists but its predecessor is not sealed")
                 prev = self._sealed_description(fd)
+                self._write_pending()
                 actions += self._complete_successor(cur + 1, prev)
                 self._write_current(cur + 1)
                 actions.append(f"rotation to generation {cur + 1} completed (CURRENT switched)")
             elif fsflags.is_sealed(fl):
                 prev = self._sealed_description(fd)
+                self._write_pending()
                 self._build_generation(cur + 1, prev)
                 self._write_current(cur + 1)
                 actions.append(f"rotation to generation {cur + 1} resumed after the seal and completed")
             else:
                 if not fsflags.is_append_only(fl):
+                    self._write_pending()
                     fsflags.add_flags(fd, fsflags.APPEND)
                     actions.append("set the missing append-only flag on the active log file")
                 first = os.pread(fd, chain.MAX_RECORD_BYTES + 64, 0).split(b"\n", 1)[0]
@@ -648,6 +697,18 @@ class AuditAdmin(Appender):
             os.close(fd)
         return actions
 
+    def _first_record(self, n: int) -> dict | None:
+        """The first record (the chain_link) of generation n, None if it cannot be read."""
+        try:
+            gfd, fd = self._open_ro(n)
+        except OSError:
+            return None
+        try:
+            return parse_record(os.pread(fd, chain.MAX_RECORD_BYTES + 64, 0).split(b"\n", 1)[0], self.node, self.spec.source)
+        finally:
+            os.close(gfd)
+            os.close(fd)
+
     def _recover_old_generations(self, cur: int, gens: dict) -> list[str]:
         """What a purge interrupted: a directory whose file is already gone (rmdir), or a file whose flags were cleared before its unlink (re-sealed and made reachable again - purge hides the
         directory (0700) before it clears a flag, so nobody can have opened the flagless file for writing)."""
@@ -658,6 +719,7 @@ class AuditAdmin(Appender):
             if not st["dir"]:
                 continue
             if not st["file"]:
+                self._write_pending()
                 os.rmdir(gen_name(s.prefix, n), dir_fd=self._dfd)
                 os.fsync(self._dfd)
                 actions.append(f"removed the empty directory of generation {n} (an interrupted purge)")
@@ -665,16 +727,24 @@ class AuditAdmin(Appender):
             if not fsflags.is_sealed(st["flags"]):
                 if st["dir_mode"] != 0o700:
                     raise AuditCorrupt(f"generation {n} lost its seal while reachable")
+                self._write_pending()
                 gfd, fd = self._open_ro(n)
                 try:
-                    fsflags.add_flags(fd, fsflags.APPEND | fsflags.IMMUTABLE)
+                    sha, size = file_summary(fd)
+                    link = self._first_record(n + 1)
+                    if link is None or link.get("prev_file_sha256") != sha or link.get("prev_file_bytes") != size:
+                        # a descriptor that predates the seal can write once the flags are gone: sealing whatever is there would launder a modification
+                        raise AuditCorrupt(f"generation {n} was without flags and its content no longer matches the chain_link of generation {n + 1}")
+                    if not fsflags.is_sealed(fsflags.add_flags(fd, fsflags.APPEND | fsflags.IMMUTABLE)):
+                        raise AuditCorrupt(f"could not re-seal generation {n}")
                     os.fchmod(gfd, s.dir_mode)
                     os.fsync(gfd)
                 finally:
                     os.close(gfd)
                     os.close(fd)
-                actions.append(f"re-sealed generation {n} (an interrupted purge cleared its flags)")
+                actions.append(f"re-sealed generation {n} (an interrupted purge cleared its flags; content verified against the next chain_link)")
             elif st["dir_mode"] != s.dir_mode:
+                self._write_pending()
                 gfd = self._open_gen_dir(n)
                 try:
                     os.fchmod(gfd, s.dir_mode)
@@ -725,8 +795,13 @@ class AuditAdmin(Appender):
             data = os.pread(fd, 2 * chain.MAX_RECORD_BYTES, 0)
             line = data.split(b"\n", 1)[0] if b"\n" in data else b""
             rec = parse_record(line, self.node, s.source) if line else None
-            if rec is None or data != line + b"\n" or not self._expected_link_ok(rec, n, prev):
+            flagged = bool(st["flags"] & fsflags.APPEND)
+            # an unflagged file sits in a 0700 directory: exactly the chain_link. A FLAGGED one may already be reachable (step 5 before the CURRENT switch): the agent can have appended to its
+            # own log in that window - those bytes are damage after the chain_link, not a reason to quarantine
+            if rec is None or not (data.startswith(line + b"\n") if flagged else data == line + b"\n") or not self._expected_link_ok(rec, n, prev):
                 raise AuditCorrupt("successor generation does not continue the sealed predecessor (chain_link mismatch)")
+            if flagged and follow(fd, self.node, s.source, None).seq != rec["seq"]:
+                raise AuditCorrupt(f"generation {n} holds chained records beyond its chain_link although CURRENT never named it: it has been used")      # junk is damage, records are use
             if st["flags"] & fsflags.IMMUTABLE:
                 raise AuditCorrupt("successor generation is sealed before it was ever live")
             if not st["flags"] & fsflags.APPEND:
@@ -796,9 +871,10 @@ class AuditAdmin(Appender):
 
     # --------------------------------------------------------------------------------------------------------- verify
     def verify(self) -> list[str]:
-        """Complete verification of every generation on disk under the lock: chain, chain_link continuity (sha256/size/seq/hash of the predecessor and the damage it accounts for),
-        flags (sealed except the active one), and that no byte of a file is unaccounted for. Hostile bytes in the agent log are counted but tolerated (`foreign`); in the priv log
-        they are a problem."""
+        """Complete verification of every generation on disk: chain, chain_link continuity (sha256/size/seq/hash of the predecessor and the damage it accounts for), flags (sealed except
+        the active one), and that no byte of a file is unaccounted for. Hostile bytes in the agent log are counted but tolerated (`foreign`); in the priv log they are a problem.
+        The log's lock is held only while CURRENT and the generation list are read and while a NOT-SEALED generation is read (it can still grow); sealed files are immutable and are
+        verified without it - a 64 MiB file takes seconds, and the writers' lock wait is 10."""
         problems: list[str] = []
         s = self.spec
         strict = s.source == "priv"
@@ -806,45 +882,52 @@ class AuditAdmin(Appender):
             self._lock()
             try:
                 cur = self._read_current()
-                if cur is None:
-                    return ["CURRENT missing"]
-                prev = None
-                for n in sorted(self._list_gens()):
-                    try:
-                        gfd, fd = self._open_ro(n)
-                    except FileNotFoundError:
-                        problems.append(f"generation {n}: directory without a log file (an interrupted purge; recover() removes it)")
-                        prev = None
-                        continue
-                    try:
-                        fl = fsflags.get_flags(fd)
-                        if n < cur and not fsflags.is_sealed(fl):
-                            problems.append(f"generation {n}: not sealed")
-                        if n == cur and not fsflags.is_live(fl):
-                            problems.append(f"generation {n}: active file is not live+append-only")
-                        if n > cur:
-                            problems.append(f"generation {n}: newer than CURRENT")
-                        first = os.pread(fd, chain.MAX_RECORD_BYTES + 64, 0).split(b"\n", 1)[0]
-                        rec0 = parse_record(first, self.node, s.source)
-                        if prev is None:
-                            # genesis file: from seq 1; the oldest file left after a purge: from whatever its chain_link continues
-                            start_seq, start_prev = (None, None) if rec0 is None or rec0.get("prev_file") is None else (rec0["seq"], rec0["prev_hash"])
-                        else:
-                            start_seq, start_prev = prev["head_seq"] + 1, prev["head_hash"]
-                            if (rec0 is None or rec0.get("prev_file_sha256") != prev["sha256"] or rec0.get("prev_file_bytes") != prev["size"]
-                                    or rec0.get("prev_damaged_bytes") != prev["trailing"] or rec0.get("prev_damaged_sha256") != prev["trailing_sha"]):
-                                problems.append(f"generation {n}: chain_link does not match the sealed predecessor file")
-                        rep = verify_file(fd, self.node, s.source, start_seq=start_seq, start_prev=start_prev, strict=strict)
-                        problems += [f"generation {n}: {p}" for p in rep.problems]
-                        if n == cur and rep.trailing_bytes:
-                            problems.append(f"generation {n}: {rep.trailing_bytes} damaged bytes at the end of the file (torn write not yet repaired)")
-                        sha, size = file_summary(fd)
-                        prev = {"head_seq": rep.head_seq, "head_hash": rep.head_hash, "sha256": sha, "size": size, "trailing": rep.trailing_bytes, "trailing_sha": rep.trailing_sha256}
-                        if rep.head_seq is None:
-                            break
-                    finally:
-                        os.close(gfd)
-                        os.close(fd)
+                gens = sorted(self._list_gens())
             finally:
                 self._unlock()
+            if cur is None:
+                return ["CURRENT missing"]
+            prev = None
+            for n in gens:
+                try:
+                    gfd, fd = self._open_ro(n)
+                except FileNotFoundError:
+                    problems.append(f"generation {n}: directory without a log file (an interrupted purge; recover() removes it)")
+                    prev = None
+                    continue
+                locked = False
+                try:
+                    fl = fsflags.get_flags(fd)
+                    if not fsflags.is_sealed(fl):
+                        self._lock()
+                        locked = True
+                    if n < cur and not fsflags.is_sealed(fl):
+                        problems.append(f"generation {n}: not sealed")
+                    if n == cur and not fsflags.is_live(fl):
+                        problems.append(f"generation {n}: active file is not live+append-only")
+                    if n > cur:
+                        problems.append(f"generation {n}: newer than CURRENT")
+                    first = os.pread(fd, chain.MAX_RECORD_BYTES + 64, 0).split(b"\n", 1)[0]
+                    rec0 = parse_record(first, self.node, s.source)
+                    if prev is None:
+                        # genesis file: from seq 1; the oldest file left after a purge: from whatever its chain_link continues
+                        start_seq, start_prev = (None, None) if rec0 is None or rec0.get("prev_file") is None else (rec0["seq"], rec0["prev_hash"])
+                    else:
+                        start_seq, start_prev = prev["head_seq"] + 1, prev["head_hash"]
+                        if (rec0 is None or rec0.get("prev_file_sha256") != prev["sha256"] or rec0.get("prev_file_bytes") != prev["size"]
+                                or rec0.get("prev_damaged_bytes") != prev["trailing"] or rec0.get("prev_damaged_sha256") != prev["trailing_sha"]):
+                            problems.append(f"generation {n}: chain_link does not match the sealed predecessor file")
+                    rep = verify_file(fd, self.node, s.source, start_seq=start_seq, start_prev=start_prev, strict=strict)
+                    problems += [f"generation {n}: {p}" for p in rep.problems]
+                    if n == cur and rep.trailing_bytes:
+                        problems.append(f"generation {n}: {rep.trailing_bytes} damaged bytes at the end of the file (torn write not yet repaired)")
+                    sha, size = file_summary(fd)
+                    prev = {"head_seq": rep.head_seq, "head_hash": rep.head_hash, "sha256": sha, "size": size, "trailing": rep.trailing_bytes, "trailing_sha": rep.trailing_sha256}
+                    if rep.head_seq is None:
+                        break
+                finally:
+                    if locked:
+                        self._unlock()
+                    os.close(gfd)
+                    os.close(fd)
         return problems

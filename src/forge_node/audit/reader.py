@@ -71,7 +71,13 @@ def read_batch(dir_path: str, prefix: str, node: str, source: str, cur: Cursor, 
             if cur.gen not in gens:
                 break
             nxt = [g for g in gens if g > cur.gen]
-            fd = _open_file(dfd, prefix, cur.gen)
+            try:
+                fd = _open_file(dfd, prefix, cur.gen)
+            except OSError:
+                if out:
+                    break                                           # a successor that is not reachable yet (rotation between steps 4 and 5) / a hidden one: ship what was read, the cursor is consistent
+                raise
+
             try:
                 size = os.fstat(fd).st_size
                 finished = True

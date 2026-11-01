@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from .. import __version__, gates, protocol
 from ..profile import PROFILE
 from ..audit.log import AuditAdmin
-from ..audit.spec import agent_spec, priv_spec
+from ..audit.spec import AuditCorrupt, AuditDown, agent_spec, priv_spec
 from ..t0.runner import FIXED_PATH, RunnerError, trusted_binary
 from . import resolver
 from .client import PrivClient
@@ -103,7 +103,7 @@ def run_privd() -> int:
         return 2
     try:
         ctx = build_context(node)
-    except (RunnerError, KeyError, OSError) as e:
+    except (RunnerError, KeyError, OSError, AuditDown, AuditCorrupt) as e:
         sys.stderr.write(f"cannot start: {type(e).__name__}: {e}\n")
         return 2
     recover_all(ctx)

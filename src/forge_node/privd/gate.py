@@ -480,6 +480,15 @@ def s_t0_audit(st: State) -> None:
         raise Deny("DENY_AUDIT_DOWN", "audit not writable") from e
 
 
+def s_audit_peek(st: State) -> None:
+    """Selfcheck pipeline: the priv log must be in a good state (CURRENT, owner/mode, the append-only flag) - observed WITHOUT repairing anything: `head()`/`append()` on the root side
+    would run the recovery, and a request of the agent uid must not be able to trigger that."""
+    try:
+        st.ctx.priv_log.peek()
+    except (AuditDown, AuditCorrupt) as e:
+        raise Deny("DENY_AUDIT_DOWN", "audit not writable") from e
+
+
 def s_t0_run(st: State) -> None:
     """Reduced pipeline effect: the probe runs in a unit of class `ro-probe` (properties from hardening.py), its single JSON line is the answer."""
     ctx, probe = st.ctx, st.extra["probe"]
@@ -581,7 +590,7 @@ def s_status(st: State) -> None:
         if log is None:
             continue
         try:
-            seq, h = log.head()
+            seq, h = log.peek()                                                  # a status request observes; it never repairs
             heads[name] = {"seq": seq, "hash": h}
         except (AuditDown, AuditCorrupt) as e:
             heads[name] = {"error": type(e).__name__}
@@ -690,21 +699,18 @@ def s_audit_rotate(st: State) -> None:
     ctx, b = st.ctx, st.req.body
     if set(b) - {"log", "when"} or "log" not in b or b["log"] not in ("priv", "agent", "both") or b.get("when", "now") not in ("now", "due"):
         raise Deny("DENY_PARAM", "audit.rotate needs {log: priv|agent|both[, when: now|due]}")
-    out = {}
     due_only = b.get("when", "now") == "due"
-    try:
-        for name, log in (("priv", ctx.priv_log), ("agent", ctx.agent_log)):
-            if b["log"] not in (name, "both"):
-                continue
-            if log is None:
-                raise Deny("DENY_PARAM", "this node has no such log")
-            if due_only and not log.due():
-                out[name] = None                                                   # not due: nothing rotated
-            else:
-                out[name] = log.rotate()
-    except (AuditDown, AuditCorrupt) as e:
-        raise Deny("DENY_AUDIT_DOWN", f"rotation failed ({type(e).__name__}: {e})") from e
-    st.reply = {"ok": True, "rotated": out}
+    out, errors = {}, {}
+    for name, log in (("priv", ctx.priv_log), ("agent", ctx.agent_log)):
+        if b["log"] not in (name, "both"):
+            continue
+        if log is None:
+            raise Deny("DENY_PARAM", "this node has no such log")
+        try:
+            out[name] = None if (due_only and not log.due()) else log.rotate()         # not due: nothing rotated
+        except (AuditDown, AuditCorrupt) as e:                                          # one log failing (the agent log's lock held by a hostile process) must not hide that the other one WAS rotated
+            out[name], errors[name] = None, f"{type(e).__name__}: {e}"
+    st.reply = {"ok": not errors, "rotated": out, **({"code": "DENY_AUDIT_DOWN", "detail": "; ".join(f"{k}: {v}" for k, v in errors.items())[:300], "errors": errors} if errors else {})}
 
 
 # ---------------------------------------------------------------------------------------------------------------------------- lockdown
@@ -734,7 +740,7 @@ PIPELINES = {
     "exec": (s_caller, s_job_signature, s_claim, s_lease, s_local_stop, s_clock, s_op_static, s_audit_intent, s_policy, s_mode, s_params, s_protected, s_allowlist, s_window, s_rate,
              s_owner_signature, s_plan, s_target_lock, s_started, s_effect, s_postcheck, s_commit),
     "t0": (s_caller, s_t0_probe_known, s_lease_authentic, s_t0_rate, s_t0_audit, s_t0_run),
-    "selfcheck": (s_caller, s_selfcheck_target, s_t0_audit, s_selfcheck_run),
+    "selfcheck": (s_caller, s_selfcheck_target, s_audit_peek, s_selfcheck_run),
     "status": (s_caller, s_status),
     "lease.put": (s_caller, s_lease_put),
     "reconcile": (s_caller, s_reconcile),

@@ -59,7 +59,11 @@ class AuditShipper:
                     break
                 if not recs:
                     break
-                resp = client.post_audit({"source": source, "records": recs})
+                try:
+                    resp = client.post_audit({"source": source, "records": recs})
+                except BaseException:
+                    self.cursors.pop(source, None)                    # the cursor already moved past these records: the next cycle starts again from what the hub acknowledged
+                    raise
                 acked = resp.get("acked", {}).get(source)
                 if isinstance(acked, int) and acked > self.acked.get(source, 0):
                     self.acked[source] = acked

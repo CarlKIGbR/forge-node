@@ -407,3 +407,68 @@ def test_a_flood_of_fake_envelopes_stops_costing_an_ssh_keygen_process_each(priv
     assert codes.count("DENY_JOB_SIGNATURE") == 120 and codes[120:] == ["DENY_RATE"] * 10
     assert len(spawned) == 120                                                              # the other ten never reached ssh-keygen
     assert e.call("exec", {"job": env}, uid=0)["ok"] is True                                # root's own bucket is untouched
+
+
+# ------------------------------------------------------------------------------------------------------------- round 2
+def test_selfcheck_and_status_observe_a_broken_priv_log_without_repairing_it(privd_env):
+    """Round 2 (MAJOR): the observation steps of selfcheck and status used head(), which on the root side RUNS THE RECOVERY. They use peek() now. (The DENIAL that a failing selfcheck
+    has to write is an append, and an append on the root side heals - that is the one place where privd repairs, and it happens for any denied request, by design.)"""
+    from forge_node.audit import fsflags
+    from forge_node.audit.spec import AuditDown
+    e = privd_env.ready()
+    gens_before = sorted(os.listdir(e.specs["priv"].dir))
+    for f in Path(e.specs["priv"].dir).glob("priv.*/priv.*.jsonl"):
+        fd = os.open(f, os.O_RDONLY)
+        fsflags.add_flags(fd, fsflags.IMMUTABLE)                                                # sealed, CURRENT still names it: "needs recovery"
+        os.close(fd)
+    with pytest.raises(AuditDown):
+        e.ctx.priv_log.peek()
+    st = e.call("status", {}, uid=AGENT_UID)["status"]                                          # status writes no record: nothing heals
+    assert st["audit_heads"]["priv"] == {"error": "AuditDown"} and st["audit_heads"]["agent"]["seq"] >= 1
+    assert sorted(os.listdir(e.specs["priv"].dir)) == gens_before and not [x for x in e.priv_records() if x["type"] == "recovery"]
+    # the observation step of selfcheck itself refuses without touching anything ...
+    from forge_node.privd import gate as gate_mod
+    from forge_node.privd.core import Peer, Request
+    with pytest.raises(gate_mod.Deny, match="audit not writable"):
+        gate_mod.s_audit_peek(gate_mod.State(e.ctx, Request("selfcheck", Peer(1, AGENT_UID, 1001), {"target": "audit"})))
+    assert sorted(os.listdir(e.specs["priv"].dir)) == gens_before
+    # ... and the request as a whole answers DENY_AUDIT_DOWN
+    r = e.call("selfcheck", {"target": "audit"}, uid=AGENT_UID)
+    assert r["ok"] is False and r["code"] == "DENY_AUDIT_DOWN"
+
+
+def test_audit_rotate_reports_the_log_that_was_rotated_even_when_the_other_one_failed(privd_env, monkeypatch):
+    """Round 2: with log=both a failure of the second log replied only 'denied' - the first had been rotated and nothing said so."""
+    import fcntl
+    from forge_node.audit import log as audit_log
+    e = privd_env.ready()
+    monkeypatch.setattr(audit_log, "LOCK_TIMEOUT_S", 0.3)
+    holder = os.open(e.specs["agent"].lock, os.O_RDWR)
+    fcntl.flock(holder, fcntl.LOCK_EX)                                                         # a hostile agent-uid process holding the agent log's lock
+    try:
+        r = e.call("audit.rotate", {"log": "both"})
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+    assert r["ok"] is False and r["code"] == "DENY_AUDIT_DOWN" and r["rotated"]["priv"] == 2 and r["rotated"]["agent"] is None and "agent" in r["errors"]
+    assert sorted(x for x in os.listdir(e.specs["priv"].dir) if x.startswith("priv."))[-1] == "priv.000002"
+
+
+def test_audit_init_proves_every_filesystem_before_it_creates_any_log(realfs, monkeypatch):
+    """Round 2 (minor): a failing proof for the agent log left the priv log initialised."""
+    from audit_helpers import make_specs
+    from forge_node.audit import fsproof
+    from forge_node.audit.log import AuditAdmin
+    from forge_node.privd import privctl
+    specs = make_specs(realfs)
+    now = lambda: __import__("privd_helpers").NOW                                              # noqa: E731
+    adm = (AuditAdmin(specs["priv"], "g2", now), AuditAdmin(specs["agent"], "g2", now))
+    real = fsproof.prove
+    monkeypatch.setattr(fsproof, "prove", lambda d: {**real(d), "ok": False} if d == specs["agent"].dir else real(d))
+    import io
+    ctl = privctl.Ctl(euid=0, client=None, state_setup=lambda: None, admin_factory=lambda: adm, ledger_path="", local_stop="", systemctl_provider=None, systemctl_text_provider=None,
+                      protected_units=(), protected_paths=(), run_systemctl=None, clock=lambda: None, out=io.StringIO())
+    with pytest.raises(privctl.CtlError):
+        ctl.cmd_audit_init()
+    import re
+    assert not [x for x in os.listdir(specs["priv"].dir) if re.match(r"^priv\.\d{6}$", x)] and not [x for x in os.listdir(specs["agent"].dir) if re.match(r"^audit\.\d{6}$", x)]

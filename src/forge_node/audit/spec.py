@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 CURRENT_NAME = "CURRENT"
 CURRENT_TMP = "CURRENT.tmp"
+RECOVERY_PENDING = "RECOVERY.pending"        # write-ahead marker of a recovery: its `recovery` record is appended even if the recovery was killed before it could be
 GEN_DIGITS = 6
 MAX_CURRENT_BYTES = 512
 LOCK_TIMEOUT_S = 10.0

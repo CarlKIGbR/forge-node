@@ -142,3 +142,34 @@ def test_shipper_stops_on_a_rejection_and_restarts_from_the_hub_ack(realfs, tmp_
     hub.reject_at = None
     s.ship_once(hub)
     assert len(hub.store["agent"]) == 11
+
+
+def test_a_transient_hub_failure_does_not_make_the_shipper_skip_the_batch(realfs, tmp_path):
+    """Round 2 (minor): the cursor moved past the records before the post; after a HubUnreachable the next cycles shipped nothing (until a restart or a rejection)."""
+    from forge_node.agent.client import HubUnreachable
+    specs = make_specs(realfs)
+    for k in ("priv", "agent"):
+        a = admin(specs[k])
+        a.init()
+        for i in range(5):
+            a.append("t0", {"i": i})
+    hub = FakeHubSink()
+
+    class Flaky:
+        def __init__(self):
+            self.fail = True
+
+        def post_audit(self, body):
+            if self.fail:
+                self.fail = False
+                raise HubUnreachable("down")
+            return hub.post_audit(body)
+    state = tmp_path / "st"
+    state.mkdir()
+    sh = AuditShipper(specs={"agent": specs["agent"], "priv": specs["priv"]}, node=NODE, state_dir=str(state), log=lambda m: None)
+    client = Flaky()
+    with pytest.raises(HubUnreachable):
+        sh.ship_once(client)
+    out = sh.ship_once(client)                                                                    # the very next cycle ships everything again
+    assert out == {"agent": 6, "priv": 6} or sum(out.values()) == 12, out
+    assert [r["seq"] for r in hub.store["agent"]] == list(range(1, 7)) and [r["seq"] for r in hub.store["priv"]] == list(range(1, 7))
