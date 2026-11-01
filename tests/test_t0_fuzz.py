@@ -143,3 +143,29 @@ def test_inputs_the_fuzzer_found_are_pinned_as_regressions():
     assert parse.nvidia_apps("a\r,b\n") == []
     assert parse.diskstats("1 2 sda x y z w q r s t u v\n") == {} and parse.net_dev("h\nh\n e: a b c d e f g h i\n") == {}
     assert parse.ip_routes("0") == {"routes": [], "default_gateways": []} and parse.lsblk('{"blockdevices": [null, 1, {"children": 5}]}')[0]["name"] is None
+
+
+@settings(max_examples=2000, deadline=None)
+@given(st.one_of(st.text(max_size=120), st.text(alphabet="/.abc-_@{}~^:?*[\\ \x00\n", max_size=40)))
+def test_property_an_accepted_ref_name_can_never_select_a_path_outside_its_base(name):
+    """Whatever string a repository owner puts in HEAD: if valid_branch() accepts it, joining it below a base stays inside that base, and the confined writer creates exactly one file
+    below the base; if it refuses it, nothing is written."""
+    import posixpath
+    base = "/snap/refs/heads"
+    if probes.valid_branch(name):
+        joined = posixpath.normpath(posixpath.join(base, name))
+        assert joined.startswith(base + "/") and ".." not in name.split("/") and not name.startswith("/")
+        assert all(c and c not in (".", "..") for c in name.split("/"))
+    with tempfile.TemporaryDirectory() as td:
+        from forge_node.t0 import confined
+        os.mkdir(os.path.join(td, "inside"))
+        fd = confined.open_dir(os.path.join(td, "inside"))
+        try:
+            try:
+                confined.write_new_at(fd, ["refs", "heads", *name.split("/")], b"x")
+            except (confined.ConfinementError, OSError):
+                pass
+        finally:
+            os.close(fd)
+        created = [os.path.join(d, f) for d, _, fs in os.walk(td) for f in fs]
+        assert all(c.startswith(os.path.join(td, "inside") + "/") for c in created)

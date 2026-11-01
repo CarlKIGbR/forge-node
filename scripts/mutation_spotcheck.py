@@ -143,6 +143,8 @@ M = [
 # Survivors that are equivalent by construction (the same fact is covered by a second, independent element of the cache key); named here so the verdict says so.
 EQUIVALENT = {
     "engine-logs-allow": "engine step 5 and T0Engine._logs both enforce the logs.unit allowlist (defence in depth); the inner one has its own test",
+    "ref-validation-in-snapshot": "valid_branch is also enforced upstream in _git_rev and by confined.py's component rule inside the writer (three independent layers; each has its own test)",
+    "branch-leading-slash": "a leading '/' also yields an empty first component, refused by the per-component rule of valid_branch itself",
     "policy-key-mode": "st_ctime_ns is in the cache key and changes on every chmod",
     "policy-key-nlink": "st_ctime_ns is in the cache key and changes on every link/unlink",
 }
