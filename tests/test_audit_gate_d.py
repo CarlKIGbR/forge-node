@@ -217,6 +217,7 @@ def test_rotation_has_no_writable_window_on_live_file(specs):
         os.setgroups([AGENT_GID]); os.setgid(AGENT_GID); os.setuid(AGENT_UID)
         bad = 0
         n = 0
+        seen = set()                                              # generations whose live file the hostile process managed to open (proof that it overlapped the rotations)
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
             n += 1
@@ -237,21 +238,27 @@ def test_rotation_has_no_writable_window_on_live_file(specs):
                     fd = os.open(p, os.O_WRONLY | os.O_APPEND)
                 except OSError:
                     continue
+                seen.add(g)
+                try:
+                    if not fsflags.get_flags(fd) & fsflags.APPEND:
+                        bad += 1                                  # an O_APPEND open of a file that is not (yet) append-only is a window too
+                except OSError:
+                    pass
                 try:
                     os.write(fd, b'{"forged":1}\n')
                 except OSError:
                     pass
                 os.close(fd)
-        os.write(w, json.dumps({"bad": bad, "n": n}).encode())
+        os.write(w, json.dumps({"bad": bad, "n": n, "gens": len(seen)}).encode())
         os._exit(0)
     os.close(w)
     for _ in range(25):
         a.append("t0", {})
         a.rotate()
         time.sleep(0.05)
-    out = json.loads(os.read(r, 100))
+    out = json.loads(os.read(r, 200))
     os.waitpid(pid, 0)
-    assert out["bad"] == 0 and out["n"] > 50, out
+    assert out["bad"] == 0 and out["n"] > 50 and out["gens"] >= 8, out                 # ... and it really was there while the generations came and went
     # the forged lines the agent appended to the file while it was live are DAMAGE: the next append accounted for them with a tail_repair record, and nothing else is wrong
     a.append("t0", {})
     assert a.verify() == []
@@ -348,7 +355,7 @@ def test_recovery_itself_is_crash_safe(specs):
     """Kill the recovery of a rotation that was interrupted at several points, before and after EVERY system call of the recovery; recover again; the result is the consistent log."""
     probe = _scenario(specs, "rprobe")
     _, total, _ = in_child(lambda: admin(probe).rotate())
-    points = sorted({3, total // 3, total // 2, (2 * total) // 3, total - 1})
+    points = range(1, total + 1)                                          # every state a rotation can be killed in (a kill 'before call k+1' is the state 'after call k')
     visited = 0
     for k in points:
         for when in ("before", "after"):
@@ -365,7 +372,7 @@ def test_recovery_itself_is_crash_safe(specs):
                 _check_recovered(base)
                 j += 1
                 assert j < 80
-    assert visited >= 20, visited
+    assert visited >= 4 * total, visited
 
 
 def test_crash_state_with_torn_new_file_is_rebuilt(specs):
