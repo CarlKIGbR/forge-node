@@ -328,6 +328,7 @@ Properties are read with `systemctl show` (including `ConflictedBy`, `RequiredBy
 | `scene` | `scene.switch` | RW paths of `kmu-s2-scene` as listed in the op table entry |
 | `t3-manifest` | typed T3 ops | per manifest kind (e.g. `unit_action` = `unit-ctl`) |
 | `t3-opaque` | opaque T3 only (§4.6) | no filesystem sandbox (cannot be known), `TimeoutStartSec`, memory/CPU/task caps, empty environment |
+| `selftest` *(N3)* | `selftest.noop` (T1, `full` profile; `selftest.fill` joins in N5) and the op `--selfcheck` | `ProtectSystem=strict`, `ReadWritePaths=<per-attempt work dir> /var/lib/forge-node-priv/locks` only, `CapabilityBoundingSet=` empty, `IPAddressDeny=any`, `AF_UNIX` only; it reads the ledger read-only and takes the effect lock — nothing else. Rendered from `privd/classes.py`; `privd` adds only the work directory it created and the policy's `forge_roots` (for `dir-ops`) |
 
 - **Validation inside the real unit.** Every op script has a side-effect-free `--selfcheck` that exercises each path, socket and capability the op needs (open for write where RW is declared, connect to sockets, `stat` targets). `forge-node doctor` runs `selfcheck` for **every enabled op inside its real transient unit** and fails the install step if any is denied; the same runs in the N3 acceptance on carlgpu2. This is the answer to "a hardening profile that silently breaks the op".
 - The agent's T0 reads that need root (`t0-probe`, `t0-journal`) use the same mechanism with class `ro-probe`.
