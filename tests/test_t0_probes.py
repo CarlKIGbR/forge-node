@@ -528,3 +528,157 @@ def test_the_git_snapshot_is_private_and_nothing_else_is_written(tmp_path):
     after = sorted(str(p) for p in (tmp_path / "opt/kmu-ai").rglob("*"))
     assert seen["mode"] == 0o700 and seen["uid"] == os.getuid() and seen["parent"] == __import__("tempfile").gettempdir()
     assert before == after == seen["repo_before"]                           # the repository tree is neither written nor given extra files
+
+
+# ===================================================================================== rework 2: the snapshot must not be able to write outside itself
+
+GOOD_BRANCHES = ["main", "feature/x", "release-1.2", "a.b/c_d", "v1.0.0", "x" * 100, "user/fix-123"]
+BAD_BRANCHES = ["/abs/path", "//x", "a//b", "a/", "/", ".hidden", "a/.hidden", "a..b", "a.lock", "a/b.lock", "a b", "a\\b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a@{b", "@", "-flag", "a.", "",
+                "x" * 201, "../../etc/x", "a/../b", "a\x00b", "ünï", "refs/heads/../x"]
+
+
+@pytest.mark.parametrize("name", GOOD_BRANCHES)
+def test_ordinary_branch_names_are_accepted(name):
+    assert probes.valid_branch(name)
+
+
+@pytest.mark.parametrize("name", BAD_BRANCHES)
+def test_malformed_absolute_and_odd_ref_names_are_refused(name):
+    assert not probes.valid_branch(name)
+
+
+def _wire_git(env):
+    return json.loads(wire.handle_request(wire.encode_request("git", {}), env))
+
+
+@pytest.mark.parametrize("branch_of", [lambda canary: str(canary), lambda canary: "../" * 12 + str(canary).lstrip("/"), lambda canary: "x/../../" + str(canary).lstrip("/")])
+def test_a_branch_ref_that_names_a_path_cannot_make_the_probe_write_there(tmp_path, branch_of):
+    """The reviewer's case through wire.handle_request: HEAD `ref: refs/heads//<absolute path>` plus a matching loose ref; os.path.join discarded the snapshot prefix and the canary was
+    overwritten with the revision. Now: refused as malformed, git never started, the canary is untouched, nothing else appears."""
+    canary = tmp_path / "outside" / "canary.txt"
+    canary.parent.mkdir()
+    canary.write_text("CANARY-UNTOUCHED\n")
+    branch = branch_of(canary)
+    head = f"ref: refs/heads/{'/' if str(canary).startswith('/') and branch == str(canary) else ''}{branch.lstrip('/') if branch != str(canary) else branch.lstrip('/')}\n"
+    if branch == str(canary):
+        head = f"ref: refs/heads/{branch}\n"                                 # exactly the reviewer's 'refs/heads//tmp/...'
+    r = FakeRunner({"git_status_tracked": lambda s, _: (_ for _ in ()).throw(AssertionError("git must not be started for a malformed ref"))})
+    files = repo_files(head=head, ref=None)
+    env = env_with(tmp_path, r, t0={"repos": ["/opt/kmu-ai"]}, files=files)
+    # the matching loose ref, as in the review (inside the fixture repository, at the path the HEAD names)
+    loose = tmp_path / "opt/kmu-ai/.git/refs/heads" / ("/".join(p for p in branch.split("/") if p not in ("", ".", "..")) or "x")
+    loose.parent.mkdir(parents=True, exist_ok=True)
+    loose.write_text("a" * 40 + "\n")
+    before = sorted(str(p) for p in tmp_path.rglob("*"))
+    resp = _wire_git(env)
+    assert resp["ok"] is True
+    row = resp["data"]["repos"]["repos"][0]
+    assert row["error"] == "malformed_ref" and row["dirty_status"] == "rejected:malformed_ref" and row["rev"] is None and row["branch"] is None
+    assert canary.read_text() == "CANARY-UNTOUCHED\n"
+    assert sorted(str(p) for p in tmp_path.rglob("*")) == before and not r.calls
+
+
+def test_a_valid_branch_that_merely_looks_like_a_path_stays_inside_the_snapshot(tmp_path):
+    """`refs/heads/tmp/x/canary` is a legal (if odd) branch name: git runs, the ref is created UNDER refs/heads of the snapshot, the real file of that name is untouched."""
+    canary = tmp_path / "outside" / "canary.txt"
+    canary.parent.mkdir()
+    canary.write_text("CANARY-UNTOUCHED\n")
+    branch = str(canary).lstrip("/")
+    seen = {}
+
+    def status(slots, _):
+        seen["ref"] = open(os.path.join(slots["snap"], "refs/heads", branch)).read()
+        seen["head"] = open(os.path.join(slots["snap"], "HEAD")).read()
+        return Run(True, "ok", 0, b"")
+    env = env_with(tmp_path, FakeRunner({"git_status_tracked": status}), t0={"repos": ["/opt/kmu-ai"]}, files=repo_files(head=f"ref: refs/heads/{branch}\n", ref=None))
+    loose = tmp_path / "opt/kmu-ai/.git/refs/heads" / branch
+    loose.parent.mkdir(parents=True, exist_ok=True)
+    loose.write_text("a" * 40 + "\n")
+    row = _wire_git(env)["data"]["repos"]["repos"][0]
+    assert row["dirty_status"] == "ok" and seen["ref"] == "a" * 40 + "\n" and seen["head"] == f"ref: refs/heads/{branch}\n" and canary.read_text() == "CANARY-UNTOUCHED\n"
+
+
+def test_the_snapshot_writer_itself_refuses_paths_that_leave_it_even_if_validation_upstream_failed(tmp_path):
+    """Second layer: _git_snapshot is called with a hostile branch directly (as if valid_branch had a hole)."""
+    from forge_node.t0 import confined
+    canary = tmp_path / "canary"
+    canary.write_text("untouched")
+    for branch in (str(canary), "../../" + str(canary).lstrip("/"), "a/../../x", "/", "a//b"):
+        with pytest.raises(confined.ConfinementError):
+            probes._git_snapshot({"rev": "a" * 40, "detached": False, "branch": branch}, "[core]\n")
+    assert canary.read_text() == "untouched"
+    import glob
+    assert not [p for p in glob.glob("/tmp/fn-git-*") if os.path.isdir(p) and str(tmp_path) in p]
+
+
+def test_confined_writes_refuse_dotdot_absolute_empty_nul_and_backslash_components(tmp_path):
+    from forge_node.t0 import confined
+    fd = confined.open_dir(str(tmp_path))
+    try:
+        for parts in (["..", "x"], ["/etc", "x"], ["a", ""], ["a", "."], ["a\x00b"], ["a\\b"], [], ["a/b"], [".hidden"], ["-x"], ["x" * 101]):
+            with pytest.raises(confined.ConfinementError):
+                confined.write_new_at(fd, parts, b"x")
+        confined.write_new_at(fd, ["d", "e", "f.txt"], b"ok")
+        assert (tmp_path / "d/e/f.txt").read_bytes() == b"ok"
+        with pytest.raises(FileExistsError):
+            confined.write_new_at(fd, ["d", "e", "f.txt"], b"again")                       # O_EXCL
+    finally:
+        os.close(fd)
+
+
+def test_confined_writes_do_not_follow_a_symlink_planted_in_the_directory(tmp_path):
+    from forge_node.t0 import confined
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    os.symlink(outside, snap / "refs")                                   # a directory link where we want to create a directory
+    fd = confined.open_dir(str(snap))
+    try:
+        with pytest.raises(OSError):
+            confined.write_new_at(fd, ["refs", "heads", "main"], b"x")
+        os.symlink(outside / "target", snap / "HEAD")                       # a link where we want to create a file
+        with pytest.raises(OSError):
+            confined.write_new_at(fd, ["HEAD"], b"x")
+    finally:
+        os.close(fd)
+    assert list(outside.iterdir()) == []
+    link = tmp_path / "linked-snap"
+    os.symlink(snap, link)
+    with pytest.raises(OSError):
+        confined.open_dir(str(link))                                        # the directory itself may not be a link
+
+
+def test_a_loose_ref_that_is_a_symlink_is_not_followed(tmp_path):
+    secret = tmp_path / "secret-ref"
+    secret.write_text("b" * 40 + "\n")
+    r = FakeRunner({"git_status_tracked": " M x\n"})
+    env = git_env(tmp_path, r, ref=None)
+    (tmp_path / "opt/kmu-ai/.git/refs/heads").mkdir(parents=True, exist_ok=True)
+    os.symlink(secret, tmp_path / "opt/kmu-ai/.git/refs/heads/main")
+    row = _wire_git(env)["data"]["repos"]["repos"][0]
+    assert row["rev"] is None and row["dirty_status"] == "no_revision" and not r.calls
+
+
+def test_staging_blobs_are_written_through_confined_descriptors(tmp_path):
+    from forge_node.agent import loop as L
+    ag = None
+    from test_n2_branches import stub_agent, StubClient
+    ag = stub_agent(tmp_path / "ag", StubClient())
+    ag.cfg = ag.cfg.__class__(**{**ag.cfg.__dict__, "state_dir": str(tmp_path / "state")})
+    (tmp_path / "state").mkdir()
+    ag._write_staged(7, {"policy": "{}", "sig": "S"})
+    assert (tmp_path / "state/staging/policy-7.json").read_text() == "{}" and (tmp_path / "state/staging/policy-7.json.sig").read_text() == "S"
+    assert sorted(os.listdir(tmp_path / "state/staging")) == ["policy-7.json", "policy-7.json.sig"]
+    ag._write_staged(7, {"policy": "{2}", "sig": "S2"})                    # re-staging replaces
+    assert (tmp_path / "state/staging/policy-7.json").read_text() == "{2}"
+    for bad in (0, -1, True, "7", 10**10, 1.5):
+        with pytest.raises(ValueError):
+            ag._write_staged(bad, {"policy": "x", "sig": "y"})
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.rename(tmp_path / "state/staging", tmp_path / "state/staging.old")
+    os.symlink(outside, tmp_path / "state/staging")                           # staging replaced by a link
+    with pytest.raises(OSError):
+        ag._write_staged(8, {"policy": "x", "sig": "y"})
+    assert list(outside.iterdir()) == []

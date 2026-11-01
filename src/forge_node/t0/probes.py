@@ -6,7 +6,7 @@ window - comes from the root-installed, signature-checked policy loaded by the p
 import os
 import re
 import shutil
-from . import parse
+from . import confined, parse
 from .env import Env, failed, ok, run_failure, run_slots, unavailable
 from .fsread import FsError, norm_abs, under
 
@@ -270,27 +270,43 @@ def filter_git_config(text: str) -> tuple[str, list[str]]:
     return cfg, sorted(set(dropped))[:20]
 
 
+def valid_branch(name) -> bool:
+    """git check-ref-format semantics for refs/heads/<name>, on a stricter charset: no leading '/' or '-', no trailing '/' or '.', no '//', no '..', no component that is empty, starts
+    with '.' or ends with '.lock', nothing outside [A-Za-z0-9._/-] (so no NUL, backslash, space, control character, ~ ^ : ? * [ @{). An HEAD that names anything else is not followed."""
+    if not isinstance(name, str) or not 1 <= len(name) <= 200 or name == "@" or not re.fullmatch(r"[A-Za-z0-9._/-]+", name):
+        return False
+    if name.startswith(("/", "-")) or name.endswith(("/", ".")) or "//" in name or ".." in name:
+        return False
+    return all(c and not c.startswith(".") and not c.endswith(".lock") for c in name.split("/"))
+
+
 def _git_snapshot(info: dict, config_text: str) -> str | None:
-    """Private snapshot git dir (mode 0700 in the probe's private tmp). Returns its path, or None if the revision is unknown (git then has nothing to compare against)."""
+    """Private snapshot git dir (mode 0700 in the probe's private tmp). Returns its path, or None if the revision is unknown (git then has nothing to compare against). Everything is
+    written through a directory descriptor with validated components (confined.py): the branch name comes from the repository's owner and must not be able to select a path."""
     import tempfile
-    if not info.get("rev"):
+    if not info.get("rev") or not re.fullmatch(r"[0-9a-f]{40}", info["rev"]):
         return None
+    if not info.get("detached") and not valid_branch(info.get("branch")):
+        raise confined.ConfinementError("branch name refused")
     snap = tempfile.mkdtemp(prefix="fn-git-")
-    os.chmod(snap, 0o700)
-    os.mkdir(os.path.join(snap, "objects"))
-    os.makedirs(os.path.join(snap, "refs", "heads"))
-    if info.get("detached"):
-        head = info["rev"] + "\n"
-    else:
-        branch = info["branch"]
-        os.makedirs(os.path.dirname(os.path.join(snap, "refs", "heads", branch)), exist_ok=True)
-        with open(os.path.join(snap, "refs", "heads", branch), "w") as f:
-            f.write(info["rev"] + "\n")
-        head = f"ref: refs/heads/{branch}\n"
-    with open(os.path.join(snap, "HEAD"), "w") as f:
-        f.write(head)
-    with open(os.path.join(snap, "config"), "w") as f:
-        f.write(config_text)
+    try:
+        os.chmod(snap, 0o700)
+        fd = confined.open_dir(snap)
+        try:
+            os.mkdir("objects", 0o700, dir_fd=fd)
+            if info.get("detached"):
+                head = info["rev"] + "\n"
+                os.mkdir("refs", 0o700, dir_fd=fd)
+            else:
+                confined.write_new_at(fd, ["refs", "heads", *info["branch"].split("/")], (info["rev"] + "\n").encode())
+                head = f"ref: refs/heads/{info['branch']}\n"
+            confined.write_new_at(fd, ["HEAD"], head.encode())
+            confined.write_new_at(fd, ["config"], config_text.encode())
+        finally:
+            os.close(fd)
+    except BaseException:
+        shutil.rmtree(snap, ignore_errors=True)
+        raise
     return snap
 
 
@@ -301,8 +317,8 @@ def _git_rev(env: Env, real: str) -> dict:
     if not m:
         return {"rev": head if re.match(r"^[0-9a-f]{40}$", head) else None, "branch": None, "detached": True}
     branch = m.group(1)
-    if ".." in branch.split("/"):
-        return {"rev": None, "branch": None, "detached": False}
+    if not valid_branch(branch):
+        return {"rev": None, "branch": None, "detached": False, "ref_error": "malformed_ref"}
     rev = None
     try:
         rev = env.fs.read_exception(f"{real}/.git/refs/heads/{branch}", _SAFE_GIT_FILES).strip()
@@ -332,7 +348,11 @@ def _probe_git(params: dict, env: Env) -> dict:
                 rows.append(row)
                 continue
             info = _git_rev(env, real)
-            row.update(info)
+            row.update({k: v for k, v in info.items() if k != "ref_error"})
+            if info.get("ref_error"):
+                row["error"], row["dirty_tracked"], row["dirty_status"] = info["ref_error"], None, "rejected:" + info["ref_error"]
+                rows.append(row)
+                continue
             cfg_text, dropped = filter_git_config(env.fs.read_exception(f"{real}/.git/config", _SAFE_GIT_FILES))
             if dropped:
                 row["config_not_used"] = dropped          # e.g. filter.*, core.fsmonitor, includes: the dirty count is computed without them
@@ -340,7 +360,12 @@ def _probe_git(params: dict, env: Env) -> dict:
                 row["dirty_tracked"], row["dirty_status"] = None, "skipped_budget"
                 rows.append(row)
                 continue
-            snap = _git_snapshot(info, cfg_text)
+            try:
+                snap = _git_snapshot(info, cfg_text)
+            except (confined.ConfinementError, OSError):
+                row["dirty_tracked"], row["dirty_status"] = None, "failed:snapshot"
+                rows.append(row)
+                continue
             if snap is None:
                 row["dirty_tracked"], row["dirty_status"] = None, "no_revision"
                 rows.append(row)

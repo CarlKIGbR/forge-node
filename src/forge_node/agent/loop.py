@@ -12,6 +12,7 @@ from datetime import datetime
 from .. import PROTOCOL_VERSION, __version__, protocol
 from ..protocol import ProtoError
 from ..redact import redact_light
+from ..t0 import confined
 from ..t0.engine import Outcome, T0Engine
 from ..t0.policy import PolicyError, PolicyView, load_installed, read_signers, verify_blob
 from .client import HubClient, HubError, HubUnreachable, PinError
@@ -246,14 +247,26 @@ class Agent:
         self.log(f"policy {serial}: signature verified, staged for privd/privctl (not active)")
 
     def _write_staged(self, serial: int, doc: dict):
-        d = os.path.join(self.cfg.state_dir, "staging")
-        os.makedirs(d, mode=0o700, exist_ok=True)
-        for name, content in ((f"policy-{serial}.json", doc["policy"]), (f"policy-{serial}.json.sig", doc["sig"])):
-            tmp = os.path.join(d, "." + name + ".tmp")
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "w") as f:
-                f.write(content)
-            os.replace(tmp, os.path.join(d, name))
+        """Staged policy blobs: written through descriptors (state dir -> staging dir), names built from the validated integer serial only, temp file O_EXCL, rename inside the
+        staging directory. A `staging` that is a symlink is refused."""
+        if isinstance(serial, bool) or not isinstance(serial, int) or not 1 <= serial <= 999_999_999:
+            raise ValueError("serial")
+        sfd = confined.open_dir(self.cfg.state_dir)
+        try:
+            dfd = confined.mkdirs_at(sfd, ["staging"])
+        finally:
+            os.close(sfd)
+        try:
+            for name, content in ((f"policy-{serial}.json", doc["policy"]), (f"policy-{serial}.json.sig", doc["sig"])):
+                tmp = name + ".tmp"
+                try:
+                    os.unlink(tmp, dir_fd=dfd)
+                except FileNotFoundError:
+                    pass
+                confined.write_new_at(dfd, [tmp], content.encode("utf-8"))
+                confined.replace_at(dfd, tmp, name)
+        finally:
+            os.close(dfd)
 
     # ------------------------------------------------------------------------------------------------------------------- loop
     def stop(self):

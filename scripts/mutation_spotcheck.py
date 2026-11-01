@@ -129,6 +129,16 @@ M = [
  ("net-counter-reset", "t0/usage.py", "    return cur - prev if cur >= prev else cur", "    return max(0, cur - prev)", "tests/test_t0_spool_metrics.py"),
  ("net-ip-accounting-off", "t0/metrics.py", " and a < 2**53 and c < 2**53 and len(net) < 2 * MAX_CG", "", "tests/test_t0_spool_metrics.py"),
  ("net-window-not-aggregated", "t0/usage.py", "            e[\"rx\"] += _grow(e[\"prev\"][0], v[0])", "            e[\"rx\"] += 0", "tests/test_t0_spool_metrics.py"),
+ ("ref-validation-in-git-rev", "t0/probes.py", "    if not valid_branch(branch):\n        return {\"rev\": None, \"branch\": None, \"detached\": False, \"ref_error\": \"malformed_ref\"}", "    if False:\n        return {\"rev\": None, \"branch\": None, \"detached\": False, \"ref_error\": \"malformed_ref\"}", "tests/test_t0_probes.py tests/test_t0_real_tools.py"),
+ ("ref-validation-in-snapshot", "t0/probes.py", "    if not info.get(\"detached\") and not valid_branch(info.get(\"branch\")):", "    if False:", "tests/test_t0_probes.py"),
+ ("branch-charset", "t0/probes.py", "re.fullmatch(r\"[A-Za-z0-9._/-]+\", name)", "re.fullmatch(r\".+\", name)", "tests/test_t0_probes.py"),
+ ("branch-leading-slash", "t0/probes.py", "    if name.startswith((\"/\", \"-\")) or", "    if name.startswith((\"-\",)) or", "tests/test_t0_probes.py"),
+ ("confined-component-rule", "t0/confined.py", "COMPONENT = re.compile(r\"^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}\\Z\")", "COMPONENT = re.compile(r\"^.+\\Z\")", "tests/test_t0_probes.py"),
+ ("confined-nofollow", "t0/confined.py", "nfd = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)", "nfd = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=fd)", "tests/test_t0_probes.py"),
+ ("confined-excl", "t0/confined.py", "os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=parent", "os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=parent", "tests/test_t0_probes.py"),
+ ("confined-open-dir-nofollow", "t0/confined.py", "return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)", "return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)", "tests/test_t0_probes.py"),
+ ("staging-serial-range", "agent/loop.py", "if isinstance(serial, bool) or not isinstance(serial, int) or not 1 <= serial <= 999_999_999:", "if False:", "tests/test_t0_probes.py"),
+ ("staging-through-descriptor", "agent/loop.py", "dfd = confined.mkdirs_at(sfd, [\"staging\"])", "os.makedirs(os.path.join(self.cfg.state_dir, \"staging\"), exist_ok=True); dfd = os.open(os.path.join(self.cfg.state_dir, \"staging\"), os.O_RDONLY | os.O_DIRECTORY)", "tests/test_t0_probes.py"),
 ]
 # Survivors that are equivalent by construction (the same fact is covered by a second, independent element of the cache key); named here so the verdict says so.
 EQUIVALENT = {

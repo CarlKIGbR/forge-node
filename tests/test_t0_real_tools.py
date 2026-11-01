@@ -1,6 +1,7 @@
 """Live-proof style tests against the REAL binaries in the test image (read-only commands on throw-away data): the argv of the command table and the parsers must work on real output,
 not only on scripted fixtures. Skipped tools are named in the skip reason - the gate jobs count them."""
 import os
+from pathlib import Path
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -266,3 +267,27 @@ def test_submodule_config_is_never_consulted(tmp_path):
     pol = view(policy_doc(t0={"repos": [str(tmp_path / "super")]}))
     g = probes.run_probe("git", {}, real_env(pol))["repos"]["repos"][0]
     assert g["dirty_status"] == "ok" and not marker.exists()
+
+
+@need("git")
+def test_reviewers_absolute_ref_case_with_real_git_and_real_filesystem_via_the_wire(tmp_path):
+    """Rework 2 (MAJOR): HEAD `ref: refs/heads//<abs path>` + a matching loose ref in a real repository; through wire.handle_request with the real reader and the real runner. Before:
+    the canary outside repository and snapshot was overwritten with 40 'a' and the response said ok:true."""
+    import json
+    from forge_node.t0 import wire
+    repo = tmp_path / "repo"
+    make_repo(repo)
+    canary = tmp_path / "outside-snapshot" / "marker"
+    canary.parent.mkdir()
+    canary.write_text("CANARY-UNTOUCHED\n")
+    assert os.path.join("/snapshot", "refs", "heads", str(canary)) == str(canary)                      # the mechanism of the bug: join discards the prefix of an absolute component
+    (repo / ".git" / "HEAD").write_text(f"ref: refs/heads/{canary}\n")                                  # 'refs/heads//tmp/...'
+    loose = Path(str(repo / ".git" / "refs" / "heads") + str(canary))
+    loose.parent.mkdir(parents=True, exist_ok=True)
+    loose.write_text("a" * 40 + "\n")
+    pol = view(policy_doc(t0={"repos": [str(repo)]}))
+    resp = json.loads(wire.handle_request(wire.encode_request("git", {}), real_env(pol)))
+    row = resp["data"]["repos"]["repos"][0]
+    assert resp["ok"] is True and row["error"] == "malformed_ref" and row["dirty_status"] == "rejected:malformed_ref" and row["rev"] is None
+    assert canary.read_text() == "CANARY-UNTOUCHED\n"
+    assert sorted(p.name for p in canary.parent.iterdir()) == ["marker"]
