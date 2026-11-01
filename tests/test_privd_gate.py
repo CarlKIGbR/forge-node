@@ -205,7 +205,8 @@ def test_rate_limit_and_state_survives_restart(privd_env):
 
 
 def test_node_wide_mutating_rate_bucket(privd_env):
-    e = privd_env.ready()
+    """T1+ mutating <= 6/min and <= 60/h per NODE (Design 9.2), whatever the per-op bucket says: the op's own rate is set far above, so only the node bucket can deny."""
+    e = privd_env.ready(t1_ops=[{"op": "selftest.noop", "mode": "enforce", "rate": [[1000, 60], [1000, 3600]]}], serial=2)
     codes = [result(e.exec(dry_run=True)[0]) for _ in range(8)]
     assert [c["status"] for c in codes[:6]] == ["dry_run"] * 6
     assert codes[6]["reason_code"] == "DENY_RATE" and codes[7]["reason_code"] == "DENY_RATE"
@@ -219,6 +220,18 @@ def test_node_wide_mutating_rate_bucket(privd_env):
     env2, _ = e.job_env(dry_run=True, job_id=job["job_id"], delivery_seq=2)
     assert result(e.call("exec", {"job": env2}))["status"] == "dry_run"
     assert e.ledger.get(job["job_id"]).state == "committed"
+    # the hourly limit: 60 per hour. 6 were used a few minutes ago (+1 above); spread the rest one minute apart until the hour bucket is full
+    n, seq = 7, 20
+    while True:
+        e.clock.advance(seconds=61)
+        seq += 1
+        assert e.put_lease(seq=seq)["ok"]
+        res = result(e.exec(dry_run=True)[0])
+        if res["status"] != "dry_run":
+            break
+        n += 1
+        assert n < 100
+    assert res["reason_code"] == "DENY_RATE" and n == 60, n                                   # exactly 60 in the hour, then the hourly bucket denies although the minute bucket is free
 
 
 def test_circuit_opens_after_three_failures_and_only_dry_runs_remain(privd_env, tmp_path):
