@@ -216,10 +216,11 @@ class Ledger:
             return self._cas(c, job_id, attempt, frm, {"state": state, "result_json": canon.canonical_text(result)}, now)
 
     def begin_reconcile(self, job_id: str, now) -> Row | None:
-        """Bump the fence and set `reconciling` in ONE transaction, before anything is looked at (Design 9.4 item 2). None if the row is not in an interruptible state."""
+        """Bump the fence and set `reconciling` in ONE transaction, before anything is looked at (Design 9.4 item 2). None if the row is not in an interruptible state (an
+        `indeterminate` row may be reconciled again: 9.4 (a))."""
         with self._tx() as c:
             r = _row(c.execute("SELECT * FROM exec WHERE job_id=?", (job_id,)).fetchone())
-            if r is None or r.state not in ("started", "effect_done", "reconciling"):
+            if r is None or r.state not in ("started", "effect_done", "reconciling", "indeterminate"):
                 return None
             c.execute("UPDATE exec SET state='reconciling', fence=fence+1, updated_at=? WHERE job_id=?", (_ts(now), job_id))
             return _row(c.execute("SELECT * FROM exec WHERE job_id=?", (job_id,)).fetchone())

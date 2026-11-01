@@ -16,6 +16,7 @@ from .core import Context, FileLock, job_lock_path, result_doc
 from .ledger import Row
 
 STOP_WAIT_S = 40.0
+INDETERMINATE_RETRY_S = 300.0         # an indeterminate row is looked at again (9.4 a) at most this often: every look appends a `recovery` record
 
 
 @dataclass
@@ -59,6 +60,7 @@ def finalize_from_status(ctx: Context, row: Row, status: dict, *, seq_first: int
                                    "plan_hash": plan_hash, "post_digest": status.get("post_digest"), "output": res["output"][:1024]})
         res["audit_seq_range"] = [first or rec["seq"], rec["seq"]]
         ctx.ledger.finish(row.job_id, row.attempt, "committed", res, ctx.now())
+        ctx.ledger.unlock_target(row.effect_key, row.job_id)               # (a no-op unless this row had been indeterminate and a repeated reconciliation found the worker's own result)
         if entry is not None and not row.eff_dry_run:                        # a dry run says nothing about the apply path: only a real success resets the failure count
             thr = ctx.policies.current().circuit_threshold if _policy_ok(ctx) else 3
             ctx.ledger.circuit_record(row.op, True, thr, ctx.now())
@@ -122,9 +124,11 @@ def _conclude(ctx: Context, row: Row, verdict: str, evidence: dict) -> dict:
     if verdict == "applied":
         res = result_doc(attempt=row.attempt, status="committed", reason_code=None, output="reconciled: the effect had been applied", seq_range=[rec["seq"], rec["seq"]], plan_hash=row.plan_hash)
         ctx.ledger.finish(row.job_id, row.attempt, "committed", res, ctx.now())
+        ctx.ledger.unlock_target(row.effect_key, row.job_id)               # a repeated reconciliation that now gives a verdict releases the target (9.4 a)
     elif verdict == "not_applied":
         res = result_doc(attempt=row.attempt, status="aborted_safe", reason_code="FAIL_EXEC", output="worker interrupted before the effect; safe to retry", seq_range=[rec["seq"], rec["seq"]], plan_hash=row.plan_hash)
         ctx.ledger.finish(row.job_id, row.attempt, "aborted_safe", res, ctx.now())
+        ctx.ledger.unlock_target(row.effect_key, row.job_id)
     else:
         res = result_doc(attempt=row.attempt, status="indeterminate", reason_code="INDETERMINATE", output=str(evidence.get("why", "unknown"))[:200], seq_range=[rec["seq"], rec["seq"]], plan_hash=row.plan_hash)
         ctx.ledger.finish(row.job_id, row.attempt, "indeterminate", res, ctx.now())
@@ -147,8 +151,10 @@ def reconcile_job(ctx: Context, job_id: str) -> tuple[str, dict | None]:
 
 def reconcile_locked(ctx: Context, job_id: str) -> tuple[str, dict | None]:
     row = ctx.ledger.get(job_id)
-    if row is None or row.state not in ("started", "effect_done", "reconciling"):
+    if row is None or row.state not in ("started", "effect_done", "reconciling", "indeterminate"):
         return "noop", None if row is None else row.result
+    if row.state == "indeterminate" and (ctx.now() - protocol.parse_ts(row.updated_at)).total_seconds() < INDETERMINATE_RETRY_S:
+        return "noop", row.result
     entry = ctx.optable.get(row.op)
     ex = examine(ctx, row)
     if ex.kind == "active":

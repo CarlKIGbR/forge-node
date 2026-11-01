@@ -346,3 +346,30 @@ def test_a_wall_clock_that_jumps_forward_does_not_make_a_live_worker_look_overdu
     kind, _ = reconcile.reconcile_job(e.ctx, jid)
     assert kind != "in_progress"
     e.backend.stop(unit)
+
+
+# ------------------------------------------------------------------------------------------- 9.4 (a): a repeated reconciliation
+def test_an_indeterminate_job_is_reconciled_again_and_a_verdict_releases_the_target(privd_env):
+    """Design 9.4 (a): the target of an indeterminate job is released by "a repeated reconciliation that now gives a verdict" (before this, only root's `resolve` could)."""
+    verdict = {"v": "unknown"}
+    e = privd_env.ready()
+    jid = _interrupted(e, probe=lambda wd: verdict["v"])
+    kind, res = reconcile.reconcile_job(e.ctx, jid)
+    assert kind == "indeterminate" and e.ledger.target_lock("selftest.noop")["job_id"] == jid
+    n_recovery = [x for x in e.priv_records() if x["type"] == "recovery" and x.get("job_id") == jid]
+    assert reconcile.reconcile_job(e.ctx, jid)[0] == "noop"                                    # too soon: every look appends a record
+    assert len([x for x in e.priv_records() if x["type"] == "recovery" and x.get("job_id") == jid]) == len(n_recovery)
+    e.clock.advance(seconds=reconcile.INDETERMINATE_RETRY_S + 1)
+    assert reconcile.reconcile_job(e.ctx, jid)[0] == "indeterminate"                           # still no verdict: stays, target stays locked, fence bumped again
+    assert e.ledger.get(jid).state == "indeterminate" and e.ledger.target_lock("selftest.noop") and e.ledger.get(jid).fence == 3
+    verdict["v"] = "applied"
+    e.clock.advance(seconds=reconcile.INDETERMINATE_RETRY_S + 1)
+    kind, res = reconcile.reconcile_job(e.ctx, jid)
+    assert kind == "committed" and e.ledger.get(jid).state == "committed" and e.ledger.target_lock("selftest.noop") is None
+    # and the other verdict
+    jid2 = _interrupted(e, probe=lambda wd: "unknown")
+    assert reconcile.reconcile_job(e.ctx, jid2)[0] == "indeterminate"
+    e.ctx.optable = optable_mod.OpTable([dataclasses.replace(e.table.get("selftest.noop"), probe=lambda wd: "not_applied")])
+    e.clock.advance(seconds=reconcile.INDETERMINATE_RETRY_S + 1)
+    kind, _ = reconcile.reconcile_job(e.ctx, jid2)
+    assert kind == "aborted_safe" and e.ledger.target_lock("selftest.noop") is None
