@@ -958,3 +958,90 @@ def test_the_shipper_says_so_when_the_agent_writable_ack_file_makes_it_stop(tmp_
     assert sh.ship_once(Hub()) == {"agent": 0} and sh.ship_once(Hub()) == {"agent": 0}
     assert len([x for x in lines if "ahead of the log" in x]) == 1                              # said once, not every cycle
     a.close()
+
+
+@pytest.mark.parametrize("torn", [b'{"torn":', b"", b"GARBAGE\n", "forged-unterminated"], ids=["fragment", "nothing-torn", "junk-line", "forged-unterminated"])
+def test_the_tail_repair_is_crash_safe_at_every_system_call(specs, torn):
+    """Round 3: the repair is now two writes (the terminating newline, then the tail_repair record). SIGKILL before and after every mutating call of an append that has to repair: the next
+    append succeeds, nothing is lost or forked, verify is clean and the tail is accounted for."""
+    def fresh(name):
+        sub = make_specs(os.path.join(os.path.dirname(specs["agent"].dir), name), max_file_bytes=10 ** 7)["agent"]
+        a = admin(sub)
+        a.init()
+        for i in range(2):
+            a.append("t0", {"i": i})
+        head = a.head()
+        a.close()
+        if torn == "forged-unterminated":
+            append_raw(live(sub), forged(head[0] + 1, head[1]).rstrip(b"\n"))
+        elif torn:
+            append_raw(live(sub), torn)
+        return sub
+    probe = fresh("tr-probe")
+    killed, total, calls = in_child(lambda: admin(probe).append("t0", {"x": 1}))
+    assert not killed and total >= 2, (total, calls)
+    for idx in range(1, total + 1):
+        for when in ("before", "after"):
+            sub = fresh(f"tr-{idx}-{when}")
+            kd, _, _ = in_child(lambda: admin(sub).append("t0", {"x": 1}), kill_at=idx, when=when)
+            assert kd
+            check_no_unflagged_reachable_file(sub.dir)
+            r = admin(sub)
+            r.append("t0", {"after": "crash"})
+            assert r.verify() == [], (idx, when, r.verify())
+            assert admin(sub).head() == r.head()
+            seqs = [x["seq"] for x in file_records(live(sub))]
+            assert seqs == sorted(set(seqs))                                               # no seq twice: nothing forked
+
+
+def test_recovery_seals_the_flagless_generation_before_it_hashes_it(specs, monkeypatch):
+    """Round 3 (MINOR): the content was hashed first and sealed afterwards - a write through a descriptor that predates the seal could land in between and be sealed as 'verified'."""
+    from forge_node.audit import log as audit_log
+    sub = _purge_scenario_for(specs, "m3toctou")
+    gdir = f"{sub.dir}/priv.000001"
+    path = f"{gdir}/priv.000001.jsonl"
+    os.chmod(gdir, 0o700)
+    ro = os.open(path, os.O_RDONLY)
+    fsflags.clear_flags(ro, fsflags.APPEND | fsflags.IMMUTABLE)
+    old_fd = os.open(path, os.O_RDWR)                                                        # predates the seal
+    before = open(path, "rb").read()
+    real, outcome = audit_log.file_summary, []
+
+    def summary_then_a_late_write(fd):
+        r = real(fd)
+        if not outcome:
+            try:
+                os.pwrite(old_fd, b"LATE", 5)
+                outcome.append("written")
+            except OSError:
+                outcome.append("refused")
+        return r
+    monkeypatch.setattr(audit_log, "file_summary", summary_then_a_late_write)
+    actions = admin(sub).recover()
+    monkeypatch.undo()
+    os.close(old_fd)
+    os.close(ro)
+    assert outcome == ["refused"] and open(path, "rb").read() == before                      # already sealed when the hash was taken: nothing can change what was hashed
+    assert any("verified against the next chain_link" in x for x in actions)
+
+
+def test_audit_verify_of_one_log_that_cannot_run_does_not_hide_the_other(tmp_path):
+    """Round 3 (MINOR): a dict comprehension over both logs lost the priv result when the agent log's verify raised (a hostile holder of the agent log's lock)."""
+    import io
+    import json
+    from forge_node.privd import privctl
+
+    class A:
+        def __init__(self, res):
+            self.res = res
+
+        def verify(self):
+            if isinstance(self.res, Exception):
+                raise self.res
+            return self.res
+    out = io.StringIO()
+    ctl = privctl.Ctl(euid=0, client=None, state_setup=lambda: None, admin_factory=lambda: (A(["generation 1: not sealed"]), A(AuditDown("busy"))), ledger_path="", local_stop="",
+                      systemctl_provider=None, systemctl_text_provider=None, protected_units=(), protected_paths=(), run_systemctl=None, clock=lambda: None, out=out)
+    assert ctl.cmd_audit_verify() == 1
+    doc = json.loads(out.getvalue())
+    assert doc["priv"] == ["generation 1: not sealed"] and "verification could not run" in doc["agent"][0]
