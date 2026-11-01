@@ -301,7 +301,7 @@ def test_privd_never_reads_agent_supplied_paths():
         ("policy_store.py", "PolicyStore._key"): fixed, ("policy_store.py", "PolicyStore.installed_serial"): fixed, ("policy_store.py", "_chain_key"): "walks up from a fixed path",
         ("policy_store.py", "_stat_key"): fixed,
         ("units.py", "LocalProcessBackend.__init__"): "registry dir (test double)", ("units.py", "LocalProcessBackend._alive"): "/proc/<pid> of a registered unit",
-        ("units.py", "LocalProcessBackend._entry"): "unit name validated by UNIT_RE", ("units.py", "LocalProcessBackend._group_alive"): "/proc",
+        ("units.py", "LocalProcessBackend._entry"): "unit name validated by UNIT_RE", ("units.py", "LocalProcessBackend.forget"): "unit name validated by UNIT_RE", ("units.py", "LocalProcessBackend._group_alive"): "/proc",
         ("units.py", "LocalProcessBackend.list_op_units"): "registry dir listing", ("units.py", "LocalProcessBackend.start"): "unit name validated by UNIT_RE",
         ("units.py", "SystemdBackend.cgroup_empty"): "/sys/fs/cgroup + ControlGroup reported by systemd for a unit we started", ("units.py", "_proc_start"): "/proc/<pid>",
         ("worker.py", "read_status"): "work_dir taken from the ledger row", ("worker.py", "run"): "argv[1] = the work dir privd created; request fields come from privd-written request.json",

@@ -120,11 +120,14 @@ class Doctor:
         if not r.get("ok"):
             return check("audit", "fail", f"selfcheck refused ({r.get('code')}: {r.get('detail')})")
         sc = r["selfcheck"]
-        fs = {k: (v or {}).get("fstype") for k, v in sc["detail"].items()}
+        logs = {k: v for k, v in sc["detail"].items() if k != "live"}
+        live = sc["detail"].get("live", {})
+        fs = {k: (v or {}).get("fstype") for k, v in logs.items()}
         if not sc["ok"]:
-            bad = {k: [c for c, v in (d or {}).get("checks", {}).items() if not v.get("ok")] for k, d in sc["detail"].items()}
-            return check("audit", "fail", f"the seal protocol does not work on this filesystem: {bad}", fstype=fs)
-        return check("audit", "ok", f"append-only + immutable seal proven on {fs}: descriptors held across the flag change cannot write after the seal", fstype=fs)
+            bad = {k: [c for c, v in (d or {}).get("checks", {}).items() if not v.get("ok")] for k, d in logs.items()}
+            broken = sorted(k for k, v in live.items() if not v.get("ok"))
+            return check("audit", "fail", f"the seal protocol does not work on this filesystem: {bad}" + (f"; the live log cannot be opened for appending: {broken}" if broken else ""), fstype=fs)
+        return check("audit", "ok", f"append-only + immutable seal proven on {fs}: descriptors held across the flag change cannot write after the seal; live logs open for appending: {sorted(live)}", fstype=fs)
 
     def forge_root_check(self) -> list[dict]:
         if self.policy is None:

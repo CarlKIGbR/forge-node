@@ -45,6 +45,10 @@ class SchemaTooNew(LedgerError):
     pass
 
 
+class TargetBusy(LedgerError):
+    """The atomic start was refused: the target is locked by an indeterminate job, or (mutating) another job's worker may still be running."""
+
+
 @dataclass(frozen=True)
 class Row:
     job_id: str
@@ -180,9 +184,17 @@ class Ledger:
         cur = c.execute(q, (*sets.values(), _ts(now), job_id, attempt, *frm))
         return cur.rowcount == 1
 
-    def mark_started(self, job_id: str, attempt: int, worker_unit: str, worker_dir: str, pre_digest: str | None, plan_hash: str | None, eff_dry_run: bool, now) -> Row:
-        """Pipeline step 17: persisted BEFORE the worker starts (unit name, directory, current fence, whether it runs as a dry run)."""
+    def mark_started(self, job_id: str, attempt: int, worker_unit: str, worker_dir: str, pre_digest: str | None, plan_hash: str | None, eff_dry_run: bool, mutating: bool, now) -> Row:
+        """Pipeline step 17: persisted BEFORE the worker starts (unit name, directory, current fence, whether it runs as a dry run). The target-lock and one-mutating-op-per-node checks are
+        made IN THE SAME TRANSACTION as the received -> started transition, so two jobs cannot both pass them and both start (the checks of step 16 are only an early exit)."""
         with self._tx() as c:
+            r = _row(c.execute("SELECT * FROM exec WHERE job_id=?", (job_id,)).fetchone())
+            if r is None or r.attempt != attempt or r.state != "received":
+                raise LedgerError("job is not in state received")
+            if c.execute("SELECT 1 FROM target_locks WHERE effect_key=?", (r.effect_key,)).fetchone():
+                raise TargetBusy("the target is locked by an indeterminate job")
+            if mutating and c.execute("SELECT 1 FROM exec WHERE state IN ('started','effect_done','reconciling') AND job_id<>? LIMIT 1", (job_id,)).fetchone():
+                raise TargetBusy("another mutating op is in flight on this node/target")
             if not self._cas(c, job_id, attempt, ("received",), {"state": "started", "worker_unit": worker_unit, "worker_dir": worker_dir, "pre_digest": pre_digest, "plan_hash": plan_hash,
                                                                   "eff_dry_run": int(eff_dry_run)}, now):
                 raise LedgerError("job is not in state received")
@@ -215,6 +227,10 @@ class Ledger:
     def open_rows(self) -> list[Row]:
         with self._lock:
             return [_row(r) for r in self._c.execute("SELECT * FROM exec WHERE state IN ('received','started','effect_done','reconciling','indeterminate') ORDER BY claimed_at")]
+
+    def known_job_ids(self) -> set[str]:
+        with self._lock:
+            return {r[0] for r in self._c.execute("SELECT job_id FROM exec")}
 
     def nonterminal_count(self) -> int:
         with self._lock:

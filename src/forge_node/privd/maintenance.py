@@ -6,6 +6,7 @@ from datetime import timedelta
 
 from .. import protocol
 from .core import Context, FileLock, job_lock_path
+from .units import UnitError, op_unit_name
 
 RETENTION_DAYS = 90
 
@@ -16,6 +17,10 @@ def prune(ctx: Context) -> dict:
     dirs = locks = 0
     for job_id, attempt in gone:
         for n in range(1, attempt + 1):
+            try:
+                ctx.backend.forget(op_unit_name(job_id, n))
+            except (UnitError, OSError):
+                pass                                                                  # housekeeping only
             wd = os.path.join(ctx.paths.work, f"{job_id}-{n}")
             if os.path.isdir(wd) and not os.path.islink(wd):
                 shutil.rmtree(wd, ignore_errors=True)

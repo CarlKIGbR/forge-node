@@ -162,11 +162,11 @@ def test_db_rejects_duplicate_gap_and_fork_even_from_a_buggy_hub(hub, hubdb, adm
 
 
 # ========================================================================================================= crosscheck (hub jobs <-> priv log)
-def _job_row(adm, job_id, tier=1, status="committed", result_at="2026-10-31T13:00:00Z", op="dir.ensure", node="g2", attempt=1):
+def _job_row(adm, job_id, tier=1, status="committed", result_at="2026-10-31T13:00:00Z", op="dir.ensure", node="g2", attempt=1, reason=None):
     adm.execute(
-        "INSERT INTO node.jobs (job_id,node_id,tier,op,params,dry_run,requester,project,state,delivery_seq,queue_deadline,issued_at,expires_at,delivered_at,result_status,result_attempt,result_at) "
-        "VALUES (%s,%s,%s,%s,'{}',false,'{\"identity\":\"meta\"}',NULL,%s,1,'2026-11-01T00:00:00Z','2026-10-31T12:59:00Z','2026-10-31T13:01:00Z','2026-10-31T12:59:00Z',%s,%s,%s)",
-        (job_id, node, tier, op, status if status in ("committed", "failed", "dry_run", "denied", "aborted_safe", "indeterminate") else "committed", status, attempt, result_at))
+        "INSERT INTO node.jobs (job_id,node_id,tier,op,params,dry_run,requester,project,state,delivery_seq,queue_deadline,issued_at,expires_at,delivered_at,result_status,result_attempt,result_at,result_reason) "
+        "VALUES (%s,%s,%s,%s,'{}',false,'{\"identity\":\"meta\"}',NULL,%s,1,'2026-11-01T00:00:00Z','2026-10-31T12:59:00Z','2026-10-31T13:01:00Z','2026-10-31T12:59:00Z',%s,%s,%s,%s)",
+        (job_id, node, tier, op, status if status in ("committed", "failed", "dry_run", "denied", "aborted_safe", "indeterminate") else "committed", status, attempt, result_at, reason))
 
 
 def _priv(hub, node, specs):
@@ -229,6 +229,27 @@ def test_crosscheck_denied_and_dry_run_jobs(hub, adm):
     _job_row(adm, r, status="dry_run")
     _priv(hub, "g2", [("denial", d, None, "2026-10-31T13:00:00Z"), ("result", r, 1, "2026-10-31T13:00:05Z")])
     assert hub.crosscheck("g2") == []
+
+
+def test_crosscheck_agent_local_denials_need_no_priv_trace_but_a_privd_reason_does(hub, adm):
+    """Review: the agent denies by itself when it has no privd link / its audit log is down / privd is unreachable - privd never saw the job, so no priv record exists and none is owed."""
+    local = [str(uuid.uuid4()) for _ in range(3)]
+    for j, code in zip(local, ("DENY_TIER_DISABLED", "DENY_AUDIT_DOWN", "DENY_STALE_LEASE")):
+        _job_row(adm, j, status="denied", reason=code)
+    assert hub.crosscheck("g2") == [] and not _q(adm)["quarantine"]
+    other = str(uuid.uuid4())
+    _job_row(adm, other, status="denied", reason="DENY_STOP")                       # a privd decision with no privd record is still a mismatch
+    assert [a["key"] for a in hub.crosscheck("g2")] == [f"missing-{other}"]
+
+
+def test_crosscheck_failed_before_any_intent_needs_only_the_denial_record(hub, adm):
+    ok, bad, half = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    _job_row(adm, ok, status="failed", reason="FAIL_PRECHECK")
+    _job_row(adm, bad, status="failed", reason="FAIL_EXEC")
+    _job_row(adm, half, status="failed", reason="FAIL_PRECHECK")
+    _priv(hub, "g2", [("denial", ok, 1, "2026-10-31T13:00:00Z"), ("denial", bad, 1, "2026-10-31T13:00:01Z"), ("intent", half, 1, "2026-10-31T13:00:02Z")])
+    keys = sorted(a["key"] for a in hub.crosscheck("g2"))
+    assert keys == sorted([f"missing-{bad}", f"missing-{half}"])
 
 
 def test_crosscheck_open_intent_older_than_10_minutes_alerts_without_quarantine(hub, adm, clock):

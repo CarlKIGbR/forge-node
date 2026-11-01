@@ -25,6 +25,11 @@ class UnitError(Exception):
     pass
 
 
+class UnitMaybeStarted(UnitError):
+    """systemd-run did not answer cleanly (timeout) or answered success but the unit shows no invocation yet: a unit may exist or may still appear. NOT a failure of the op - the caller
+    leaves the ledger row `started` and lets attach/reconcile decide from the unit and the worker's status file."""
+
+
 def op_unit_name(job_id: str, attempt: int) -> str:
     n = f"forge-node-op-{job_id}-{attempt}.service"
     if not UNIT_RE.match(n):
@@ -90,15 +95,20 @@ class SystemdBackend:
         """Start the transient unit (--no-block, no --collect) and return its InvocationID. systemd allocates the invocation id when the start JOB begins, which is after
         systemd-run returned: poll briefly for it. A unit that already ended (a very short worker) still carries the id of its run."""
         rc, out, err = self.run(systemd_run_argv(self.systemd_run, name, props, argv, pipe_wait=False), None, 30)
+        if rc == 124:
+            raise UnitMaybeStarted("systemd-run timed out: the unit may have been created")
         if rc != 0:
             raise UnitError(f"systemd-run failed: {err[:200]!r}")
         deadline = self.monotonic() + self.INVOCATION_WAIT_S
         while True:
-            info = self.show(name)
+            try:
+                info = self.show(name)
+            except UnitError as e:
+                raise UnitMaybeStarted(f"systemd-run succeeded but the unit state cannot be read ({e})") from e
             if info is not None and info.invocation_id:
                 return info.invocation_id
             if self.monotonic() >= deadline:
-                raise UnitError("the started unit has no InvocationID (the start job did not begin)")
+                raise UnitMaybeStarted("systemd-run succeeded but the unit has no InvocationID yet (the start job did not begin)")
             self.sleep(0.05)
 
     def run_pipe(self, name: str, props: Mapping[str, str], argv: Sequence[str], stdin: bytes, timeout_s: int):
@@ -109,7 +119,7 @@ class SystemdBackend:
             raise UnitError("unit name not allowed")
         rc, out, err = self.run([self.systemctl, "show", "--no-pager", *[f"-p{p}" for p in self.SHOW_PROPS], name], None, 20)
         if rc != 0:
-            return None
+            raise UnitError(f"systemctl show failed (rc {rc}): the state of the unit is unknown")       # never 'gone': a timeout or a bus error says nothing about the unit
         d = parse_show(out.decode("utf-8", "replace"))
         if d.get("ActiveState") in (None, "") or (d.get("ActiveState") == "inactive" and d.get("SubState") == "dead" and not d.get("InvocationID") and not d.get("ControlGroup")):
             return None                                                  # never loaded / garbage-collected
@@ -131,6 +141,12 @@ class SystemdBackend:
         rc, _, err = self.run([self.systemctl, "stop", name], None, 60)
         if rc != 0 and b"not loaded" not in err:
             raise UnitError(f"systemctl stop failed: {err[:200]!r}")
+
+    def forget(self, name: str) -> None:
+        """Drop the queryable state of a unit whose job is retired (a failed transient unit stays loaded until reset-failed)."""
+        if not UNIT_RE.match(name):
+            raise UnitError("unit name not allowed")
+        self.run([self.systemctl, "reset-failed", name], None, 30)
 
     def list_op_units(self) -> list[str]:
         rc, out, _ = self.run([self.systemctl, "list-units", "--all", "--no-legend", "--plain", "--no-pager", "forge-node-op-*.service"], None, 30)
@@ -254,6 +270,11 @@ class LocalProcessBackend:
                 if not self._group_alive(e):
                     return
                 time.sleep(0.01)
+
+    def forget(self, name: str) -> None:
+        e = self._entry(name)
+        if e is not None and not self._alive(e):
+            os.unlink(self._path(name))
 
     def list_op_units(self) -> list[str]:
         return sorted(n[:-5] for n in os.listdir(self.dir) if n.endswith(".json") and UNIT_RE.match(n[:-5]))

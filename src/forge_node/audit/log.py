@@ -352,6 +352,23 @@ class Appender:
                 self._unlock()
 
 
+    def peek(self) -> tuple[int, str]:
+        """Like head(), but never repairs anything: a sealed or flagless live file stays an error (AuditDown) even on the root side, where append()/head() would run the recovery.
+        For checks that must not change the log (doctor, selfcheck)."""
+        with self._mutex:
+            self._lock()
+            try:
+                cur = self._read_current()
+                if cur is None:
+                    self._drop()
+                    raise AuditNotInitialised("audit log is not initialised (CURRENT missing)")
+                Appender._ensure_open(self, cur)
+                t = self._refresh_tail()
+                return t.seq, t.hash
+            finally:
+                self._unlock()
+
+
 class AuditAdmin(Appender):
     """Root side: initialise, rotate, recover, purge, verify. Needs CAP_LINUX_IMMUTABLE (privd's root; the agent has no such object)."""
 

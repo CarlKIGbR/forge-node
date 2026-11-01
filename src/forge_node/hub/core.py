@@ -16,6 +16,8 @@ JOB_TTL_S = protocol.JOB_MAX_TTL_S
 MAX_OPEN_JOBS_PER_NODE = 200
 VERIFY_PAGE = 5000
 FULL_VERIFY_EVERY = 1440          # Durchlaeufe (bei 60 s Takt: taeglich); dazwischen nur neue Records
+# Ablehnungen, die der Agent selbst ausspricht, ohne dass privd je gefragt wurde (kein privd-Link, Agent-Audit unten, privd nicht erreichbar): es gibt keine priv-Spur, es wurde nichts ausgefuehrt
+AGENT_LOCAL_DENIALS = frozenset({"DENY_TIER_DISABLED", "DENY_AUDIT_DOWN", "DENY_STALE_LEASE"})
 _ACTIVE_STATES = ("issued", "in_progress")
 TERMINAL = ("committed", "dry_run", "denied", "failed", "expired")
 
@@ -465,7 +467,7 @@ class Hub:
         cutoff = now - timedelta(seconds=self.cfg.crosscheck_grace_s)
         anomalies: list[dict] = []
         with self.db.tx() as conn:
-            jobs = conn.execute("SELECT job_id, tier, op, state, result_status, result_attempt FROM node.jobs WHERE node_id=%s AND tier >= 1 AND result_at IS NOT NULL AND result_at < %s", (node_id, cutoff)).fetchall()
+            jobs = conn.execute("SELECT job_id, tier, op, state, result_status, result_reason, result_attempt FROM node.jobs WHERE node_id=%s AND tier >= 1 AND result_at IS NOT NULL AND result_at < %s", (node_id, cutoff)).fetchall()
             for j in jobs:
                 recs = conn.execute("SELECT type, attempt FROM node.audit WHERE node_id=%s AND source='priv' AND job_id=%s", (node_id, j["job_id"])).fetchall()
                 att = j["result_attempt"]
@@ -474,10 +476,14 @@ class Hub:
                 st = j["result_status"]
                 if st in ("committed", "failed", "aborted_safe", "indeterminate"):
                     ok = "intent" in types and bool(types & {"result", "recovery"})
+                    if not ok and st == "failed" and j["result_reason"] == "FAIL_PRECHECK":
+                        ok = "denial" in types and "intent" not in types              # failed before any intent existed (nothing was started): privd recorded a denial, not intent+result
                 elif st == "dry_run":
                     ok = bool(types & {"intent", "result"})
                 else:                                                                 # denied
                     ok = bool(types & {"denial", "result"})
+                    if not ok and not types and j["result_reason"] in AGENT_LOCAL_DENIALS:
+                        ok = True                                                     # the agent denied it itself (no audit log / no privd link / privd unreachable): nothing reached privd, nothing ran
                 if not ok:
                     anomalies.append({"kind": "crosscheck_mismatch", "key": f"missing-{j['job_id']}", "detail": {"job_id": str(j["job_id"]), "hub_status": st, "hub_attempt": att, "priv_types": sorted(types), "priv_attempts": sorted({r["attempt"] for r in recs if r["attempt"] is not None})}})
             orphans = conn.execute(

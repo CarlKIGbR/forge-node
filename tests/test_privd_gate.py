@@ -128,11 +128,12 @@ def test_unsigned_wrong_node_expired_and_foreign_key_jobs(privd_env, keys):
     assert e.call("exec", {"job": env2})["code"] == "DENY_JOB_SIGNATURE"                       # signed by a key the policy does not list
     env3, _ = e.job_env(node="g3")
     assert e.call("exec", {"job": env3})["code"] == "DENY_JOB_SIGNATURE"
-    env4, _ = e.job_env(ttl=10)
+    env4, job4 = e.job_env(ttl=10)
     e.clock.advance(seconds=11)
     assert e.call("exec", {"job": env4})["code"] == "DENY_JOB_EXPIRED"
     assert not e.ledger.open_rows()                                                          # nothing was claimed for an unauthenticated job
-    assert not any(r.get("job_id") for r in e.priv_records() if r["type"] == "denial")       # and its id is never trusted into a job_id column (hub cross-check)
+    # the id of an unauthenticated job is never trusted into a job_id column (hub cross-check); the expired one WAS signed by the hub, so its denial names it
+    assert [r["job_id"] for r in e.priv_records() if r["type"] == "denial" and r.get("job_id")] == [job4["job_id"]]
     assert any(r.get("claimed_job_id") or r.get("kind") == "exec" for r in e.priv_records() if r["type"] == "denial")
 
 
@@ -431,6 +432,79 @@ def test_stop_is_reobserved_immediately_before_the_unit_starts(privd_env):
         assert e.ledger.get(job["job_id"]).state == "denied_retryable"
         types = [r["type"] for r in e.priv_records() if r.get("job_id") == job["job_id"]]
         assert types == ["intent", "result"], types                                  # an intent was written, so the denial closes it with a result (hub cross-check)
+
+
+def test_two_jobs_cannot_both_pass_the_busy_check_and_both_start(privd_env):
+    """G28 race (review M1): B passes the early target/busy check while nothing runs and is parked right before its ledger transition; A starts completely (its row is `started`, parked
+    just before its unit); B is released. The busy check inside the transition must refuse B - one mutating op per node - and B's unit must never start."""
+    from g28_race import Interleaver, hook_before
+    e = privd_env.ready()
+    starts = []
+    real_start = e.backend.start
+    il = Interleaver()
+
+    def start(unit, *a):
+        starts.append(unit)
+        if threading_name() == "il-A":
+            il.park("A.unit")
+        return real_start(unit, *a)
+    import threading
+    threading_name = lambda: threading.current_thread().name           # noqa: E731
+    e.backend.start = start
+    hook_before(e.ledger, "mark_started", il, "B.pre", only_thread="B")
+    env_b, job_b = e.job_env(dry_run=True)
+    env_a, job_a = e.job_env(dry_run=True)
+    il.start("B", lambda: e.call("exec", {"job": env_b}))
+    il.wait_parked("B.pre")
+    il.start("A", lambda: e.call("exec", {"job": env_a}))
+    il.wait_parked("A.unit")
+    assert e.ledger.get(job_a["job_id"]).state == "started"
+    il.release("B.pre")
+    res_b = result(il.join("B"))
+    assert res_b["status"] == "denied" and res_b["reason_code"] == "DENY_TARGET_LOCKED", res_b
+    assert e.ledger.get(job_b["job_id"]).state == "denied_retryable"
+    il.release("A.unit")
+    assert result(il.join("A"))["status"] in ("dry_run", "committed")
+    assert len(starts) == 1 and starts[0].endswith(f"{job_a['job_id']}-1.service") or job_a["job_id"] in starts[0], starts
+    assert job_b["job_id"] not in " ".join(starts)
+
+
+def test_a_job_denied_after_its_work_directory_exists_succeeds_when_it_is_redelivered(privd_env):
+    """Review M2: STOP arrives after `started` (the work directory exists), the job is denied retryably; STOP is lifted and the SAME job is delivered again - it must run, not fail on
+    the leftover directory."""
+    from g28_race import Interleaver, hook_after
+    e = privd_env.ready()
+    il = Interleaver()
+    hook_after(e.ledger, "mark_started", il, "A.started", only_thread="A")
+    env, job = e.job_env(dry_run=True)
+    il.start("A", lambda: e.call("exec", {"job": env}))
+    il.wait_parked("A.started")
+    open(e.paths.local_stop, "w").close()
+    il.release("A.started")
+    assert result(il.join("A"))["reason_code"] == "DENY_LOCAL_STOP"
+    e.ledger.mark_started = e.ledger.__class__.mark_started.__get__(e.ledger)             # drop the hook
+    os.unlink(e.paths.local_stop)
+    assert os.path.isdir(os.path.join(e.paths.work, f"{job['job_id']}-1"))
+    e.clock.advance(seconds=61)
+    assert e.put_lease(seq=20)["ok"]
+    env2, _ = e.job_env(dry_run=True, job_id=job["job_id"], delivery_seq=2)
+    res = result(e.call("exec", {"job": env2}))
+    assert res["status"] in ("dry_run", "committed"), res
+
+
+def test_a_denial_before_the_claim_names_the_job_only_when_the_hub_signature_verified(privd_env):
+    """Review M3: the hub matches denials to jobs by the record's job_id. An expired but genuinely hub-signed job is named (job_id); a job whose signature did not verify is not - what the
+    caller claimed goes into claimed_job_id only."""
+    e = privd_env.ready()
+    env, job = e.job_env(dry_run=True, ttl=5)
+    e.clock.advance(seconds=30)
+    assert e.call("exec", {"job": env})["code"] == "DENY_JOB_EXPIRED"
+    forged_env, _ = e.job_env(dry_run=True)
+    forged_env = {**forged_env, "sig": forged_env["sig"][:-8] + "AAAAAAAA"}                  # a signature that does not verify
+    assert e.call("exec", {"job": forged_env})["code"] == "DENY_JOB_SIGNATURE"
+    den = [r for r in e.priv_records() if r["type"] == "denial"]
+    assert [r.get("job_id") for r in den] == [job["job_id"], None]
+    assert den[0]["reason_code"] == "DENY_JOB_EXPIRED" and "job_id" not in den[1]
 
 
 def test_concurrent_policy_apply_of_the_same_serial_has_one_winner(privd_env):

@@ -5,14 +5,17 @@ import os
 import socket
 import struct
 import threading
+import time
 
 from .. import canon
 from .core import KINDS, Context, Peer, Request
 from .gate import gate
 
 MAX_REQUEST_BYTES = 512 * 1024
-READ_TIMEOUT_S = 10.0
-MAX_CONNECTIONS = 32
+READ_TIMEOUT_S = 10.0                  # the WHOLE request must have arrived this long after the connection was accepted (not per recv: one byte every 9 s must not hold a slot)
+SEND_TIMEOUT_S = 10.0                  # a client that does not read its reply releases its thread after this
+AGENT_CONNECTIONS = 24                 # slots for the agent uid (and any other non-root caller) ...
+ROOT_CONNECTIONS = 8                   # ... and slots only root can use, so a flooded socket still takes root's lockdown / policy.apply / reconcile
 MAINTENANCE_EVERY_S = 3600.0
 HANDLERS = {"exec": "handle_exec", "lease.put": "handle_lease_put", "t0": "handle_t0", "status": "handle_status", "selfcheck": "handle_selfcheck", "reconcile": "handle_reconcile",
             "policy.apply": "handle_policy_apply", "audit.rotate": "handle_audit_rotate", "lockdown": "handle_lockdown"}
@@ -26,7 +29,7 @@ def _err(code: str, detail: str) -> bytes:
 class Server:
     def __init__(self, ctx: Context):
         self.ctx = ctx
-        self._sem = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self._sems = {"agent": threading.BoundedSemaphore(AGENT_CONNECTIONS), "root": threading.BoundedSemaphore(ROOT_CONNECTIONS)}
         self._stop = threading.Event()
 
     # ---- the nine handlers: closed set, one gate() call each --------------------------------------------------------------------
@@ -81,28 +84,37 @@ class Server:
         pid, uid, gid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
         return Peer(pid, uid, gid)
 
-    def serve_connection(self, conn: socket.socket) -> None:
+    def _pool_of(self, peer: Peer) -> str:
+        return "root" if peer.uid == self.ctx.owner_uid else "agent"
+
+    def serve_connection(self, conn: socket.socket, pool: str) -> None:
         try:
-            conn.settimeout(READ_TIMEOUT_S)
+            deadline = time.monotonic() + READ_TIMEOUT_S
             peer = self.peer_of(conn)
             buf = bytearray()
             while not buf.endswith(b"\n"):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return
+                conn.settimeout(left)
                 chunk = conn.recv(65536)
                 if not chunk:
                     return
                 buf += chunk
                 if len(buf) > MAX_REQUEST_BYTES:
+                    conn.settimeout(SEND_TIMEOUT_S)
                     conn.sendall(_err("BAD_REQUEST", "request too large"))
                     return
-            conn.settimeout(None)
-            conn.sendall(self.dispatch(bytes(buf), peer))
+            reply = self.dispatch(bytes(buf), peer)
+            conn.settimeout(SEND_TIMEOUT_S)
+            conn.sendall(reply)
         except (OSError, struct.error):
             pass
         finally:
             try:
                 conn.close()
             finally:
-                self._sem.release()
+                self._sems[pool].release()
 
     def serve(self, listener: socket.socket) -> None:
         from . import maintenance
@@ -121,13 +133,21 @@ class Server:
                 continue
             except OSError:
                 return
-            if not self._sem.acquire(blocking=False):
+            try:
+                pool = self._pool_of(self.peer_of(conn))
+            except (OSError, struct.error):
+                conn.close()
+                continue
+            if not self._sems[pool].acquire(blocking=False):
                 try:
+                    conn.settimeout(1.0)
                     conn.sendall(_err("DENY_RATE", "too many connections"))
+                except OSError:
+                    pass
                 finally:
                     conn.close()
                 continue
-            threading.Thread(target=self.serve_connection, args=(conn,), daemon=True).start()
+            threading.Thread(target=self.serve_connection, args=(conn, pool), daemon=True).start()
 
     def stop(self) -> None:
         self._stop.set()

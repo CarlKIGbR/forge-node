@@ -45,6 +45,7 @@ class ProtoError(Exception):
         super().__init__(f"{code}: {detail}" if detail else code)
         self.code = code
         self.detail = detail
+        self.job_id = None                  # set by verify_job when the signature HAD verified (a hub-signed job that is merely expired / not yet valid)
 
 
 # ----------------------------------------------------------------------------------------------------------------- time
@@ -279,10 +280,12 @@ def verify_job(env, gate_keys: dict[str, GateKey], node: str, now: datetime, ssh
     p = open_envelope(env, gate_keys, "job", now, ssh_keygen)
     if p["node"] != node:
         raise ProtoError("DENY_JOB_SIGNATURE", "job for another node")
-    if now > parse_ts(p["expires_at"]):
-        raise ProtoError("DENY_JOB_EXPIRED", "job expired")
-    if now < parse_ts(p["issued_at"]) - timedelta(seconds=CLOCK_SKEW_MAX_S):
-        raise ProtoError("DENY_CLOCK", "job issued in the future")
+    for bad, code, detail in ((now > parse_ts(p["expires_at"]), "DENY_JOB_EXPIRED", "job expired"),
+                               (now < parse_ts(p["issued_at"]) - timedelta(seconds=CLOCK_SKEW_MAX_S), "DENY_CLOCK", "job issued in the future")):
+        if bad:
+            e = ProtoError(code, detail)
+            e.job_id = p["job_id"]
+            raise e
     return p
 
 

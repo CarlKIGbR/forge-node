@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from forge_node.privd.units import (UNIT_RE, LocalProcessBackend, SystemdBackend, UnitError, op_unit_name, parse_show, prop_args, systemd_run_argv)
+from forge_node.privd.units import (UNIT_RE, LocalProcessBackend, SystemdBackend, UnitError, UnitMaybeStarted, op_unit_name, parse_show, prop_args, systemd_run_argv)
 
 JOB = "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b"
 NAME = op_unit_name(JOB, 2)
@@ -89,7 +89,16 @@ def test_start_fails_when_systemd_run_fails_or_the_job_never_begins():
         backend(sc).start(NAME, {}, ["/usr/bin/true"])
     sc = Script()
     sc.show_outputs = [b"ActiveState=inactive\nSubState=dead\nInvocationID=\nResult=success\nControlGroup=\n"]
-    with pytest.raises(UnitError, match="no InvocationID"):
+    with pytest.raises(UnitMaybeStarted, match="no InvocationID"):                         # systemd-run said yes: a unit may appear - not a clean failure
+        backend(sc).start(NAME, {}, ["/usr/bin/true"])
+    sc = Script()
+    sc.rc["run"] = 124                                                                    # systemd-run timed out
+    with pytest.raises(UnitMaybeStarted, match="timed out"):
+        backend(sc).start(NAME, {}, ["/usr/bin/true"])
+    sc = Script()
+    sc.rc["show"] = 1                                                                     # systemd-run succeeded, the state cannot be read
+    sc.show_outputs = [b""]
+    with pytest.raises(UnitMaybeStarted):
         backend(sc).start(NAME, {}, ["/usr/bin/true"])
 
 
@@ -107,9 +116,22 @@ def test_show_parses_states_and_treats_a_collected_unit_as_gone():
     assert b.show(NAME) is None
     sc.rc["show"] = 1
     sc.show_outputs = [b""]
-    assert b.show(NAME) is None
+    with pytest.raises(UnitError, match="unknown"):                                        # a failing/timed-out `systemctl show` is NOT 'the unit is gone'
+        b.show(NAME)
+    sc.rc["show"] = 124
+    with pytest.raises(UnitError):
+        b.show(NAME)
     with pytest.raises(UnitError):
         b.show("x.service")
+
+
+def test_forget_resets_a_failed_unit_by_exact_name_only():
+    sc = Script()
+    b = backend(sc)
+    b.forget(NAME)
+    assert sc.calls[-1][0] == ["/usr/bin/systemctl", "reset-failed", NAME]
+    with pytest.raises(UnitError):
+        b.forget("sshd.service")
 
 
 def test_stop_and_list_op_units():

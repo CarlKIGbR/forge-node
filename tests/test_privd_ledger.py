@@ -244,7 +244,7 @@ def _died_without_status(e, entry_changes):
     e.ledger.claim(jid, 1, "selftest.noop", "selftest.noop", "0" * 64, False, "meta", e.clock())
     wd = Path(e.paths.work) / f"{jid}-1"
     wd.mkdir(mode=0o700)
-    e.ledger.mark_started(jid, 1, op_unit_name(jid, 1), str(wd), None, None, False, e.clock())
+    e.ledger.mark_started(jid, 1, op_unit_name(jid, 1), str(wd), None, None, False, False, e.clock())
     kind, res = reconcile.reconcile_job(e.ctx, jid)
     return jid, kind, res
 
@@ -301,7 +301,7 @@ def test_delegated_pending_systemd_job_settles_before_probe(privd_env):
         e.ledger.claim(jid, 1, "selftest.noop", "selftest.noop", "0" * 64, False, "meta", e.clock())
         wd = Path(e.paths.work) / f"{jid}-1"
         wd.mkdir(mode=0o700)
-        e.ledger.mark_started(jid, 1, op_unit_name(jid, 1), str(wd), None, None, False, e.clock())
+        e.ledger.mark_started(jid, 1, op_unit_name(jid, 1), str(wd), None, None, False, False, e.clock())
         kind, _ = reconcile.reconcile_job(e.ctx, jid)
         assert kind == expect
         e.ledger.unlock_target("selftest.noop", jid)
@@ -425,7 +425,7 @@ def test_fence_mismatch_worker_exits_without_effect(privd_env, tmp_path):
     e.ledger.claim(jid, 1, "selftest.noop", "k1", "0" * 64, False, "meta", e.clock())
     wd = Path(e.paths.work) / f"{jid}-1"
     wd.mkdir(mode=0o700)
-    e.ledger.mark_started(jid, 1, op_unit_name(jid, 1), str(wd), None, None, False, e.clock())
+    e.ledger.mark_started(jid, 1, op_unit_name(jid, 1), str(wd), None, None, False, False, e.clock())
     req = {"job_id": jid, "attempt": 1, "fence": 1, "op": "selftest.noop", "params": {"note": ""}, "dry_run": False, "plan_hash": None, "effect_key": "k1", "ledger_path": e.paths.ledger,
            "lock_dir": e.paths.locks, "priv_state": e.paths.priv_state}
     (wd / "request.json").write_text(json.dumps(req))
@@ -540,7 +540,7 @@ def test_effect_lock_blocks_a_worker_until_it_is_released(privd_env):
     e.ledger.claim(jid, 1, "selftest.noop", "k-lock", "0" * 64, False, "meta", e.clock())
     wd = Path(e.paths.work) / f"{jid}-1"
     wd.mkdir(mode=0o700)
-    e.ledger.mark_started(jid, 1, op_unit_name(jid, 1), str(wd), None, None, False, e.clock())
+    e.ledger.mark_started(jid, 1, op_unit_name(jid, 1), str(wd), None, None, False, False, e.clock())
     req = {"job_id": jid, "attempt": 1, "fence": 1, "op": "selftest.noop", "params": {"note": ""}, "dry_run": False, "plan_hash": None, "effect_key": "k-lock", "ledger_path": e.paths.ledger,
            "lock_dir": e.paths.locks, "priv_state": e.paths.priv_state}
     (wd / "request.json").write_text(json.dumps(req))

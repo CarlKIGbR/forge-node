@@ -168,7 +168,11 @@ def reconcile_locked(ctx: Context, job_id: str) -> tuple[str, dict | None]:
     except BlockingIOError:
         return "indeterminate", _conclude(ctx, row, "unknown", {"why": "the effect lock is held by a process outside the worker's cgroup"})
     try:
-        if entry is not None and entry.settle is not None and not entry.settle(row.worker_dir):
+        try:
+            settled = entry is None or entry.settle is None or entry.settle(row.worker_dir)
+        except Exception as e:  # noqa: BLE001 - an op's settle hook that fails says nothing about the world: indeterminate, never a row left in `reconciling`
+            return "indeterminate", _conclude(ctx, row, "unknown", {"why": f"the settle hook raised {type(e).__name__}"})
+        if not settled:
             return "indeterminate", _conclude(ctx, row, "unknown", {"why": "delegated effects did not settle"})
         status = worker.read_status(row.worker_dir) if row.worker_dir else None
         if status is not None and (status.get("job_id") != row.job_id or status.get("attempt") != row.attempt):
@@ -181,7 +185,12 @@ def reconcile_locked(ctx: Context, job_id: str) -> tuple[str, dict | None]:
         elif status is not None and status["outcome"] == "fenced":
             verdict = "not_applied"
         elif entry.probe is not None:
-            verdict = entry.probe(row.worker_dir)
+            try:
+                verdict = entry.probe(row.worker_dir)
+            except Exception:  # noqa: BLE001 - a probe that cannot answer is an unknown answer
+                verdict = "unknown"
+            if verdict not in ("applied", "not_applied", "partial", "unknown"):
+                verdict = "unknown"
         else:
             verdict = "unknown"
     finally:
@@ -227,9 +236,9 @@ def recover_all(ctx: Context) -> dict:
                 report["audit_errors"][name] = f"{type(e).__name__}: {e}"
     rows = {r.job_id: r for r in ctx.ledger.open_rows()}
     units = list(ctx.backend.list_op_units())
-    known = {r.worker_unit for r in rows.values() if r.worker_unit}
+    jobs = ctx.ledger.known_job_ids()                 # a unit whose JOB the ledger knows (any state, any attempt) is not an orphan: a failed unit of a finished job stays queryable
     for u in units:
-        if u not in known:
+        if u[len("forge-node-op-"):][:36] not in jobs:
             ctx.backend.stop(u)
             ctx.audit("recovery", {"orphan_unit": u, "action": "stopped (no ledger row)"})
             report["orphans"].append(u)

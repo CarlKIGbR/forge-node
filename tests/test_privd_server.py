@@ -136,6 +136,7 @@ def test_closed_request_set_and_malformed_lines(served):
 
 def test_many_concurrent_clients_are_served(served):
     results = []
+    served.server._sems["root"] = threading.BoundedSemaphore(32)                             # this test client is root; the production root pool is small on purpose (see test_privd_review)
 
     def go():
         results.append(json.loads(raw_call(served.paths.socket, req("status")))["ok"])

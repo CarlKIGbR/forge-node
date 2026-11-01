@@ -31,8 +31,8 @@ from ..t0 import hardening
 from ..t0.policy import OWNER_PRINCIPAL, PolicyError
 from . import classes, reconcile as rec
 from .core import KINDS, Context, Deny, FileLock, Request, job_lock_path, result_doc, work_dir_path
-from .ledger import STATE_SCHEMA, Row
-from .units import UnitError, op_unit_name
+from .ledger import STATE_SCHEMA, Row, TargetBusy
+from .units import UnitError, UnitMaybeStarted, op_unit_name
 
 CLOCK_SANITY_S = 60
 LIGHT_PROBE_RATE = ((3, 60),)
@@ -101,6 +101,11 @@ def _rate(st: State, bucket: str, limits, code: str = "DENY_RATE") -> None:
         raise Deny(code, f"rate limit {bucket}")
 
 
+def _uid_rate(st: State, base: str, limits) -> None:
+    """A bucket per caller uid: the agent's junk requests must not use up root's budget for the same request kind (revocation by policy.apply, resolve by reconcile)."""
+    _rate(st, f"{base}.uid{st.req.peer.uid}", limits)
+
+
 def _local_stop_active(ctx: Context) -> bool:
     try:
         os.lstat(ctx.paths.local_stop)
@@ -127,6 +132,7 @@ def s_job_signature(st: State) -> None:
     try:
         st.job = protocol.verify_job(env, _gate_keys(st), st.ctx.node, st.ctx.now(), st.ctx.ssh_keygen)
     except ProtoError as e:
+        st.extra["signed_job_id"] = e.job_id
         raise Deny(e.code if e.code in protocol.REASON_CODES else "DENY_JOB_SIGNATURE", e.detail) from e
 
 
@@ -353,7 +359,10 @@ def s_started(st: State) -> None:
         os.fsync(dfd)
     finally:
         os.close(dfd)
-    st.row = ctx.ledger.mark_started(row.job_id, row.attempt, unit, st.work_dir, None, st.extra.get("plan_hash"), st.dry_run, ctx.now())
+    try:
+        st.row = ctx.ledger.mark_started(row.job_id, row.attempt, unit, st.work_dir, None, st.extra.get("plan_hash"), st.dry_run, entry.mutating, ctx.now())
+    except TargetBusy as e:
+        raise Deny("DENY_TARGET_LOCKED", str(e)) from e
 
 
 def _fresh_stop_check(st: State) -> None:
@@ -378,6 +387,10 @@ def s_effect(st: State) -> None:
     props = classes.op_unit_properties(entry.unit_class, work_dir=st.work_dir, priv_state=ctx.paths.priv_state, forge_roots=tuple(r.path for r in _policy(st).forge_roots), timeout_s=entry.timeout_s)
     try:
         inv = ctx.backend.start(row.worker_unit, props, ctx.argv_for("op", entry.name, st.work_dir))
+    except UnitMaybeStarted as e:
+        # not a failure and not a denial: a unit may exist. The row stays `started`; a monitor waits for the unit (or reconciles it), the hub's open_jobs asks again meanwhile.
+        rec.attach_monitor(ctx, ctx.ledger.get(row.job_id))
+        raise Done({"ok": True, "in_progress": True, "job_id": row.job_id}) from e
     except UnitError as e:
         raise Deny("FAIL_EXEC", f"unit did not start: {e}") from e
     ctx.ledger.set_invocation(row.job_id, row.attempt, inv, ctx.now())
@@ -476,15 +489,24 @@ def s_selfcheck_target(st: State) -> None:
     elif b["target"] != "audit":
         raise Deny("DENY_PARAM", "selfcheck target must be probe:<name>, op:<name> or audit")
     st.extra["kind"], st.extra["name"] = (kind, name) if b["target"] != "audit" else ("audit", "")
-    _rate(st, "selfcheck", SELFCHECK_RATE)
+    _uid_rate(st, "selfcheck", SELFCHECK_RATE)
 
 
 def s_selfcheck_run(st: State) -> None:
     ctx, kind, name = st.ctx, st.extra["kind"], st.extra["name"]
     if kind == "audit":
         from ..audit import fsproof
-        res = {"priv": fsproof.prove(ctx.priv_log.spec.dir), "agent": fsproof.prove(ctx.agent_log.spec.dir) if ctx.agent_log else None}
-        ok_ = res["priv"]["ok"] and (res["agent"] is None or res["agent"]["ok"])
+        # The proof writes only a canary inside a root-only scratch directory next to each log (removed afterwards, stale ones of a killed proof swept); the logs themselves are only READ:
+        # peek() opens the live file under the log's lock and checks CURRENT, owner/mode and the append-only flag - and repairs nothing.
+        res = {"priv": fsproof.prove(ctx.priv_log.spec.dir), "agent": fsproof.prove(ctx.agent_log.spec.dir) if ctx.agent_log else None, "live": {}}
+        for name, log in (("priv", ctx.priv_log), ("agent", ctx.agent_log)):
+            if log is not None:
+                try:
+                    seq, _ = log.peek()
+                    res["live"][name] = {"ok": True, "seq": seq}
+                except (AuditDown, AuditCorrupt) as e:
+                    res["live"][name] = {"ok": False, "error": type(e).__name__}
+        ok_ = res["priv"]["ok"] and (res["agent"] is None or res["agent"]["ok"]) and all(v["ok"] for v in res["live"].values())
         st.reply = {"ok": True, "selfcheck": {"target": "audit", "ok": ok_, "detail": res}}
         return
     unit = f"forge-node-probe-{os.urandom(16).hex()}.service"
@@ -566,7 +588,7 @@ def s_reconcile(st: State) -> None:
         protocol.check_uuid(b["job_id"])
     except ProtoError as e:
         raise Deny("DENY_PARAM", e.detail) from e
-    _rate(st, "reconcile", ((30, 60),))
+    _uid_rate(st, "reconcile", ((30, 60),))
     if "resolve" in b:                                                          # ledger.resolve: root only, an indeterminate row only, never the failing caller's decision alone
         if st.req.peer.uid != ctx.owner_uid:
             raise Deny("DENY_NEEDS_OWNER_SIG", "only root may resolve an indeterminate job")
@@ -598,7 +620,7 @@ def s_policy_apply(st: State) -> None:
         raw = base64.b64decode(b["policy_b64"], validate=True)
     except (binascii.Error, ValueError) as e:
         raise Deny("DENY_PARAM", "policy_b64 is not base64") from e
-    _rate(st, "policy.apply", ((10, 60),))
+    _uid_rate(st, "policy.apply", ((10, 60),))
     try:
         ctx.priv_log.head()
     except (AuditDown, AuditCorrupt) as e:
@@ -716,7 +738,10 @@ def _record_denial(st: State, d: Deny) -> dict:
                               frm=("received", "started"))
             return {"ok": True, "result": {"job_id": row.job_id, **res}}
         if _denial_audit_allowed(ctx):
-            ctx.audit("denial", {"kind": st.req.kind, "reason_code": d.code, "detail": d.detail[:300], "caller_uid": st.req.peer.uid, "claimed_job_id": st.claimed_id})
+            # `job_id` (what the hub's cross-check matches on) only for a job whose hub signature verified; whatever else the caller named is untrusted and goes into `claimed_job_id`
+            vid = st.extra.get("signed_job_id") or st.claimed_id
+            ctx.audit("denial", {"kind": st.req.kind, "reason_code": d.code, "detail": d.detail[:300], "caller_uid": st.req.peer.uid, "claimed_job_id": st.claimed_id,
+                                 **({"job_id": vid} if vid else {})})
     except Deny:
         if row is not None:                                                     # the audit log is down: the job is retryable, nothing was recorded
             res = result_doc(attempt=row.attempt, status="denied", reason_code="DENY_AUDIT_DOWN", output="audit down", seq_range=None, plan_hash=None)

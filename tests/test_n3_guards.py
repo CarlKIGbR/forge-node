@@ -333,7 +333,7 @@ def test_g28_reconcile_reobserves_the_world_after_the_fence_bump(privd_env, tmp_
     wd.mkdir(mode=0o700)
     unit = op_unit_name(jid, 1)
     inv = e.backend.start(unit, {"ProtectSystem": "strict"}, [sys.executable, "-c", "import time; time.sleep(120)"])
-    e.ledger.mark_started(jid, 1, unit, str(wd), None, None, False, e.clock())
+    e.ledger.mark_started(jid, 1, unit, str(wd), None, None, False, False, e.clock())
     e.ledger.set_invocation(jid, 1, inv, e.clock())
     e.clock.advance(seconds=31)                                                                # past the op's budget: reconciliation is allowed to proceed
     il = Interleaver()
@@ -359,7 +359,7 @@ def test_reconcile_and_retry_claims_serialized(privd_env):
     e.ledger.claim(jid, 1, "selftest.noop", "selftest.noop", __import__("forge_node.canon", fromlist=["x"]).digest({"note": "r"}), False, "meta", e.clock())
     wd = Path(e.paths.work) / f"{jid}-1"
     wd.mkdir(mode=0o700)
-    e.ledger.mark_started(jid, 1, op_unit_name(jid, 1), str(wd), None, None, False, e.clock())      # an interrupted row: no unit
+    e.ledger.mark_started(jid, 1, op_unit_name(jid, 1), str(wd), None, None, False, False, e.clock())      # an interrupted row: no unit
     il = Interleaver()
     hook_after(e.ledger, "begin_reconcile", il, "A.bumped", only_thread="A")
     il.start("A", lambda: reconcile.reconcile_job(e.ctx, jid))
