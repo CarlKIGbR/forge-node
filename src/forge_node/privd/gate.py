@@ -666,6 +666,20 @@ def flush_pending_policy_audit(ctx: Context) -> bool:
     return True
 
 
+def record_release_switch(ctx: Context) -> bool:
+    """Design 13.E: "the audit chain simply gets a `release_switch` record". The switcher is stdlib-only and cannot write the log; the privd that starts after a switch (or the first start of
+    an install) records that its version differs from the one that ran before."""
+    last = ctx.ledger.meta_get("last_version")
+    if last == ctx.version:
+        return False
+    try:
+        ctx.audit("release_switch", {"from": last, "to": ctx.version})
+    except Deny:
+        return False                                                           # audit down: it is recorded at the next start (the marker is only set after the record exists)
+    ctx.ledger.meta_set("last_version", ctx.version)
+    return True
+
+
 def s_policy_apply(st: State) -> None:
     ctx, b = st.ctx, st.req.body
     if set(b) != {"policy_b64", "sig"} or not isinstance(b["policy_b64"], str) or not isinstance(b["sig"], str):

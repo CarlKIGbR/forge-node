@@ -288,3 +288,19 @@ def test_doctor_main_exits_with_the_verdict_the_switcher_depends_on(monkeypatch,
     assert D.main([]) == 0 and FakeDoctor.seen["after_switch"] is False
     FakeDoctor.failed = ["privd"]
     assert D.main(["--after-switch"]) == 1
+
+
+def test_unit_checks_carry_their_own_long_timeout_per_request(served, tmp_path, monkeypatch):
+    """Round 2: 'per-request selfcheck timeout dropped' survived - an op's selfcheck runs a real unit and takes seconds."""
+    monkeypatch.setattr(D, "HubClient", FakeHub)
+    FakeHub.behaviour = None
+    seen = []
+    real = PrivClient(served.paths.socket, 0, 60)
+
+    class Spy:
+        def request(self, kind, body, timeout=None):
+            seen.append((body.get("target"), timeout))
+            return real.request(kind, body, timeout) if timeout else real.request(kind, body)
+    d, _ = doctor(served, tmp_path, op_names=("selftest.noop",), priv=Spy())
+    d.unit_checks()
+    assert seen and all(t == 150 for target, t in seen if target and target != "audit")

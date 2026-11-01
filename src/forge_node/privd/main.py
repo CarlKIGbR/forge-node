@@ -18,7 +18,7 @@ from ..t0.runner import FIXED_PATH, RunnerError, trusted_binary
 from . import resolver
 from .client import PrivClient
 from .core import Context, Paths
-from .gate import flush_pending_policy_audit
+from .gate import flush_pending_policy_audit, record_release_switch
 from .ledger import Ledger
 from .lease import LeaseStore
 from .optable import build_optable
@@ -110,6 +110,7 @@ def run_privd() -> int:
         return 2
     recover_all(ctx)
     flush_pending_policy_audit(ctx)
+    record_release_switch(ctx)
     Server(ctx).serve(listener_from_systemd())
     return 0
 

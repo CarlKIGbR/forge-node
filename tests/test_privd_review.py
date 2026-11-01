@@ -472,3 +472,22 @@ def test_audit_init_proves_every_filesystem_before_it_creates_any_log(realfs, mo
         ctl.cmd_audit_init()
     import re
     assert not [x for x in os.listdir(specs["priv"].dir) if re.match(r"^priv\.\d{6}$", x)] and not [x for x in os.listdir(specs["agent"].dir) if re.match(r"^audit\.\d{6}$", x)]
+
+
+def test_privd_records_a_release_switch_when_its_version_differs_from_the_one_that_ran_before(privd_env):
+    """Design 13.E promised a `release_switch` record; nothing wrote one."""
+    from forge_node.privd.gate import record_release_switch
+    e = privd_env.ready()
+    assert record_release_switch(e.ctx) is True and record_release_switch(e.ctx) is False         # first start, then no change
+    e.ctx.version = "0.1.1"
+    assert record_release_switch(e.ctx) is True
+    recs = [x for x in e.priv_records() if x["type"] == "release_switch"]
+    assert [(x["from"], x["to"]) for x in recs] == [(None, "0.0-test"), ("0.0-test", "0.1.1")]
+    # audit down: no marker is set, the next start records it
+    e.ctx.version = "0.2.0"
+    real = e.ctx.audit
+    from forge_node.privd.core import Deny
+    e.ctx.audit = lambda t, f: (_ for _ in ()).throw(Deny("DENY_AUDIT_DOWN", "down"))
+    assert record_release_switch(e.ctx) is False
+    e.ctx.audit = real
+    assert record_release_switch(e.ctx) is True

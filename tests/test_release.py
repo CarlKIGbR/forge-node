@@ -1055,3 +1055,140 @@ def test_the_zipapp_does_not_depend_on_the_builders_time_zone(env):
             os.environ["TZ"] = old
         __import__("time").tzset()
     assert len(digests) == 1, digests
+
+
+# ----------------------------------------------------------------------------------------------------- round 2: tests that claimed more than they proved
+def test_the_way_back_re_reads_the_ledger_after_stopping_again(env):
+    """Round 2 (G28): 'rollback without _quiesce_and_check_ledger' passed every test. A row that appears while the new release runs must stop the rollback - it would orphan that worker."""
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    env.doctor_script = [False]
+
+    def a_row_appears():
+        c = sqlite3.connect(env.ledger)
+        c.execute("INSERT INTO exec VALUES('late', 'started')")
+        c.commit()
+        c.close()
+    env.on_doctor = a_row_appears
+    assert sw.cmd_switch("0.3.1") == 3
+    res = docs(env.out.getvalue())[-1]
+    assert "not terminal" in res["restore_error"] and res["restored"] is None
+
+
+def test_an_oserror_while_moving_current_is_a_failure_that_takes_the_previous_release_back(env, monkeypatch):
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.make_ledger()
+    real = sw._repoint
+    calls = []
+
+    def flaky(link, target):
+        calls.append(target)
+        if target.endswith("0.3.1") and link.endswith("current"):
+            raise OSError(28, "No space left on device")
+        return real(link, target)
+    sw._repoint = flaky
+    assert sw.cmd_switch("0.3.1") == 1
+    assert os.readlink(env.base / "current") == "releases/0.3.0" and "No space" in docs(env.out.getvalue())[-1]["failure"]
+
+
+def test_self_update_hashes_the_bytes_it_writes_and_refuses_a_downgrade(env, monkeypatch):
+    env.release("0.3.0", "full")
+    sw = env.switcher()
+    env.self_path.write_text("#!/bin/sh\necho old\n")
+    from forge_node.release import switcher as sw_mod
+    real = sw_mod._read_nofollow
+
+    def swapped(path, limit, owner_uid):
+        data = real(path, limit, owner_uid)
+        return b"#!/bin/sh\nrm -rf /\n" if path.endswith("sbin/forge-node-release") else data               # the file changed between the tree check and the read
+    monkeypatch.setattr(sw_mod, "_read_nofollow", swapped)
+    with pytest.raises(Refused, match="differs from its manifest"):
+        sw.cmd_self_update("0.3.0")
+    monkeypatch.undo()
+    assert env.self_path.read_text() == "#!/bin/sh\necho old\n"
+    env.release("0.0.1", "full", switcher_api=SWITCHER_API - 1)
+    with pytest.raises(Refused, match="downgrade"):
+        sw.cmd_self_update("0.0.1")
+
+
+def test_reads_never_follow_a_symlink_and_a_first_install_never_overwrites_a_profile(env, tmp_path):
+    from forge_node.release.switcher import _read_nofollow
+    (tmp_path / "real").write_text("full\n")
+    os.chmod(tmp_path / "real", 0o644)
+    os.symlink(tmp_path / "real", tmp_path / "link")
+    with pytest.raises(OSError):
+        _read_nofollow(str(tmp_path / "link"), 100, 0)
+    env.release("0.3.0", "full")
+    (env.base / "profile").write_text("full\n")                                                  # a leftover profile file that even matches
+    os.chmod(env.base / "profile", 0o644)
+    sw = env.switcher()
+    with pytest.raises(FileExistsError):
+        sw.cmd_install_first("0.3.0")
+    assert (env.base / "profile").read_text() == "full\n" and not os.path.lexists(env.base / "current")
+
+
+def test_a_directory_that_cannot_be_scanned_is_a_refusal(env, monkeypatch):
+    env.release("0.3.0", "full")
+    sw = env.switcher()
+    real_walk = os.walk
+
+    def walk(top, topdown=True, onerror=None, followlinks=False):
+        if str(top).endswith("0.3.0") and onerror:
+            onerror(PermissionError(13, "denied", str(top)))
+        return real_walk(top, topdown, onerror, followlinks)
+    monkeypatch.setattr(os, "walk", walk)
+    with pytest.raises(Refused, match="cannot scan"):
+        sw.cmd_check("0.3.0")
+
+
+def test_a_group_writable_file_in_the_tree_is_refused_not_only_a_world_writable_one(env):
+    env.release("0.3.0", "full")
+    sw = env.switcher()
+    f = env.base / "releases" / "0.3.0" / "forge-node.pyz"
+    os.chmod(f, 0o664)
+    with pytest.raises(Refused, match="only root can write"):
+        sw.cmd_check("0.3.0")
+    os.chmod(f, 0o644)
+    assert sw.cmd_check("0.3.0") == 0
+
+
+def _resign(env, ver, edit):
+    d = env.base / "releases" / ver
+    m = json.loads((d / "RELEASE.json").read_text())
+    edit(m, d)
+    raw = (json.dumps(m, indent=1, sort_keys=True) + "\n").encode()
+    (d / "RELEASE.json").write_bytes(raw)
+    (d / "RELEASE.json.sig").write_text(sshsig.sign(raw, env.priv, sshsig.NS_RELEASE))
+
+
+def test_only_forge_node_units_may_be_named_by_a_signed_manifest(env):
+    env.release("0.3.0", "full")
+    sw = env.switcher()
+
+    def add_unit(m, d):
+        (d / "units" / "evil.service").write_text("[Service]\nExecStart=/bin/sh\n")
+        os.chmod(d / "units" / "evil.service", 0o644)
+        m["units"].append("evil.service")
+        m["files"]["units/evil.service"] = __import__("hashlib").sha256((d / "units" / "evil.service").read_bytes()).hexdigest()
+    _resign(env, "0.3.0", add_unit)
+    with pytest.raises(Refused, match="not a listed forge-node unit"):
+        sw.cmd_check("0.3.0")
+
+
+def test_the_modes_the_builder_writes_are_the_modes_the_switcher_demands():
+    res_modes = {}
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        priv = Path(t) / "k"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(priv)], check=True, capture_output=True)
+        res = build.build_release("0.3.0", "full", Path(t) / "o", src_root=SRC_ROOT, sign=lambda raw: sshsig.sign(raw, priv, sshsig.NS_RELEASE))
+        with tarfile.open(res["tar"]) as tf:
+            res_modes = {m.name.split("/", 1)[-1]: m.mode for m in tf.getmembers() if m.isfile()}
+    assert res_modes["bin/privctl"] == 0o755 and res_modes["sbin/forge-node-release"] == 0o755
+    assert all(m == 0o644 for n, m in res_modes.items() if n not in ("bin/privctl", "sbin/forge-node-release")), res_modes
