@@ -1308,3 +1308,45 @@ def test_the_release_name_is_built_into_the_zipapp_and_into_the_version_privd_re
     from forge_node.privd import main as pmain
     monkeypatch.setattr(pmain, "RELEASE", "0.3.1")
     assert pmain.full_version().endswith("+0.3.1") and pmain.full_version().startswith(pmain.__version__)
+
+
+def test_an_unreadable_ledger_refuses_the_switch(env):
+    """Round 3 (reviewer mutant m12 survived): a guard whose input is garbage must not read as 'no open rows'."""
+    env.release("0.3.0", "full")
+    env.release("0.3.1", "full")
+    sw = env.switcher()
+    sw.cmd_install_first("0.3.0")
+    env.ledger.write_bytes(b"this is not a sqlite database at all" * 40)
+    with pytest.raises(Refused, match="ledger"):
+        sw.cmd_switch("0.3.1", False)
+    assert os.readlink(env.base / "current") == "releases/0.3.0"
+
+
+def test_a_directory_above_the_release_tree_that_another_user_owns_is_refused(env):
+    """Round 3 (reviewer mutant m5 survived): the tests only changed mode bits, never the OWNER of an ancestor."""
+    env.release("0.3.0", "full")
+    sw = env.switcher()
+    os.chown(env.tmp / "opt", 1234, 0)                                                       # /opt/forge-node's parent belongs to somebody else
+    with pytest.raises(Refused, match="root-owned"):
+        sw.cmd_check("0.3.0")
+
+
+def test_privctl_reads_node_env_when_the_environment_was_scrubbed(tmp_path, monkeypatch):
+    """Round 3 (reviewer mutant p4 survived): the helper was tested, the wiring in run_privctl was not."""
+    import types
+    from forge_node.privd import main as pmain
+    f = tmp_path / "node.env"
+    f.write_text("FORGE_NODE_NODE_ID=g7\n")
+    os.chmod(f, 0o644)
+    monkeypatch.setattr(pmain, "NODE_ENV", str(f))
+    monkeypatch.delenv("FORGE_NODE_NODE_ID", raising=False)
+    monkeypatch.setattr(pmain, "pwd", types.SimpleNamespace(getpwnam=lambda n: types.SimpleNamespace(pw_gid=1)))
+    monkeypatch.setattr(pmain, "trusted_binary", lambda n: "/bin/true")
+    monkeypatch.setattr(pmain, "PrivClient", lambda *a, **k: None)
+    captured = {}
+    monkeypatch.setattr(pmain, "Ctl", lambda **kw: captured.update(kw) or object())
+    monkeypatch.setattr(pmain, "ctl_main", lambda argv, ctl: 0)
+    monkeypatch.setattr(pmain, "AuditAdmin", lambda spec, node, clock: types.SimpleNamespace(node=node))
+    assert pmain.run_privctl(["status"]) == 0 and captured["admin_factory"]()[0].node == "g7"
+    f.write_text("# no id\n")
+    assert pmain.run_privctl(["status"]) == 2

@@ -292,6 +292,9 @@ M = [
  ("n3-privctl-node-id-first-assignment", "privd/main.py", "            found = v if protocol.is_node_id(v) else \"\"", "            return v if protocol.is_node_id(v) else \"\"", "tests/test_privd_server.py"),
  ("n3-switch-signals-ignored-across-exec", "release/switcher.py", "signal.signal(sig, lambda _s, _f: None)", "signal.signal(sig, signal.SIG_IGN)", "tests/test_release.py"),
  ("n3-switch-only-three-signals", "release/switcher.py", "signal.SIGTERM, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2)}", "signal.SIGTERM)}", "tests/test_release.py"),
+ ("n3-switch-ancestor-owner-unchecked", "release/switcher.py", "            if not stat.S_ISDIR(st.st_mode) or st.st_uid != self.owner_uid or st.st_mode & 0o022:\n                raise Refused(f\"{what}: {d} is not", "            if not stat.S_ISDIR(st.st_mode) or st.st_mode & 0o022:\n                raise Refused(f\"{what}: {d} is not", "tests/test_release.py"),
+ ("n3-switch-unreadable-ledger-passes", "release/switcher.py", "        except sqlite3.Error as e:\n            raise Refused(f\"ledger unreadable", "        except sqlite3.Error as e:\n            return 0, 0\n            raise Refused(f\"ledger unreadable", "tests/test_release.py"),
+ ("n3-privctl-ignores-node-env", "privd/main.py", "        node = node_id_from_file(NODE_ENV, 0)", "        node = \"\"", "tests/test_release.py"),
 ]
 # Survivors that are equivalent by construction (the same fact is covered by a second, independent element of the cache key); named here so the verdict says so.
 EQUIVALENT = {
