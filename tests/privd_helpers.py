@@ -55,27 +55,31 @@ def policy_doc(serial=1, node=NODE, profile="full", mode="enforce", tiers=(0, 1)
 
 
 class PrivdEnv:
-    def __init__(self, base: str, keys, *, gate_set=None, backend_cls=LocalProcessBackend, worker_script: str | None = None, clock=None):
+    def __init__(self, base: str, keys, *, gate_set=None, backend_cls=LocalProcessBackend, worker_script: str | None = None, clock=None, attach: bool = False):
+        """attach=True: open an EXISTING installation (a second privd process / a restarted privd) - nothing is created or initialised."""
         self.base = base
-        self.owner, self.gate_key = keys["owner"], keys["gate"]
+        self.keys = keys
+        self.owner, self.gate_key = (keys["owner"], keys["gate"]) if keys else (None, None)
         self.clock = clock or Clock()
         self.gates = gate_set if gate_set is not None else gates_with("D")
         etc, state, run = f"{base}/etc/forge-node", f"{base}/var/lib/forge-node-priv", f"{base}/run/forge-node"
-        for d, mode in ((f"{base}/etc", 0o755), (etc, 0o755), (f"{etc}/policy", 0o755), (f"{base}/var", 0o755), (f"{base}/var/lib", 0o755), (state, 0o700), (f"{state}/locks", 0o700),
-                        (f"{state}/work", 0o700), (f"{base}/run", 0o755), (run, 0o755)):
+        for d, mode in (() if attach else ((f"{base}/etc", 0o755), (etc, 0o755), (f"{etc}/policy", 0o755), (f"{base}/var", 0o755), (f"{base}/var/lib", 0o755), (state, 0o700), (f"{state}/locks", 0o700),
+                        (f"{state}/work", 0o700), (f"{base}/run", 0o755), (run, 0o755))):
             os.makedirs(d, exist_ok=True)
             os.chown(d, 0, 0)
             os.chmod(d, mode)
         self.paths = Paths(state, run, f"{etc}/policy", f"{etc}/allowed_signers", f"{etc}/LOCAL_STOP")
-        signers = sshsig.allowed_signers_text([(OWNER_PRINCIPAL, self.owner["pub"], sshsig.NS_POLICY), (OWNER_PRINCIPAL, self.owner["pub"], sshsig.NS_APPROVAL)])
-        Path(self.paths.allowed_signers).write_text(signers)
-        os.chmod(self.paths.allowed_signers, 0o644)
-        specs = make_specs(f"{base}/logs")
+        if not attach:
+            signers = sshsig.allowed_signers_text([(OWNER_PRINCIPAL, self.owner["pub"], sshsig.NS_POLICY), (OWNER_PRINCIPAL, self.owner["pub"], sshsig.NS_APPROVAL)])
+            Path(self.paths.allowed_signers).write_text(signers)
+            os.chmod(self.paths.allowed_signers, 0o644)
+        specs = make_specs(f"{base}/logs") if not attach else make_specs(f"{base}/logs")
         self.specs = specs
         self.priv_log = AuditAdmin(specs["priv"], NODE, self.clock)
-        self.priv_log.init()
         self.agent_log = AuditAdmin(specs["agent"], NODE, self.clock)
-        self.agent_log.init()
+        if not attach:
+            self.priv_log.init()
+            self.agent_log.init()
         self.ledger = Ledger(self.paths.ledger)
         self.backend = backend_cls(f"{base}/units")
         os.environ["PYTHONPATH"] = SRC + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
@@ -85,6 +89,10 @@ class PrivdEnv:
         self.table = optable_mod.build_optable()
         self.ssh_keygen = shutil.which("ssh-keygen")
         self.ctx = self.make_context()
+
+    def restart(self, **kw) -> "PrivdEnv":
+        """A new privd instance on the same installation (own connections, own clock starting where this one is)."""
+        return attach(self.base, keys=self.keys, clock=kw.pop("clock", None) or Clock(self.clock()), gate_set=self.gates, **kw)
 
     # ------------------------------------------------------------------------------------------------------------------------------ context
     def argv_for(self, role: str, name: str, wd: str | None) -> list:
@@ -181,3 +189,7 @@ class PrivdEnv:
 def lease_payload(now, seq=1, valid=60, stop=False, projects=(), quarantine=False, node=NODE):
     return {"typ": "lease", "v": 1, "node": node, "seq": seq, "issued_at": protocol.fmt_ts(now), "valid_until": protocol.fmt_ts(now + timedelta(seconds=valid)), "stop": stop,
             "stopped_projects": sorted(projects), "quarantine": quarantine}
+
+
+def attach(base: str, *, keys=None, clock=None, worker_script=None, gate_set=None) -> PrivdEnv:
+    return PrivdEnv(base, keys, attach=True, clock=clock, worker_script=worker_script, gate_set=gate_set if gate_set is not None else gates_with("D"))
