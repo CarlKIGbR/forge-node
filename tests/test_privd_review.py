@@ -374,3 +374,36 @@ def test_an_indeterminate_job_is_reconciled_again_and_a_verdict_releases_the_tar
     e.clock.advance(seconds=reconcile.INDETERMINATE_RETRY_S + 1)
     kind, _ = reconcile.reconcile_job(e.ctx, jid2)
     assert kind == "aborted_safe" and e.ledger.target_lock("selftest.noop") is None
+
+
+def test_a_stored_plan_is_bound_to_the_op_and_parameters_it_was_computed_for(privd_env):
+    """Review: step 15 only checked that SOME plan existed for the hash; the apply of other parameters could present another job's plan hash."""
+    e = privd_env.ready()
+    plan = result(e.exec(dry_run=True, params={"note": "alpha"})[0])
+    e.clock.advance(seconds=61)
+    assert e.put_lease(seq=40)["ok"]
+    r, _ = e.exec(params={"note": "beta"}, plan_hash=plan["plan_hash"])                      # the plan of {"note": "alpha"} offered for {"note": "beta"}
+    assert result(r)["reason_code"] == "DENY_STALE_PLAN"
+    e.clock.advance(seconds=61)
+    assert e.put_lease(seq=41)["ok"]
+    r, job = e.exec(params={"note": "alpha"}, plan_hash=plan["plan_hash"])                   # the right parameters still apply
+    assert result(r)["status"] == "committed"
+
+
+def test_a_flood_of_fake_envelopes_stops_costing_an_ssh_keygen_process_each(privd_env):
+    """Review: every exec with a plausible envelope spawned ssh-keygen before any rate limit."""
+    e = privd_env.ready()
+    spawned = []
+    real_run = __import__("subprocess").run
+    env, _ = e.job_env(dry_run=True)
+    fake = dict(env, sig=env["sig"][:-12] + "A" * 12)
+    import forge_node.sshsig as sshsig_mod
+    real_verify = sshsig_mod.verify
+    sshsig_mod.verify = lambda *a, **k: (spawned.append(1), real_verify(*a, **k))[1]
+    try:
+        codes = [e.call("exec", {"job": fake}, uid=AGENT_UID).get("code") for _ in range(130)]
+    finally:
+        sshsig_mod.verify = real_verify
+    assert codes.count("DENY_JOB_SIGNATURE") == 120 and codes[120:] == ["DENY_RATE"] * 10
+    assert len(spawned) == 120                                                              # the other ten never reached ssh-keygen
+    assert e.call("exec", {"job": env}, uid=0)["ok"] is True                                # root's own bucket is untouched

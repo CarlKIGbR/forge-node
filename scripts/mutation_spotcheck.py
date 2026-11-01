@@ -213,6 +213,8 @@ M = [
  ("n3-gate-denial-without-job-id", "privd/gate.py", "                                 **({\"job_id\": vid} if vid else {})})", "                                 })", "tests/test_privd_gate.py"),
  ("n3-gate-circuit-ignores-fail-denials", "privd/gate.py", "            if d.code.startswith(\"FAIL_\") and st.entry is not None:", "            if False:", "tests/test_privd_review.py"),
  ("n3-gate-accepts-malformed-request", "privd/gate.py", "    if not isinstance(req.peer, Peer) or not isinstance(req.body, dict):", "    if False:", "tests/test_n3_guards.py"),
+ ("n3-gate-plan-not-bound", "privd/gate.py", "    if plan[\"op\"] != st.job[\"op\"] or plan[\"params_sha256\"] != _sha(st.job[\"params\"]):", "    if False:", "tests/test_privd_review.py"),
+ ("n3-gate-verify-flood", "privd/gate.py", "    _uid_rate(st, \"exec.verify\", EXEC_VERIFY_RATE)", "    pass", "tests/test_privd_review.py"),
  ("n3-reconcile-active-worker", "privd/reconcile.py", "        if elapsed is None or elapsed < limit:", "        if False:", "tests/test_privd_ledger.py"),
  ("n3-reconcile-wall-clock-budget", "privd/reconcile.py", "            elapsed = min(elapsed, ctx.monotonic() - mono)", "            pass", "tests/test_privd_review.py"),
  ("n3-reconcile-no-settle", "privd/reconcile.py", "        if not settled:", "        if False:", "tests/test_privd_ledger.py"),

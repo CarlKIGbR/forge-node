@@ -127,8 +127,12 @@ def s_caller_root(st: State) -> None:
         raise Deny("DENY_JOB_SIGNATURE", "this request is for root only")
 
 
+EXEC_VERIFY_RATE = ((120, 60),)
+
+
 def s_job_signature(st: State) -> None:
     env = st.req.body.get("job")
+    _uid_rate(st, "exec.verify", EXEC_VERIFY_RATE)                              # every verification spawns ssh-keygen: a flood of well-formed fake envelopes must not become a CPU flood
     try:
         st.job = protocol.verify_job(env, _gate_keys(st), st.ctx.node, st.ctx.now(), st.ctx.ssh_keygen)
     except ProtoError as e:
@@ -313,8 +317,11 @@ def s_plan(st: State) -> None:
     if st.dry_run or not st.entry.requires_plan:
         return
     ph = st.job["plan_hash"]
-    if ph is None or st.ctx.ledger.plan_get(ph, st.ctx.now().timestamp()) is None:
+    plan = None if ph is None else st.ctx.ledger.plan_get(ph, st.ctx.now().timestamp())
+    if plan is None:
         raise Deny("DENY_STALE_PLAN", "no stored, unexpired plan for this plan_hash")
+    if plan["op"] != st.job["op"] or plan["params_sha256"] != _sha(st.job["params"]):
+        raise Deny("DENY_STALE_PLAN", "the stored plan belongs to another op or other parameters")      # a plan is bound to what it was computed for, not just to its hash
     st.extra["plan_hash"] = ph
 
 
