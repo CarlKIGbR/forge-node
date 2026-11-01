@@ -1,7 +1,7 @@
 # forge-node Slice N2 — Report (M-94)
 
 Head: see `git -C /srv/forge/work/forge-node-n2 rev-parse n2` (a commit cannot contain its own hash); the chat report carries it as first line.
-Repo/branch: **forge-node** branch `n2` (worktree `/srv/forge/work/forge-node-n2`, base `main` = 01b416a, N1 merged). Class kritisch. Authored Sat 31.10.2026 20:00–22:15 Berlin; rework rounds 1 and 2 on Sun 01.11.2026 06:20–06:46 Berlin (outside 02:00–05:45).
+Repo/branch: **forge-node** branch `n2` (worktree `/srv/forge/work/forge-node-n2`, base `main` = 01b416a, N1 merged). Class kritisch. Authored Sat 31.10.2026 20:00–22:15 Berlin; rework rounds 1 and 2 on Sun 01.11.2026 06:20–07:52 Berlin (outside 02:00–05:45).
 Nothing installed, started, built or generated on any server: no unit files (hardening is **data** in `t0/hardening.py`), no sudoers, no keys (test keys/PKI are ephemeral in the test container), no firewall change. The only contact with a real host was a **read-only, unprivileged** run of the T0 engine on carlgpu2 and an offline `systemd-analyze verify/security` of unit texts rendered into `/tmp` (see "Live proof").
 
 ## N2 items (design §15 slice plan; acceptance list = new §16.2)
