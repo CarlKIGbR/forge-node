@@ -174,6 +174,17 @@ def test_audit_check_reports_which_proof_step_failed(served, tmp_path):
     assert r["status"] == "fail" and "set_append_flag" in r["detail"] and "chmod_refused" not in r["detail"]
 
 
+def test_audit_check_does_not_pass_routes_it_could_not_observe_silently(served, tmp_path):
+    """Round 3: a proof whose unflagged control failed inside the real unit (e.g. no CAP_CHOWN) proves nothing about that route: warn, naming it."""
+    proof = {"fstype": "ext4", "ok": True, "checks": {"chown_refused": {"ok": True}}, "unobservable": ["chown_refused"]}
+    d, _ = doctor(served, tmp_path, priv=SimpleNamespace(request=lambda kind, body, timeout=None: {"ok": True, "selfcheck": {"target": "audit", "ok": True, "detail": {"priv": proof, "agent": proof, "live": {}}}}))
+    r = d.audit_check()
+    assert r["status"] == "warn" and "chown_refused" in r["detail"]
+    clean = {**proof, "unobservable": []}
+    d, _ = doctor(served, tmp_path, priv=SimpleNamespace(request=lambda kind, body, timeout=None: {"ok": True, "selfcheck": {"target": "audit", "ok": True, "detail": {"priv": clean, "agent": clean, "live": {}}}}))
+    assert d.audit_check()["status"] == "ok"
+
+
 def test_forge_root_checks(served, tmp_path):
     served.ctx.policies.devof = lambda p: 1                                                  # the test tree is not on the container's root device; doctor's re-check below uses its own stat
     r = served.install(tiers=(0,), serial=2, forge_roots=[{"path": "/srv/forge/node", "quota_backend": "loop_fs", "backing_image": str(tmp_path / "img"), "size_bytes": 1 << 30,

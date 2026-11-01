@@ -138,6 +138,9 @@ class Doctor:
             bad = {k: [c for c, v in (d or {}).get("checks", {}).items() if not v.get("ok")] for k, d in logs.items()}
             broken = sorted(k for k, v in live.items() if not v.get("ok"))
             return check("audit", "fail", f"the seal protocol does not work on this filesystem: {bad}" + (f"; the live log cannot be opened for appending: {broken}" if broken else ""), fstype=fs)
+        blind = {k: v["unobservable"] for k, v in logs.items() if (v or {}).get("unobservable")}
+        if blind:                                                                                  # a route whose unflagged control failed here proves nothing: say so, do not pass it silently
+            return check("audit", "warn", f"seal protocol proven except for routes that cannot be observed in this unit/filesystem: {blind}", fstype=fs)
         return check("audit", "ok", f"append-only + immutable seal proven on {fs}: descriptors held across the flag change cannot write after the seal; live logs open for appending: {sorted(live)}", fstype=fs)
 
     def forge_root_check(self) -> list[dict]:
