@@ -237,7 +237,7 @@ M = [
  ("n3-switch-signers-unchecked", "release/switcher.py", "        _read_nofollow(self.signers, 1 << 20, self.owner_uid)", "        pass", "tests/test_release.py"),
  ("n3-switch-stop-before-read", "release/switcher.py", "        self._systemctl(\"stop\", *UNITS_STOP)\n        try:", "        try:", "tests/test_release.py"),
  ("n3-switch-self-update-gap", "release/switcher.py", "            os.link(self.self_path, keep)\n            os.replace(keep, self.self_path + \".prev\")", "            os.replace(self.self_path, self.self_path + \".prev\")", "tests/test_release.py"),
- ("n3-build-umask", "release/build.py", "            os.chmod(dst, 0o644)", "            pass", "tests/test_release.py"),
+ ("n3-build-umask", "release/build.py", "            os.chmod(d, 0o755 if d.is_dir() else 0o644)", "            pass", "tests/test_release.py"),
  ("n3-build-t0-allowlist", "release/build.py", " and rel.parts[1] not in T0_PRIVD_ALLOWED:", " and False:", "tests/test_release.py"),
  ("n3-doctor-unpaced", "doctor.py", "        if self._selfchecks:\n            self.sleep(PACE_S)", "        if False:\n            self.sleep(PACE_S)", "tests/test_doctor.py"),
  ("n3-doctor-environmental-fails-switch", "doctor.py", "                if r[\"check\"] in ENVIRONMENTAL and r[\"status\"] == \"fail\":", "                if False:", "tests/test_doctor.py"),

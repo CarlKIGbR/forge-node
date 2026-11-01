@@ -66,12 +66,11 @@ def build_zipapp(src_root: Path, profile: str, target: Path) -> None:
             dst = stage / "forge_node" / p.relative_to(src_root / "forge_node")
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(p, dst)
-            os.chmod(dst, 0o644)                                                   # the zip records the mode: the builder's umask must not reach the artifact
         (stage / "forge_node" / "profile.py").write_text(f'"""Build profile (written by the release builder)."""\nPROFILE = "{profile}"\n')
         # zipapp's own `main=` spec would call main() and DROP its return value (exit status 0 always): write the entry ourselves
         (stage / "__main__.py").write_text("import sys\nfrom forge_node.cli import main\n\nsys.exit(main())\n")
         for d in [stage, *stage.rglob("*")]:
-            os.chmod(d, 0o755 if d.is_dir() else 0o644)
+            os.chmod(d, 0o755 if d.is_dir() else 0o644)                       # the zip records the mode: the builder's umask must not reach the artifact
             os.utime(d, (EPOCH, EPOCH))
         zipapp.create_archive(str(stage), str(target), compressed=False)
 
