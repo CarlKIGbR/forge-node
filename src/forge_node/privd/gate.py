@@ -720,7 +720,9 @@ def _record_denial(st: State, d: Deny) -> dict:
 
 def gate(ctx: Context, req: Request) -> dict:
     """The single guarded function. Returns the wire reply; never raises for a bad request. See the module docstring for the pipelines."""
-    plan = PIPELINES.get(req.kind) if isinstance(req, Request) else None
+    if not isinstance(ctx, Context) or not isinstance(req, Request):
+        return {"ok": False, "code": "DENY_OP_UNKNOWN", "detail": "no context or no request: nothing is done"}      # missing guard state rejects (G27 fail closed)
+    plan = PIPELINES.get(req.kind)
     if plan is None:
         return {"ok": False, "code": "DENY_OP_UNKNOWN", "detail": "unknown request kind"}
     st = State(ctx, req)

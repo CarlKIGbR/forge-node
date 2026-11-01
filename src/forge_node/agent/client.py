@@ -110,8 +110,15 @@ class HubClient:
             raise HubUnreachable("unexpected response shape")
         return doc
 
+    def healthz(self) -> dict:
+        """Connection test (Design 13.D): TLS 1.3, chain, name and the leaf PIN are all checked before the first byte; /healthz needs no registration."""
+        return self._request("GET", "/healthz", None)
+
     def poll(self, body: dict) -> dict:
         return self._request("POST", "/v1/poll", body)
+
+    def post_audit(self, body: dict) -> dict:
+        return self._request("POST", "/v1/audit", body)
 
     def post_result(self, job_id: str, body: dict) -> dict:
         return self._request("POST", f"/v1/jobs/{protocol.check_uuid(job_id)}/result", body)

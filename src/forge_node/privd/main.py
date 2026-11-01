@@ -40,7 +40,7 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def run_cmd(argv, stdin, timeout_s):
+def run_process(argv, stdin, timeout_s):
     """Trusted subprocess wrapper for the systemd backend and the live resolver: argv list, no shell, fixed PATH, bounded time."""
     try:
         r = subprocess.run(argv, input=stdin if stdin is not None else b"", capture_output=True, timeout=timeout_s, env={"PATH": ":".join(FIXED_PATH), "LC_ALL": "C"}, check=False)
@@ -78,9 +78,9 @@ def build_context(node: str, agent_user: str = "forgenode") -> Context:
     pw = pwd.getpwnam(agent_user)
     table = build_optable(PROFILE)
     ledger = Ledger(PATHS.ledger)
-    priv_log = AuditAdmin(priv_spec(gid=pw.pw_gid), node, now)
-    agent_log = AuditAdmin(agent_spec(gid=pw.pw_gid), node, now)
-    backend = SystemdBackend(systemd_run=trusted_binary("systemd-run"), systemctl=trusted_binary("systemctl"), run=run_cmd)
+    priv_log = AuditAdmin(priv_spec(gid=pw.pw_gid, trust_anchor="/"), node, now)
+    agent_log = AuditAdmin(agent_spec(gid=pw.pw_gid, trust_anchor="/"), node, now)
+    backend = SystemdBackend(systemd_run=trusted_binary("systemd-run"), systemctl=trusted_binary("systemctl"), run=run_process)
     policies = PolicyStore(policy_dir=PATHS.policy_dir, allowed_signers=PATHS.allowed_signers, serial_file=PATHS.serial_file, node=node, owner_uid=0, ssh_keygen=ssh_keygen, clock=now,
                            gates_map=gates.GATES, table_ops=table.names, devof=devof, protected_devs=protected_devs)
     leases = LeaseStore(path=PATHS.lease_file, ledger=ledger, node=node, ssh_keygen=ssh_keygen, clock=now, owner_uid=0)
@@ -126,7 +126,7 @@ def run_privctl(argv: list) -> int:
     gid = pwd.getpwnam("forgenode").pw_gid
     sysctl = trusted_binary("systemctl")
     ctl = Ctl(euid=os.geteuid(), client=PrivClient(PATHS.socket, 0, 60), state_setup=ensure_state_dirs,
-              admin_factory=lambda: (AuditAdmin(priv_spec(gid=gid), node, now), AuditAdmin(agent_spec(gid=gid), node, now)), ledger_path=PATHS.ledger, local_stop=PATHS.local_stop,
-              systemctl_provider=resolver.systemctl_provider(sysctl, run_cmd), protected_units=BUILTIN_PROTECTED_UNITS, protected_paths=BUILTIN_PROTECTED_PATHS,
-              run_systemctl=lambda a: run_cmd([sysctl, *a], None, 60), clock=now, out=sys.stdout)
+              admin_factory=lambda: (AuditAdmin(priv_spec(gid=gid, trust_anchor="/"), node, now), AuditAdmin(agent_spec(gid=gid, trust_anchor="/"), node, now)), ledger_path=PATHS.ledger, local_stop=PATHS.local_stop,
+              systemctl_provider=resolver.systemctl_provider(sysctl, run_process), protected_units=BUILTIN_PROTECTED_UNITS, protected_paths=BUILTIN_PROTECTED_PATHS,
+              run_systemctl=lambda a: run_process([sysctl, *a], None, 60), clock=now, out=sys.stdout)
     return ctl_main(argv, ctl)

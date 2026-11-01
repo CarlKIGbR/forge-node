@@ -98,9 +98,9 @@ class PolicyHolder:
 
 
 class Agent:
-    def __init__(self, cfg, holder: PolicyHolder, build_runtime, spool, sampler_factory, clock, ssh_keygen, sleep=time.sleep, log=None, rng=None, priv=None):
+    def __init__(self, cfg, holder: PolicyHolder, build_runtime, spool, sampler_factory, clock, ssh_keygen, sleep=time.sleep, log=None, rng=None, priv=None, shipper=None):
         """`priv` (PrivLink) is the only way to anything privileged. Without it this agent is the N2 agent: tier 0 only, everything above is denied DENY_TIER_DISABLED."""
-        self.priv = priv
+        self.priv, self.shipper = priv, shipper
         self.cfg, self.holder, self.build_runtime, self.spool, self.sampler_factory = cfg, holder, build_runtime, spool, sampler_factory
         self.clock, self.sleep, self.ssh_keygen = clock, sleep, ssh_keygen
         self.log = log or (lambda m: None)
@@ -165,6 +165,11 @@ class Agent:
             return "unreachable"
         status = self._handle(rt, resp)
         self._flush_pending(rt)
+        if self.shipper is not None:
+            try:
+                self.shipper.ship_once(rt.client)
+            except (HubUnreachable, HubError) as e:
+                self.log(f"audit shipping: {e}")
         return status
 
     def _handle(self, rt: Runtime, resp: dict) -> str:

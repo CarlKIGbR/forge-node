@@ -323,7 +323,7 @@ class Switcher:
         return 0
 
 
-def run_cmd(argv, stdin, timeout_s):
+def run_process(argv, stdin, timeout_s):
     try:
         r = subprocess.run(argv, input=stdin if stdin is not None else b"", capture_output=True, timeout=timeout_s, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}, check=False)
         return r.returncode, r.stdout, r.stderr
@@ -356,7 +356,7 @@ def production() -> int:
         sys.stderr.write("no ssh-keygen\n")
         return 2
     sw = Switcher(base="/opt/forge-node", root="/opt/forge-node", ledger="/var/lib/forge-node-priv/ledger.sqlite", signers="/etc/forge-node/allowed_signers",
-                  policy_dir="/etc/forge-node/policy", ssh_keygen=ssh_keygen, run=run_cmd, self_path="/usr/local/sbin/forge-node-release", owner_uid=0, out=sys.stdout)
+                  policy_dir="/etc/forge-node/policy", ssh_keygen=ssh_keygen, run=run_process, self_path="/usr/local/sbin/forge-node-release", owner_uid=0, out=sys.stdout)
     return main(sys.argv[1:], sw)
 
 

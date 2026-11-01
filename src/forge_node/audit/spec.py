@@ -53,11 +53,11 @@ class LogSpec:
     max_age_s: int         # rotation threshold (age of the active file; a file holding only its chain_link is never rotated for age)
 
 
-def priv_spec(*, dir="/var/log/forge-node-priv", lock="/var/lib/forge-node-priv/locks/priv.log.lock", gid: int, owner_uid=0, trust_anchor="/", max_file_bytes=64 * 1024 * 1024, max_age_s=86400) -> LogSpec:
+def priv_spec(*, dir="/var/log/forge-node-priv", lock="/var/lib/forge-node-priv/locks/priv.log.lock", gid: int, trust_anchor: str, owner_uid=0, max_file_bytes=64 * 1024 * 1024, max_age_s=86400) -> LogSpec:
     return LogSpec("priv", "priv", dir, lock, gid, owner_uid, 0o640, 0o750, 0o600, trust_anchor, max_file_bytes, max_age_s)
 
 
-def agent_spec(*, dir="/var/log/forge-node-agent", lock="/var/log/forge-node-agent/audit.lock", gid: int, owner_uid=0, trust_anchor="/", max_file_bytes=64 * 1024 * 1024, max_age_s=86400) -> LogSpec:
+def agent_spec(*, dir="/var/log/forge-node-agent", lock="/var/log/forge-node-agent/audit.lock", gid: int, trust_anchor: str, owner_uid=0, max_file_bytes=64 * 1024 * 1024, max_age_s=86400) -> LogSpec:
     return LogSpec("agent", "audit", dir, lock, gid, owner_uid, 0o660, 0o755, 0o660, trust_anchor, max_file_bytes, max_age_s)
 
 

@@ -45,12 +45,14 @@ def chain_rig(_rig, realfs, owner, gate, clock, monkeypatch):
     r.install = lambda **kw: env.install(env.doc(hub_tls_pins=r.pins, gate_keys=gate["keys"], tiers=(0, 1), t1_ops=[{"op": "selftest.noop", "mode": "enforce"}], **kw))
     assert r.install(serial=1)["ok"]
 
-    def make_agent():
+    def make_agent(ship=False):
         cfg = AgentConfig("g2", "127.0.0.1", r.srv.server_address[1], str(r.certs["g2"][1]), str(r.certs["g2"][0]), str(r.pki.ca_crt), env.paths.policy_dir, env.paths.allowed_signers,
                           str(r.tmp / "state"), env.paths.socket, os.getuid(), os.getuid(), str(r.tmp / "root"))
         os.makedirs(r.tmp / "state", exist_ok=True)
         link = PrivLink(client=PrivClient(env.paths.socket, 0, 60), audit=Appender(env.specs["agent"], "g2", clock), log=r.logs.append)
-        return agent_main.build(cfg, runner=r.runner, clock=clock, log=r.logs.append, probe=r.probe, ssh_keygen="ssh-keygen", priv=link), link
+        from forge_node.agent.shipper import AuditShipper
+        shipper = AuditShipper(specs={"agent": env.specs["agent"], "priv": env.specs["priv"]}, node="g2", state_dir=str(r.tmp / "state"), log=r.logs.append) if ship else None
+        return agent_main.build(cfg, runner=r.runner, clock=clock, log=r.logs.append, probe=r.probe, ssh_keygen="ssh-keygen", priv=link, shipper=shipper), link
     r.make_chain_agent = make_agent
     yield r
     srv.stop()
@@ -116,3 +118,27 @@ def test_agent_without_audit_log_relays_nothing_above_t0(chain_rig):
     j = r.hub.job_state(jid)
     assert j["result_reason"] == "DENY_AUDIT_DOWN" and not r.env.ledger.open_rows()
     assert r.env.ledger.get(jid) is None                                                   # privd never saw it
+
+
+def test_audit_travels_to_the_hub_chains_verify_across_rotation_and_the_crosscheck_matches_the_jobs(chain_rig):
+    """The node's two logs are shipped; the hub recomputes both chains (incl. the chain_link after a rotation) and cross-checks every executed job against privd's intent/result."""
+    r = chain_rig
+    agent, link = r.make_chain_agent(ship=True)
+    jid = r.hub.enqueue_job(JobRequest(node="g2", tier=1, op="selftest.noop", params={"note": "ship"}, dry_run=True)).job_id
+    assert agent.poll_once(wait_s=0) == "job"
+    plan = r.env.ledger.get(jid).result["plan_hash"]
+    assert r.env.call("audit.rotate", {"log": "both"})["ok"]                                 # rotate both logs between the two jobs
+    r.clock.advance(61)
+    jid2 = r.hub.enqueue_job(JobRequest(node="g2", tier=1, op="selftest.noop", params={"note": "ship"}, plan_hash=plan)).job_id
+    assert agent.poll_once(wait_s=0) == "job"
+    r.clock.advance(61)
+    agent.poll_once(wait_s=0)
+    heads = {s: r.adm.execute("SELECT max(seq) AS m FROM node.audit WHERE node_id='g2' AND source=%s", (s,)).fetchone()["m"] for s in ("agent", "priv")}
+    assert heads["agent"] >= 5 and heads["priv"] >= 8
+    assert r.hub.verify_chains("g2", full=True) == []
+    r.clock.advance(r.hub.cfg.crosscheck_grace_s + 5)
+    assert r.hub.crosscheck("g2") == []
+    types = {x["type"] for x in r.adm.execute("SELECT type FROM node.audit WHERE node_id='g2' AND source='priv'").fetchall()}
+    assert {"intent", "result", "chain_link", "policy", "lease"} <= types
+    n = r.adm.execute("SELECT status FROM node.nodes WHERE node_id='g2'").fetchone()["status"]
+    assert n == "active"                                                                       # not quarantined

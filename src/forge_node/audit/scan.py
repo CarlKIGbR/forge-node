@@ -55,25 +55,31 @@ def _pread_all(fd: int, off: int, n: int) -> bytes:
 
 
 def tail_state(fd: int, node: str, source: str) -> Tail:
-    """Head of the file from its tail only (cheap). Looks back from the end for the last valid record; the window doubles until one is found, the file start is reached, or the damaged
-    part exceeds MAX_DAMAGED_TAIL (then AuditCorrupt: that is not a crash artefact)."""
+    """Head of the file from its tail only (cheap). Looks back from the end for the last record that is part of the CHAIN: valid (hash, structure) AND linked - its prev_hash is the hash of
+    an earlier valid record and its seq is that one's + 1 - or the file's genesis record (a chain_link at offset 0). A record that is valid in itself but not linked (a hostile writer's
+    forgery with an invented seq/prev_hash) is damage like any other junk, so it cannot hijack the head. The window doubles until the answer is certain, the file start is reached, or the
+    damaged part exceeds MAX_DAMAGED_TAIL (then AuditCorrupt: that is not a crash artefact)."""
     size = os.fstat(fd).st_size
     window = FIRST_WINDOW
     while True:
         start = max(0, size - window)
         data = _pread_all(fd, start, size - start)
-        # complete lines inside the window; the first (possibly cut) line is only usable if the window starts at 0
-        pieces = data.split(b"\n")
-        # pieces[-1] is the unterminated rest (possibly empty); pieces[0] is cut unless start == 0
-        lines = pieces[:-1]
+        lines = data.split(b"\n")[:-1]                       # complete lines; the last piece is the unterminated rest
         offsets, off = [], start
         for ln in lines:
             offsets.append(off)
             off += len(ln) + 1
-        usable_from = 0 if start == 0 else 1
-        for i in range(len(lines) - 1, usable_from - 1, -1):
+        usable_from = 0 if start == 0 else 1                  # the first line of a window that does not start at 0 may be cut
+        valid = []                                            # (line index, record) in file order
+        for i in range(usable_from, len(lines)):
             rec = parse_record(lines[i], node, source)
             if rec is not None:
+                valid.append((i, rec))
+        hashes = {r["hash"]: r["seq"] for _, r in valid}
+        for i, rec in reversed(valid):
+            linked = rec["prev_hash"] in hashes and hashes[rec["prev_hash"]] + 1 == rec["seq"] and rec["prev_hash"] != rec["hash"]
+            genesis = offsets[i] == 0 and rec["type"] == "chain_link"
+            if linked or genesis:
                 end = offsets[i] + len(lines[i]) + 1
                 if size - end > MAX_DAMAGED_TAIL:
                     raise AuditCorrupt("damaged tail larger than the allowed limit")
