@@ -438,3 +438,39 @@ def test_sealed_active_file_after_a_crash_is_never_appended_by_the_appender(spec
     assert os.path.getsize(f) == size
     admin(sub).recover()
     assert appender(sub).append("t0", {})["seq"] > 3
+
+
+@pytest.mark.parametrize("field,value", [("prev_file_sha256", "0" * 64), ("prev_file_bytes", 1), ("prev_file", "priv.000009/priv.000009.jsonl"), ("gen", 7), ("prev_damaged_bytes", 5),
+                                         ("prev_damaged_sha256", "1" * 64), ("prev_seq", 999)])
+def test_successor_with_a_correct_head_but_a_wrong_predecessor_description_is_quarantined(specs, field, value):
+    """The successor continues the sealed predecessor's seq and hash exactly (so the cheap checks pass) but its chain_link describes the predecessor file wrongly: recovery must not adopt
+    it. One field at a time, each re-sealed with a valid self-hash."""
+    import hashlib
+    from forge_node import canon
+    sub = _scenario(specs, f"badlink-{field}")
+    a = admin(sub)
+    f1 = live(sub, 1)
+    fd = os.open(f1, os.O_RDONLY)
+    fsflags.add_flags(fd, fsflags.IMMUTABLE)
+    sha, size = hashlib.sha256(open(f1, "rb").read()).hexdigest(), os.path.getsize(f1)
+    os.close(fd)
+    last = recs(f1)[-1]
+    fields = {"ts": "2026-10-31T13:40:10Z", "node": NODE, "type": "chain_link", "gen": 2, "prev_file": "priv.000001/priv.000001.jsonl", "prev_seq": last["seq"], "prev_file_sha256": sha,
+              "prev_file_bytes": size, "prev_damaged_bytes": 0, "prev_damaged_sha256": None}
+    fields[field] = value
+    rec = chain.seal_record(fields, last["seq"] + 1, last["hash"])
+    gdir = f"{sub.dir}/priv.000002"
+    os.mkdir(gdir, 0o700)
+    p = f"{gdir}/priv.000002.jsonl"
+    with open(p, "wb") as f:
+        f.write(canon.canonical(rec) + b"\n")
+    os.chmod(p, 0o640)
+    os.chown(p, 0, AGENT_GID)
+    os.chown(gdir, 0, AGENT_GID)
+    os.chmod(gdir, 0o750)
+    fd = os.open(p, os.O_RDONLY)
+    fsflags.add_flags(fd, fsflags.APPEND)
+    os.close(fd)
+    with pytest.raises(AuditCorrupt):
+        a.recover()
+    assert a._read_current() == 1                                                          # nothing was switched
