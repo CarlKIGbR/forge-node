@@ -682,3 +682,20 @@ def test_staging_blobs_are_written_through_confined_descriptors(tmp_path):
     with pytest.raises(OSError):
         ag._write_staged(8, {"policy": "x", "sig": "y"})
     assert list(outside.iterdir()) == []
+
+
+def test_a_failure_while_building_the_snapshot_removes_it_and_reports_failed_snapshot(tmp_path, monkeypatch):
+    import glob
+    from forge_node.t0 import confined
+    before = set(glob.glob("/tmp/fn-git-*"))
+    real = confined.write_new_at
+
+    def flaky(fd, parts, data, mode=0o600):
+        if parts == ["config"]:
+            raise OSError("disk full")
+        return real(fd, parts, data, mode)
+    monkeypatch.setattr(confined, "write_new_at", flaky)
+    r = FakeRunner({"git_status_tracked": " M x\n"})
+    row = _wire_git(git_env(tmp_path, r))["data"]["repos"]["repos"][0]
+    assert row["dirty_status"] == "failed:snapshot" and row["rev"] == H1 and not r.calls
+    assert set(glob.glob("/tmp/fn-git-*")) == before
