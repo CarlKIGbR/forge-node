@@ -176,12 +176,13 @@ def test_a_signature_by_a_key_that_is_not_the_expected_owner_key_is_caught_on_th
     assert rc == 1 and not list(out.glob("*"))
 
 
-def test_key_and_output_guards(n5keys, tmp_path):
+def test_key_and_output_guards(n5keys, tmp_path, capsys):
     loose = tmp_path / "loose"
     shutil.copy(n5keys["plain"], loose)
     os.chmod(loose, 0o644)
     shutil.copy(str(n5keys["plain"]) + ".pub", str(loose) + ".pub")
-    assert rel_cli.main(["build", "0.5.0", "t0", "--out", str(tmp_path / "o"), "--key", str(loose)]) == 1               # a private key others can read is refused
+    assert rel_cli.main(["build", "0.5.0", "t0", "--out", str(tmp_path / "o"), "--key", str(loose)]) == 1               # a private key others can read is refused ...
+    assert "must not be accessible by group/others" in capsys.readouterr().err                                         # ... by our own check, before ssh-keygen is even started
     assert rel_cli.main(["build", "0.5.0", "t0", "--out", str(tmp_path / "o"), "--key", str(tmp_path / "missing")]) == 1
     assert rel_cli.main(["build", "../x", "t0", "--out", str(tmp_path / "o"), "--key", str(n5keys["plain"])]) == 1          # bad version: BuildError becomes a clean refusal
     assert rel_cli.main(["build", "0.5.0", "t0", "--out", str(tmp_path / "o"), "--key", str(n5keys["plain"])]) == 0

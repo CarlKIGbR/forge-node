@@ -74,7 +74,7 @@ scp -i ~/.ssh/sshcarljump01 carl@192.168.10.4:/srv/forge/work/forge-core/secrets
 scp -i ~/.ssh/sshcarljump01 carl@192.168.10.4:/srv/forge/work/forge-core/secrets/nodehub/gate_ed25519.pub issued/hub_gate_ed25519.pub
 printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:192.168.10.4,DNS:forge-nodehub.lan\n' > issued/ext_hub.cnf
 openssl x509 -req -in issued/hub.csr -CA ca/ca.crt -CAkey ca/ca.key -CAcreateserial -days 365 -sha256 -extfile issued/ext_hub.cnf -out issued/hub.crt
-openssl x509 -in issued/hub.crt -noout -subject -ext subjectAltName -enddate     # CN=forge-nodehub, IP:192.168.10.4
+openssl x509 -in issued/hub.crt -noout -subject -enddate; openssl x509 -in issued/hub.crt -noout -text | grep -A1 'Alternative Name'     # CN=forge-nodehub, IP Address:192.168.10.4 (kein '-ext': das LibreSSL des Mac kennt es nicht)
 scp -i ~/.ssh/sshcarljump01 issued/hub.crt ca/ca.crt carl@192.168.10.4:/tmp/
 ssh -t -i ~/.ssh/sshcarljump01 carl@192.168.10.4 \
   'sudo install -m 0644 -o forge -g forgebox /tmp/hub.crt /tmp/ca.crt /srv/forge/work/forge-core/secrets/nodehub/ && rm /tmp/hub.crt /tmp/ca.crt && sudo ls -l /srv/forge/work/forge-core/secrets/nodehub/'
