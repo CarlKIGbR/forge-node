@@ -163,8 +163,9 @@ def test_b7_a_lockdown_that_appears_while_the_way_back_is_taken_also_wins(env):
 def test_b10_a_timeout_kills_the_whole_process_group_not_only_the_direct_child(tmp_path):
     pidfile = tmp_path / "grandchild.pid"
     script = f"sleep 300 & echo $! > {pidfile}; wait"
+    t0 = time.time()
     rc, out, err = switcher.run_process(["/bin/sh", "-c", script], None, 1)
-    assert rc == 124
+    assert rc == 124 and time.time() - t0 < 20, "returned only when the grandchild's end of the pipes closed: the group was not killed"
     gpid = int(pidfile.read_text())
     deadline = time.time() + 5
     while time.time() < deadline:
