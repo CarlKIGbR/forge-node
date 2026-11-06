@@ -185,6 +185,8 @@ class Switcher:
         try:
             names = [n for n in os.listdir(self.policy_dir) if re.match(r"^policy-[1-9][0-9]{0,8}\.json\Z", n)]
         except FileNotFoundError:
+            if self.current() is not None:                           # N4 (B9): the install creates the directory (13.C C3); gone on an installed node = damage, not "no policy yet"
+                raise Refused(f"policy directory {self.policy_dir} is missing on an installed node: refusing to read 'no policy' from nothing") from None
             return None
         except OSError as e:
             raise Refused(f"policy directory unreadable ({e})") from e

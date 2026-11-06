@@ -385,3 +385,18 @@ def test_every_gated_feature_is_verified_disabled_policy_apply_and_direct_privd_
         for log in (e.priv_log, e.agent_log):
             log.close()
         e.ledger.close()
+
+
+def test_a_missing_policy_directory_is_a_refusal_on_an_installed_node_and_no_policy_before_the_install(env):
+    """B9 (third guard): the directory is created by the install (13.C C3); before install-first 'no directory' still reads as 'no policy'."""
+    import shutil
+    env.release("0.3.0", "full")
+    sw = env.switcher()
+    shutil.rmtree(env.policy_dir)
+    assert sw.installed_policy_schema() is None
+    sw.cmd_install_first("0.3.0")
+    with pytest.raises(Refused, match="policy directory .* missing on an installed node"):
+        sw.installed_policy_schema()
+    env.policy_dir.mkdir()
+    os.chmod(env.policy_dir, 0o755)
+    assert sw.installed_policy_schema() is None                                               # present and empty (before policy-apply): fine
