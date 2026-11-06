@@ -1,6 +1,6 @@
 GO nodehub-deploy — class produktion. NOT YET SENT; send when the owner has finished guide parts 3.1/3.2 and the Betriebsleiter has merged forge-node `n5prep` (main) and forge-ops `n5prep` (master).
 Window: one sitting, not 02:00–05:45 Berlin, not Sunday < 06:00, no STOP active. Inputs: forge-node main `<MAIN_SHA>`, forge-core master `<CORE_SHA>` (≥ bebbc28), forge-ops master `<OPS_SHA>`.
-Not part of this GO (abort if tempted): firewall/iptables/ufw (the owner applies `forge-docker-user.sh --hub` himself, guide part 4), registering a node, any other service start/restart, any docker restart, any change of existing pins in images.lock.
+Not part of this GO (abort if tempted): firewall/iptables/ufw (the owner first renews the root boot copy with `forge-docker-user.sh --install-unit`, then applies and confirms `--hub` himself, guide part 4), registering a node, any other service start/restart, any docker restart, any change of existing pins in images.lock.
 
 Needs (exact), all under /srv/forge/work/forge-core unless absolute:
  owner-made, verified in P1:  secrets/nodehub/hub.key (0600 forge:forgebox) · hub.crt (0644) · ca.crt (0644) · gate_ed25519 (0600) · gate_ed25519.pub (0644)   [hub.csr may remain]

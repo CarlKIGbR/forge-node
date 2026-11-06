@@ -81,6 +81,12 @@ def protected_devs() -> set:
     return {d for d in (devof(p) for p in PROTECTED_MOUNTS) if d is not None}
 
 
+def build_policy_store(node: str, table, ssh_keygen: str) -> PolicyStore:
+    """The production PolicyStore. `table_ops` is release_table_ops(table, PROFILE): a t0 release refuses every policy that is not profile t0 (its own function so that a test pins this wiring)."""
+    return PolicyStore(policy_dir=PATHS.policy_dir, allowed_signers=PATHS.allowed_signers, serial_file=PATHS.serial_file, node=node, owner_uid=0, ssh_keygen=ssh_keygen, clock=now,
+                       gates_map=gates.GATES, table_ops=release_table_ops(table, PROFILE), devof=devof, protected_devs=protected_devs)
+
+
 def build_context(node: str, agent_user: str = "forgenode") -> Context:
     ssh_keygen = trusted_binary("ssh-keygen")
     pw = pwd.getpwnam(agent_user)
@@ -89,8 +95,7 @@ def build_context(node: str, agent_user: str = "forgenode") -> Context:
     priv_log = AuditAdmin(priv_spec(gid=pw.pw_gid, trust_anchor="/"), node, now)
     agent_log = AuditAdmin(agent_spec(gid=pw.pw_gid, trust_anchor="/"), node, now)
     backend = SystemdBackend(systemd_run=trusted_binary("systemd-run"), systemctl=trusted_binary("systemctl"), run=run_process, sleep=time.sleep, monotonic=time.monotonic)
-    policies = PolicyStore(policy_dir=PATHS.policy_dir, allowed_signers=PATHS.allowed_signers, serial_file=PATHS.serial_file, node=node, owner_uid=0, ssh_keygen=ssh_keygen, clock=now,
-                           gates_map=gates.GATES, table_ops=release_table_ops(table, PROFILE), devof=devof, protected_devs=protected_devs)
+    policies = build_policy_store(node, table, ssh_keygen)
     leases = LeaseStore(path=PATHS.lease_file, ledger=ledger, node=node, ssh_keygen=ssh_keygen, clock=now, owner_uid=0)
     return Context(node=node, paths=PATHS, clock=now, ledger=ledger, priv_log=priv_log, agent_log=agent_log, backend=backend, optable=table, gates=gates.GATES, ssh_keygen=ssh_keygen,
                    owner_uid=0, agent_uid=pw.pw_uid, policies=policies, leases=leases, argv_for=argv_for, version=full_version(), sleep=time.sleep, monotonic=time.monotonic)

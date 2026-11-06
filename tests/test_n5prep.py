@@ -469,8 +469,9 @@ def test_guide_uses_only_commands_that_exist():
     sw = (SRC / "forge_node" / "release" / "switcher.py").read_text()
     for sub in set(re.findall(r"forge-node-release (status|check|switch|install-first)\b", g)):
         assert f'"{sub}"' in sw, sub
-    fw = [l for l in blocks.splitlines() if "forge-docker-user.sh" in l or l.lstrip().startswith("sudo $FW")]
-    assert fw and all("--hub" in l for l in fw if "forge-docker-user.sh" in l or "$FW" in l if not l.startswith("FW=")), fw       # every firewall call is the 8094 set
+    fw = [l for l in blocks.splitlines() if "forge-docker-user.sh" in l or "$FW" in l]
+    rule_calls = [l for l in fw if not l.startswith("FW=") and not any(x in l for x in ("--install-unit", "cmp ", "grep -c -- '--hub'", "--dry-run --restore", "git -C"))]
+    assert rule_calls and all("--hub" in l for l in rule_calls), rule_calls                    # every apply/confirm/remove call is the 8094 set
     p = rel_cli.parser()
     ns = p.parse_args(["build", "0.5.0", "t0", "--out", "o", "--key", "k"])
     assert ns.profile == "t0"
@@ -479,3 +480,144 @@ def test_guide_uses_only_commands_that_exist():
     sign = [l for l in blocks.splitlines() if "forge_node.cli release sign" in l][0]
     assert "--namespace forge-node-policy" in sign
     assert "'t0'" in blocks and "INSERT INTO node.nodes" in blocks and "SET ROLE forge_core" in blocks                      # registration by SQL while Cockpit /nodes does not exist
+
+
+# ======================================================================================================================== 5. guide rework 1 (verify n-09d83249: M-1 boot copy, M-2 uninstall, M-3 hub CSR path, m-1..m-6)
+def _guide_text() -> str:
+    return GUIDE.read_text()
+
+
+def test_every_guide_block_is_a_subshell_with_set_e_so_a_failure_stops_the_block_not_the_session():
+    for i, b in enumerate(_guide_blocks()):
+        lines = b.splitlines()
+        assert lines[0] == "(" and lines[1] == "set -euo pipefail", (i, lines[:2])
+        tail = [l for l in lines if not l.startswith("#")][-1]
+        assert tail.startswith(") &&"), (i, tail)                                         # FEHLER branch prints; the login shell never gets `set -e`
+
+
+def test_files_owned_by_other_users_are_never_read_from_secrets_or_removed_by_carl():
+    import re
+    g = "\n".join(_guide_blocks())
+    for m in re.finditer(r"(?:scp|ssh)\b[^\n]*carl@[\d.]+:(/\S+)", g):
+        assert m.group(1).startswith("/tmp/"), m.group(0)                                          # M-3: carl cannot read forge-core/secrets, forge's and forgenode's files live there / in the sticky /tmp
+    assert "sudo install -m 0644 -o \"$(id -un)\" $S/hub.csr /tmp/hub.csr" in g and "$S/gate_ed25519.pub /tmp/hub_gate_ed25519.pub" in g
+    assert "sudo -u forge -g" not in g and "sudo chgrp forgebox $S/hub.key" in g                       # m-1 without needing a sudoers (forge : forgebox) rule
+    for rm in re.findall(r"^.*\brm -f[^\n]*", g, re.M):
+        for owned_by_other in ("/tmp/fn-src.tar", "/tmp/$NID.csr"):
+            if owned_by_other in rm:
+                assert "sudo rm" in rm, rm                                                          # forge / forgenode own these, carl may not delete them in the sticky /tmp
+
+
+def test_firewall_part_installs_the_boot_copy_before_the_rules_and_proves_the_boot_path():
+    g = _guide_text()
+    t4 = g[g.index("## Teil 4"):g.index("## Teil 5")]
+    i_inst, i_apply, i_conf = t4.index("sudo $FW --install-unit\n"), t4.index("sudo /srv/forge/work/forge-ops/bin/forge-docker-user.sh --hub\n"), t4.index("forge-docker-user.sh --confirm --hub\n")
+    assert i_inst < i_apply < i_conf                                                                # M-1: root copy first, then the rules, then the confirmation
+    assert "sudo cmp $FW /usr/local/sbin/forge-docker-user.sh" in t4
+    assert "/usr/local/sbin/forge-docker-user.sh --dry-run --restore | grep -c '^iptables -I.*forge-nodehub'" in t4 and '[ "$n" = 3 ]' in t4
+    assert t4.index("--dry-run --restore") > i_conf                                                 # the proof needs the confirmed marker
+
+
+def _shim_chattr(bin_dir: Path) -> None:
+    bin_dir.mkdir()
+    f = bin_dir / "chattr"
+    f.write_text("#!%s\nimport os, sys\nsys.path.insert(0, %r)\nfrom forge_node.audit import fsflags\n"
+                 "bits = 0\nfiles = []\nfor a in sys.argv[1:]:\n    if a.startswith('-'):\n        bits |= (fsflags.APPEND if 'a' in a else 0) | (fsflags.IMMUTABLE if 'i' in a else 0)\n    else:\n        files.append(a)\n"
+                 "rc = 0\nfor p in files:\n    try:\n        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)\n        fsflags.clear_flags(fd, bits)\n        os.close(fd)\n    except OSError as e:\n        print('chattr:', p, e, file=sys.stderr); rc = 1\nsys.exit(rc)\n" % (sys.executable, str(SRC)))
+    f.chmod(0o755)
+
+
+def test_guide_uninstall_removes_sealed_audit_logs_of_the_real_layout(realfs):
+    """M-2: the real layout <dir>/<prefix>.NNNNNN/<prefix>.NNNNNN.jsonl with +a (live) / +a+i (sealed). The guide's own find/chattr and rm lines, relocated below a scratch directory, must empty it."""
+    import re
+
+    from audit_helpers import make_specs
+    from forge_node.audit.log import AuditAdmin
+    from privd_helpers import Clock
+    base = Path(realfs)
+    specs = make_specs(str(base / "x"))
+    clock = Clock()
+    for name in ("priv", "agent"):
+        adm = AuditAdmin(specs[name], "g2", clock)
+        adm.init()
+        adm.append("policy" if name == "priv" else "t0", {"action": "apply", "serial": 1, "sha256": "a" * 64, "previous_serial": 0, "profile": "t0", "global_mode": "observe", "tiers": [0], "caller_uid": 0} if name == "priv" else {"n": 1})
+        adm.rotate()                                                                                  # generation 1 sealed (+a+i), generation 2 live (+a)
+        adm.append("policy" if name == "priv" else "t0", {"action": "apply", "serial": 2, "sha256": "b" * 64, "previous_serial": 1, "profile": "t0", "global_mode": "observe", "tiers": [0], "caller_uid": 0} if name == "priv" else {"n": 2})
+    root = base / "root" / "var" / "log"
+    root.mkdir(parents=True)
+    os.rename(base / "x" / "priv", root / "forge-node-priv")
+    os.rename(base / "x" / "agent", root / "forge-node-agent")
+    files = sorted(str(p) for p in root.rglob("*.jsonl"))
+    assert len(files) >= 4 and all(re.search(r"/(priv|audit)\.\d{6}/(priv|audit)\.\d{6}\.jsonl$", f) for f in files), files           # the layout the guide has to deal with
+    from forge_node.audit import fsflags
+
+    def flags(p):
+        fd = os.open(p, os.O_RDONLY)
+        try:
+            return fsflags.get_flags(fd)
+        finally:
+            os.close(fd)
+    assert any(flags(f) & fsflags.IMMUTABLE for f in files) and all(flags(f) & fsflags.APPEND for f in files)
+    shim = base / "shimbin"
+    _shim_chattr(shim)
+    env = {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}"}
+    g = _guide_text()
+    t7 = g[g.index("## Teil 7"):g.index("## Teil 8")]
+    find_line = [l for l in t7.splitlines() if "-exec chattr -i -a {} +" in l][0]
+    rm_line = [l for l in t7.splitlines() if l.startswith("sudo rm -rf /opt/forge-node")][0]
+
+    def relocate(line):
+        line = re.sub(r"\s+#.*$", "", line).replace("sudo ", "")
+        return re.sub(r"(?<![\w/])/((?:opt|etc|run|var/lib|var/log)/forge-node[\w-]*)", lambda m: f"{base}/root/{m.group(1)}", line)
+    old = subprocess.run(["bash", "-c", f"chattr -a {root}/forge-node-priv/*.jsonl"], capture_output=True, text=True, env=env)               # the rework-0 command: the glob matches nothing
+    assert old.returncode != 0
+    r = subprocess.run(["bash", "-c", relocate(rm_line)], capture_output=True, text=True, env=env)
+    assert r.returncode != 0 and (root / "forge-node-priv").exists(), "rm -rf must fail on sealed files (this is what the rework fixes)"
+    r = subprocess.run(["bash", "-c", relocate(find_line)], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    assert not any(flags(f) & (fsflags.APPEND | fsflags.IMMUTABLE) for f in files)
+    r = subprocess.run(["bash", "-c", relocate(rm_line)], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    assert not (root / "forge-node-priv").exists() and not (root / "forge-node-agent").exists()
+
+
+def test_registration_and_hub_queries_survive_two_shells_of_quoting(tmp_path):
+    """The ssh/sudo/docker one-liners of 5.5 and Teil 6: what the container's `sh -c` finally gets, with $POSTGRES_USER still unexpanded and the SQL intact."""
+    import re
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "ssh").write_text('#!/bin/bash\nwhile [ $# -gt 1 ]; do shift; done\nexec bash -c "$1"\n')
+    (bin_dir / "sudo").write_text('#!/bin/bash\nexec "$@"\n')
+    (bin_dir / "docker").write_text('#!/bin/bash\nfor a in "$@"; do printf "ARG<%s>\\n" "$a"; done\ncat >/dev/null\n')
+    for f in bin_dir.iterdir():
+        f.chmod(0o755)
+    g = "\n".join(_guide_blocks())
+    lines = [l for l in g.splitlines() if "docker exec -i forge-postgres-1" in l]
+    assert len(lines) == 2
+    (tmp_path / "register-g2.sql").write_text("SELECT 1;\n")
+    outs = []
+    for l in lines:
+        cmd = re.sub(r"/tmp/register-\$NID\.sql", str(tmp_path / "register-g2.sql"), l)
+        cmd = cmd.replace('"sudo docker', '"docker').replace("rm -f " + str(tmp_path / "register-g2.sql"), "true")
+        r = subprocess.run(["bash", "-c", f'NID=g2; {cmd.lstrip()}'], capture_output=True, text=True, env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+        outs.append(r.stdout)
+        assert r.returncode == 0, (cmd, r.stderr)
+    for o in outs:
+        assert 'ARG<psql' in o and 'ARG<exec>' in o and "ARG<forge-postgres-1>" in o
+        assert re.search(r'ARG<psql[^>]*-U "\$POSTGRES_USER" -d forge', o), o                      # the variable is expanded INSIDE the container, not on the Mac or the host
+    assert 'SELECT node_id, profile, status, policy_serial, now() - last_seen AS seit FROM node.nodes ORDER BY 1' in outs[1]
+
+
+def test_production_wiring_of_a_t0_release_refuses_a_full_policy_profile(monkeypatch):
+    """Verify m-4: reverting `table_ops=release_table_ops(table, PROFILE)` to `table.names` in privd/main.py was not caught - nothing built the production PolicyStore."""
+    from forge_node.privd import main as privd_main
+    monkeypatch.setattr(privd_main, "PROFILE", "t0")
+    store = privd_main.build_policy_store("g2", optable_mod.build_optable("t0"), "ssh-keygen")
+    assert store.gates_map is __import__("forge_node").gates.GATES and store.node == "g2"
+    assert store.table_ops("t0") == frozenset()
+    with pytest.raises(PolicyError) as e:
+        store.table_ops("full")
+    assert "release is profile t0" in e.value.detail
+    monkeypatch.setattr(privd_main, "PROFILE", "full")                                              # a full release still takes both
+    store = privd_main.build_policy_store("g2", optable_mod.build_optable("full"), "ssh-keygen")
+    assert store.table_ops("t0") == frozenset() and "selftest.noop" in store.table_ops("full")
