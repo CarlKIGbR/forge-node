@@ -67,6 +67,7 @@ class Env:
         self.doctor_script = []                                   # per-call verdicts (first doctor, second doctor, ...); falls back to doctor_ok
         self.on_doctor = None                                     # called at every doctor run (to change the world while it runs)
         self.local_stop = tmp / "LOCAL_STOP"
+        self.hold_path = tmp / "RELEASE_HOLD"
         self.lock_path = tmp / "release.lock"
         self.self_path = tmp / "sbin" / "forge-node-release"
         self.self_path.parent.mkdir()
@@ -84,6 +85,8 @@ class Env:
             if self.on_doctor:
                 self.on_doctor()
             ok = self.doctor_script.pop(0) if self.doctor_script else self.doctor_ok
+            if ok == "indeterminate":                                  # exactly what doctor.main prints and returns for a hub that answered 5xx on every attempt (M-108)
+                return 4, b'{"attempts": 4, "check": "hub", "detail": "hub answered 502", "status": "indeterminate"}\n{"doctor": "INDETERMINATE", "escalate": "betriebsleiter", "failed": [], "indeterminate": ["hub"], "warnings": []}\n', b""
             return (0, b"", b"") if ok else (1, b'{"check": "privd", "detail": "boom", "status": "fail"}\n{"doctor": "FAILED", "failed": ["privd"]}\n', b"")
         return 0, b"", b""
 
@@ -101,7 +104,7 @@ class Env:
         return res
 
     def switcher(self, **kw) -> Switcher:
-        args = dict(base=str(self.base), root="/opt/forge-node", ledger=str(self.ledger), signers=str(self.signers), policy_dir=str(self.policy_dir), node_env=str(self.node_env), local_stop=str(self.local_stop), lock_path=str(self.lock_path), trust_anchor=str(self.tmp),
+        args = dict(base=str(self.base), root="/opt/forge-node", ledger=str(self.ledger), signers=str(self.signers), policy_dir=str(self.policy_dir), node_env=str(self.node_env), local_stop=str(self.local_stop), hold_path=str(self.hold_path), lock_path=str(self.lock_path), trust_anchor=str(self.tmp),
                     ssh_keygen=shutil.which("ssh-keygen"), runuser="/usr/sbin/runuser",
                     run=self.run, self_path=str(self.self_path), owner_uid=0, out=self.out)
         args.update(kw)
@@ -441,6 +444,7 @@ def test_install_first_refuses_when_something_is_current_and_switch_refuses_with
     with pytest.raises(Refused, match="no release is current"):
         sw.cmd_switch("0.3.1", False)
     sw.cmd_install_first("0.3.0")
+    env.make_ledger()                                                       # (the install creates it with `privctl audit-init`; without it the switcher refuses, M-109)
     with pytest.raises(Refused, match="already current"):
         sw.cmd_install_first("0.3.1")
     with pytest.raises(Refused, match="already current"):
@@ -453,6 +457,7 @@ def test_policy_schema_newer_than_the_release_supports_blocks_a_rollback(env):
     (env.policy_dir / "policy-3.json").write_text(json.dumps({"schema": 1, "serial": 3}))
     sw = env.switcher()
     sw.cmd_install_first("0.3.0")
+    env.make_ledger()
     with pytest.raises(Refused, match="installed policy has schema 1"):
         sw.cmd_check("0.2.0")
 
@@ -481,8 +486,8 @@ def test_the_switcher_is_stdlib_only_and_independent_of_the_release_tree():
         if isinstance(n, ast.ImportFrom):
             assert n.level == 0, "relative import: the switcher must not depend on forge_node"
             mods.add((n.module or "").split(".")[0])
-    assert mods <= {"fcntl", "hashlib", "json", "os", "re", "signal", "sqlite3", "stat", "subprocess", "sys", "tempfile"} and "forge_node" not in mods
-    assert len((SRC_ROOT / "forge_node" / "release" / "switcher.py").read_text().splitlines()) < 600        # "a few hundred lines"
+    assert mods <= {"fcntl", "hashlib", "json", "os", "re", "signal", "sqlite3", "stat", "subprocess", "sys", "tempfile", "datetime"} and "forge_node" not in mods
+    assert len((SRC_ROOT / "forge_node" / "release" / "switcher.py").read_text().splitlines()) < 700        # "a few hundred lines" (M-108/M-109 added the hold and the missing-ledger guard)
 
 
 # --------------------------------------------------------------------------------------------------------------------- policy templates
@@ -844,6 +849,7 @@ def test_self_update_can_install_a_switcher_newer_than_the_running_one_while_che
     env.release("0.4.0", "full", switcher_api=SWITCHER_API + 1)
     sw = env.switcher()
     sw.cmd_install_first("0.3.0")
+    env.make_ledger()
     env.self_path.write_text("#!/bin/sh\necho old\n")
     for cmd in (sw.cmd_check, lambda v: sw.cmd_switch(v, False)):
         with pytest.raises(Refused, match="self-update"):

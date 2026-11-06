@@ -2,9 +2,13 @@
 release switch. It OBSERVES and reports; it never changes anything (privd's own `selfcheck` requests run each op's side-effect-free check inside its REAL transient unit, which is the
 point: a hardening profile that silently breaks an op shows up here, not in production).
 
-Checks (status ok | warn | fail | skip): clock, identity (node key/cert/CA, expiry), policy (signature, node, serial, mode), privd (reachable, peer root, policy agrees, lease), hub (TLS 1.3 + pin;
+Checks (status ok | warn | fail | indeterminate | skip): clock, identity (node key/cert/CA, expiry), policy (signature, node, serial, mode), privd (reachable, peer root, policy agrees, lease), hub (TLS 1.3 + pin;
 'unregistered' is the expected answer before the Cockpit approval), audit (the seal protocol PROVEN on the log filesystem by privd, both logs readable), forge root volume (ext4 loop mount
-with nodev,nosuid, backing file on the root device), every probe and every op of the release's table inside its own unit. Exit status 0 only if nothing failed."""
+with nodev,nosuid, backing file on the root device), every probe and every op of the release's table inside its own unit.
+
+Exit status: 0 nothing failed and nothing is undecided; 1 something FAILED; 4 INDETERMINATE (M-108): the hub answered 5xx on every one of 4 attempts (the first + 3 retries with backoff). A hub that is
+down for a restart proves neither that the release works (PASS) nor that it is broken (FAIL), so doctor says neither: the release switcher then keeps the known-good release, refuses every further
+switch until the owner clears the hold, and writes an escalation record for the Betriebsleiter. A real FAIL always wins over INDETERMINATE."""
 import json
 import os
 import sys
@@ -16,6 +20,8 @@ from .privd.client import PrivClient, PrivUnavailable
 from .t0 import hardening
 from .t0.policy import PolicyError, load_installed
 
+EXIT_OK, EXIT_FAILED, EXIT_INDETERMINATE = 0, 1, 4
+HUB_5XX_BACKOFF_S = (2.0, 5.0, 10.0)          # M-108: up to 3 retries after the first attempt, then `indeterminate`
 PACE_S = 6.0                         # privd rate-limits selfchecks (12/min per caller uid); EVERY selfcheck request - the audit one included - is paced, 14 requests in all
 
 
@@ -33,6 +39,7 @@ class Doctor:
         self.fs_stat, self.mountinfo, self.out, self.after_switch = fs_stat, mountinfo, out, after_switch
         self.policy = None
         self._selfchecks = 0
+        self._failed, self._indeterminate = [], []
 
     # ---- individual checks -------------------------------------------------------------------------------------------------------
     def clock_check(self) -> dict:
@@ -101,20 +108,28 @@ class Doctor:
     def hub_check(self) -> dict:
         if self.policy is None:
             return check("hub", "skip", "no policy")
-        c = HubClient(self.cfg.hub_host, self.cfg.hub_port, self.cfg.node_cert, self.cfg.node_key, self.cfg.ca_file, self.policy.hub_tls_pins, timeout_s=15.0)
-        try:
-            c.healthz()
-            return check("hub", "ok", "TLS 1.3 handshake, chain, name and hub pin verified; /healthz answered")
-        except PinError:
-            return check("hub", "fail", "the hub's certificate is not in the policy's hub_tls_pins")
-        except HubError as e:
-            if e.status in (401, 403):
-                return check("hub", "warn", "reachable and pinned; the node is not registered/approved yet (expected until the Cockpit approval)")
-            return check("hub", "fail", f"hub answered {e.status}")
-        except HubUnreachable as e:
-            return check("hub", "fail", f"hub unreachable: {e}", environmental=True)
-        finally:
-            c.close()
+        attempts = 0
+        while True:
+            attempts += 1
+            c = HubClient(self.cfg.hub_host, self.cfg.hub_port, self.cfg.node_cert, self.cfg.node_key, self.cfg.ca_file, self.policy.hub_tls_pins, timeout_s=15.0)
+            try:
+                c.healthz()
+                return check("hub", "ok", "TLS 1.3 handshake, chain, name and hub pin verified; /healthz answered")
+            except PinError:
+                return check("hub", "fail", "the hub's certificate is not in the policy's hub_tls_pins")
+            except HubError as e:
+                if e.status in (401, 403):
+                    return check("hub", "warn", "reachable and pinned; the node is not registered/approved yet (expected until the Cockpit approval)")
+                if 500 <= e.status <= 599:                                                       # M-108: a hub in a restart behind its proxy: neither PASS nor FAIL
+                    if attempts <= len(HUB_5XX_BACKOFF_S):
+                        self.sleep(HUB_5XX_BACKOFF_S[attempts - 1])
+                        continue
+                    return check("hub", "indeterminate", f"hub answered {e.status} on {attempts} attempts (backoff {list(HUB_5XX_BACKOFF_S)} s): neither pass nor fail", attempts=attempts, http_status=e.status)
+                return check("hub", "fail", f"hub answered {e.status}")
+            except HubUnreachable as e:
+                return check("hub", "fail", f"hub unreachable: {e}", environmental=True)
+            finally:
+                c.close()
 
     def _selfcheck(self, target: str, timeout=None):
         """Every selfcheck request, paced: the first goes at once, each later one PACE_S after the previous (privd allows 12 per minute per caller)."""
@@ -216,8 +231,13 @@ class Doctor:
         for r in results:
             self.out.write(json.dumps(r, sort_keys=True) + "\n")
         failed = [r["check"] for r in results if r["status"] == "fail"]
-        self.out.write(json.dumps({"doctor": "FAILED" if failed else "OK", "failed": failed, "warnings": [r["check"] for r in results if r["status"] == "warn"]}, sort_keys=True) + "\n")
-        self._failed = failed
+        undecided = [r["check"] for r in results if r["status"] == "indeterminate"]
+        verdict = "FAILED" if failed else "INDETERMINATE" if undecided else "OK"
+        summary = {"doctor": verdict, "failed": failed, "warnings": [r["check"] for r in results if r["status"] == "warn"]}
+        if undecided:
+            summary |= {"indeterminate": undecided, "escalate": "betriebsleiter"}
+        self.out.write(json.dumps(summary, sort_keys=True) + "\n")
+        self._failed, self._indeterminate = failed, undecided
         return results
 
 
@@ -240,4 +260,4 @@ def main(argv=None) -> int:
     d = Doctor(cfg=cfg, clock=lambda: datetime.now(timezone.utc), runner=ReadOnlyRunner(), ssh_keygen=ssh_keygen, priv=PrivClient(cfg.priv_socket, cfg.owner_uid, 150), sleep=time.sleep,
                op_names=build_optable(PROFILE).names(PROFILE), after_switch=bool(args))
     d.run()
-    return 1 if d._failed else 0
+    return EXIT_FAILED if d._failed else EXIT_INDETERMINATE if d._indeterminate else EXIT_OK

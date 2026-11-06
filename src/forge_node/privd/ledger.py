@@ -41,6 +41,10 @@ class LedgerError(Exception):
     pass
 
 
+class LedgerMissing(LedgerError):
+    """M-109: the ledger file is not there (or has no schema). On an installed node that is never 'a fresh start': the exactly-once knowledge is gone, so everything refuses; only the install creates it."""
+
+
 class SchemaTooNew(LedgerError):
     pass
 
@@ -96,15 +100,19 @@ def _ts(dt) -> str:
 
 
 class Ledger:
-    def __init__(self, path: str, *, read_only: bool = False):
+    def __init__(self, path: str, *, read_only: bool = False, create: bool = False):
+        """`create=True` is the INSTALL (privctl audit-init on a fresh node) and nothing else: privd, privctl and the workers open an existing, initialised ledger or refuse (M-109, fail
+        closed). A deleted or zero-byte-replaced ledger silently re-created at the next start would forget every claimed job - a re-delivered job would then run a second time."""
         self.path = path
         self._lock = threading.RLock()
         if read_only:
             self._c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, isolation_level=None, check_same_thread=False, timeout=30)
             self._c.row_factory = sqlite3.Row
             return
-        fresh = not os.path.exists(path)
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            fd = os.open(path, os.O_RDWR | (os.O_CREAT if create else 0) | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except FileNotFoundError:
+            raise LedgerMissing(f"ledger {path} does not exist: refusing to start with an empty ledger (only the install creates it: privctl audit-init on a fresh node)") from None
         try:
             st = os.fstat(fd)
             if st.st_nlink != 1 or st.st_mode & 0o077:
@@ -113,9 +121,12 @@ class Ledger:
             os.close(fd)
         self._c = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=30)
         self._c.row_factory = sqlite3.Row
+        ver = self._c.execute("PRAGMA user_version").fetchone()[0]
+        if not create and (ver == 0 or not self._c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='exec'").fetchone()):
+            self._c.close()
+            raise LedgerMissing(f"ledger {path} has no schema (user_version {ver}): it was replaced or never initialised; refusing to initialise it here")
         self._c.execute("PRAGMA journal_mode=WAL")
         self._c.execute("PRAGMA synchronous=FULL")
-        ver = self._c.execute("PRAGMA user_version").fetchone()[0]
         if ver > STATE_SCHEMA:
             raise SchemaTooNew(f"ledger schema {ver} is newer than this release supports ({STATE_SCHEMA})")
         self._c.executescript(_SCHEMA)

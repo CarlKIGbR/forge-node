@@ -8,6 +8,10 @@ One guard, verify_release(), stands in front of every command that changes anyth
   * the manifest names this release, the profile of the installed node, a switcher_api this switcher supports (else: 'run self-update'), a policy schema the INSTALLED policy fits,
     and a state-schema window that contains the ledger's PRAGMA user_version;
   * every file in the tree is listed with its sha256, nothing else is there, no symlinks, no hard links, nothing group/other-writable.
+A ledger that is missing, or has no schema, on a node that has a `current` release is a REFUSAL (M-109; 'no ledger yet' is only the state before install-first): it would otherwise read as 'no open rows'.
+`doctor --after-switch` has three verdicts (M-108): ok (rc 0) keeps the release, failed (rc 1) rolls back, INDETERMINATE (rc 4: the hub answered 5xx on every attempt - neither pass nor fail) rolls back
+to the known-good release too, without treating the unproven release as broken, and leaves a HOLD (RELEASE_HOLD, next to LOCAL_STOP) that refuses every further `switch` until the owner clears it with
+`clear-hold`; the hold file is the escalation record to the Betriebsleiter (exit status 5).
 `switch` additionally refuses while a ledger row is non-terminal (re-read after EVERYTHING that can create a row - agent, privd socket and service, the rotation timer - has been stopped,
 immediately before `current` is moved), moves agent, privd, units and the op table together (they all live below `current`), starts the privd socket, runs `doctor --after-switch` against it and
 only then starts the agent and the rotation timer; it goes back to the previous release by itself when ANY step after the first change fails (not only doctor). If the way back fails too,
@@ -24,6 +28,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 
 SWITCHER_API = 1
 VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}\Z")
@@ -67,16 +72,16 @@ def _read_nofollow(path: str, limit: int, owner_uid: int) -> bytes:
 
 
 class Switcher:
-    def __init__(self, *, base: str, root: str, ledger: str, signers: str, policy_dir: str, node_env: str, local_stop: str, lock_path: str, trust_anchor: str, ssh_keygen: str, runuser: str, run,
+    def __init__(self, *, base: str, root: str, ledger: str, signers: str, policy_dir: str, node_env: str, local_stop: str, hold_path: str, lock_path: str, trust_anchor: str, ssh_keygen: str, runuser: str, run,
                  self_path: str, owner_uid: int, out):
         """base: /opt/forge-node as a filesystem path (a test passes a temp directory); root: the LOGICAL prefix units refer to ('/opt/forge-node'); ledger: ledger.sqlite;
         signers: allowed_signers; policy_dir: the installed policies (schema check); node_env: /etc/forge-node/node.env (what `doctor` needs, exactly as the agent unit gets it); runuser: the util-linux binary (/usr/sbin/runuser on Ubuntu - NOT /usr/bin);
-        local_stop: /etc/forge-node/LOCAL_STOP (a switch is refused while it exists); lock_path: the lock file of changing commands; trust_anchor: '/' (a test passes its temp root) - every directory from
+        local_stop: /etc/forge-node/LOCAL_STOP (a switch is refused while it exists); hold_path: /etc/forge-node/RELEASE_HOLD (written after an INDETERMINATE doctor; a switch is refused while it exists); lock_path: the lock file of changing commands; trust_anchor: '/' (a test passes its temp root) - every directory from
         the release tree, `allowed_signers` and the policy up to it must be root-owned and not writable by others;
         run(argv, stdin, timeout_s) -> (rc, out, err); self_path: where this switcher is installed.
         All required: there is no default that could stand in for a missing guard input."""
         self.base, self.root, self.ledger, self.signers, self.policy_dir, self.node_env = base, root, ledger, signers, policy_dir, node_env
-        self.local_stop, self.lock_path, self.trust_anchor = local_stop, lock_path, trust_anchor
+        self.local_stop, self.hold_path, self.lock_path, self.trust_anchor = local_stop, hold_path, lock_path, trust_anchor
         self.ssh_keygen, self.runuser, self.run, self.self_path, self.owner_uid, self.out = ssh_keygen, runuser, run, self_path, owner_uid, out
 
     def chain_trusted(self, path: str, what: str) -> None:
@@ -146,8 +151,12 @@ class Switcher:
 
     # ------------------------------------------------------------------------------------------------------------------------ state
     def ledger_schema_and_open(self) -> tuple[int, int]:
-        """(PRAGMA user_version, non-terminal rows) read-only; (0, 0) when there is no ledger yet."""
-        if not os.path.exists(self.ledger):
+        """(PRAGMA user_version, non-terminal rows) read-only. (0, 0) ONLY while no release is installed yet (install-first / check before the install); once a release is `current` a missing
+        or schema-less ledger is a refusal (M-109): it would read as 'no open rows' and hide a deleted or replaced file."""
+        installed = self.current() is not None
+        if not os.path.lexists(self.ledger):
+            if installed:
+                raise Refused(f"ledger {self.ledger} is missing on an installed node: refusing to read 'no open rows' from nothing (the install creates it with `privctl audit-init`; a deleted one is damage - tell the Betriebsleiter)")
             return 0, 0
         try:
             c = sqlite3.connect(f"file:{self.ledger}?mode=ro", uri=True, timeout=10)
@@ -156,8 +165,8 @@ class Switcher:
                 try:
                     n = c.execute(f"SELECT COUNT(*) FROM exec WHERE state IN ({','.join('?' * len(NONTERMINAL))})", NONTERMINAL).fetchone()[0]
                 except sqlite3.OperationalError as e:
-                    if ver == 0:
-                        return 0, 0                                     # a ledger file privd has not initialised yet
+                    if ver == 0 and not installed:
+                        return 0, 0                                     # a ledger file nobody has initialised yet, before the install
                     raise Refused(f"ledger (schema {ver}) has no readable exec table ({e}): refusing to count 'no open rows'") from e
                 return ver, n
             finally:
@@ -306,7 +315,8 @@ class Switcher:
     # --------------------------------------------------------------------------------------------------------------------- commands
     def show_status(self) -> int:
         rels = sorted(os.listdir(os.path.join(self.base, "releases"))) if os.path.isdir(os.path.join(self.base, "releases")) else []
-        doc = {"current": self.current(), "previous": self._link_target(self.previous_link), "profile": self.installed_profile(), "switcher_api": SWITCHER_API, "releases": rels}
+        doc = {"current": self.current(), "previous": self._link_target(self.previous_link), "profile": self.installed_profile(), "switcher_api": SWITCHER_API, "releases": rels,
+               "hold": self.read_hold()}
         for key, fn in (("ledger", lambda: dict(zip(("state_schema", "non_terminal_rows"), self.ledger_schema_and_open()))), ("installed_policy_schema", self.installed_policy_schema)):
             try:
                 doc[key] = fn()
@@ -321,9 +331,9 @@ class Switcher:
         return 0
 
     def cmd_install_first(self, ver: str) -> int:
-        m = self.verify_release(ver, False)
         if os.path.lexists(self.current_link):
             raise Refused("a release is already current: use 'switch'")
+        m = self.verify_release(ver, False)
         fd = os.open(self.profile_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
         try:
             os.write(fd, m["profile"].encode() + b"\n")
@@ -400,13 +410,56 @@ class Switcher:
             raise Refused(f"{self.node_env} has no FORGE_NODE_NODE_ID")
         return env
 
-    def _doctor(self, env: list[str]) -> tuple[bool, str]:
+    def read_hold(self):
+        """None, or the hold record as text-safe dict. Anything at the path counts as a hold - a symlink, an unreadable or malformed file too (fail closed)."""
+        if not os.path.lexists(self.hold_path):
+            return None
+        try:
+            return json.loads(_read_nofollow(self.hold_path, 16 * 1024, self.owner_uid))
+        except (OSError, ValueError, SwitchError):
+            return {"kind": "unreadable", "note": f"{self.hold_path} exists but cannot be read as a hold record"}
+
+    def _write_hold(self, doc: dict) -> str | None:
+        """The escalation record: written atomically (new file, fsync, rename) into the root-owned directory of LOCAL_STOP. Returns an error text instead of raising: the way back has already
+        happened and must be reported either way."""
+        tmp = self.hold_path + ".new"
+        try:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            try:
+                os.write(fd, (json.dumps(doc, sort_keys=True, indent=1) + "\n").encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(tmp, self.hold_path)
+            return None
+        except OSError as e:
+            return f"{type(e).__name__}: {e}"
+
+    def cmd_clear_hold(self) -> int:
+        """The owner's deliberate release of the hold, after the hub is back and `doctor` was run by hand. Says what it removed."""
+        hold = self.read_hold()
+        if hold is None:
+            raise Refused("there is no hold")
+        os.unlink(self.hold_path)
+        self.say({"hold_cleared": hold})
+        return 0
+
+    def _doctor(self, env: list[str]) -> tuple[str, str]:
+        """-> ("ok" | "failed" | "indeterminate", why). INDETERMINATE needs BOTH exit status 4 and doctor's own verdict line: any other non-zero status (a crash, a timeout = 124) is a failure."""
         argv = [self.runuser, "-u", "forgenode", "--", "/usr/bin/env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C", *env,
                 "/usr/bin/python3", "-I", f"{self.root}/current/forge-node.pyz", "doctor", "--after-switch"]
         rc, out, err = self.run(argv, None, 900)
         text = (out + err).decode("utf-8", "replace")
+        if rc == 0:
+            return "ok", ""
+        if rc == 4 and any('"doctor": "INDETERMINATE"' in ln for ln in text.splitlines()):
+            return "indeterminate", "rc 4: " + " | ".join(ln for ln in text.splitlines() if '"status": "indeterminate"' in ln)[-1500:]
         failed = [ln for ln in text.splitlines() if '"status": "fail"' in ln or '"doctor": "FAILED"' in ln]
-        return rc == 0, ("" if rc == 0 else f"rc {rc}: " + " | ".join(failed)[-1500:])
+        return "failed", f"rc {rc}: " + " | ".join(failed)[-1500:]
 
     def _safe_stop(self) -> list[str]:
         """The way back failed: leave a quiet node - stopped AND disabled, so that a reboot does not start what nobody has verified (the next successful switch enables the units again).
@@ -422,6 +475,10 @@ class Switcher:
     def cmd_switch(self, ver: str, one_way: bool) -> int:
         """`one_way` (required): the owner accepts that the new release's state window is wider than the current one, i.e. that the first start of its privd may move the ledger schema to a version
         the current release cannot read - after which a failed doctor has NO way back and ends in a stopped, disabled node. Without it such a switch is refused before the first change."""
+        hold = self.read_hold()
+        if hold is not None:
+            raise Refused(f"{self.hold_path} exists: a previous switch ended INDETERMINATE ({hold.get('attempted', '?')} could not be judged, the node stayed on {hold.get('known_good', '?')}); "
+                          "no further switch until the owner has looked at it (`doctor` by hand) and removed the hold with `forge-node-release clear-hold`")
         m = self.verify_release(ver, False)
         prev = self.current()
         if prev is None:
@@ -439,15 +496,17 @@ class Switcher:
         old_previous = self._link_target(self.previous_link)
         self._quiesce_and_check_ledger(restart_on_refusal=True)
         failure = None
+        undecided = False
         try:
             self._activate(ver, m)
-            ok, why = self._doctor(env)
-            if ok:
+            verdict, why = self._doctor(env)
+            if verdict == "ok":
                 self._start_rest()
                 done = {"switched": ver, "from": prev, "doctor": "ok", "rollback_possible": way_back}
             else:
                 done = None
-                failure = f"doctor failed ({why})"
+                undecided = verdict == "indeterminate"
+                failure = f"doctor {'INDETERMINATE' if undecided else 'failed'} ({why})"
         except (SwitchError, OSError) as e:
             done = None
             failure = f"{type(e).__name__}: {e}"
@@ -459,9 +518,12 @@ class Switcher:
             pm = self.verify_release(prev, False)
             self._quiesce_and_check_ledger(restart_on_refusal=False)
             self._activate(prev, pm)
-            ok, why = self._doctor(env)
-            if not ok:
+            verdict, why = self._doctor(env)
+            if verdict == "failed":
                 raise SwitchError(f"the restored release {prev} fails doctor too ({why})")
+            if verdict == "indeterminate":                              # the known-good release cannot be judged while the hub answers 5xx: it was proven before, it stays (M-108)
+                undecided = True
+                failure = f"{failure}; the restored release {prev} could not be judged either ({why})"
             self._start_rest()
             if old_previous is not None:                                # `previous` must not point at the release we just took back
                 self._repoint(self.previous_link, os.path.join("releases", old_previous))
@@ -476,6 +538,15 @@ class Switcher:
                      f"NOT CONFIRMED STOPPED ({'; '.join(not_quiet)}): units of the release that FAILED may still be running; current -> {self.current()}; stop them by hand before anything else")
             self.say({"switched": None, "attempted": ver, "failure": failure, "restored": None, "restore_error": f"{type(e).__name__}: {e}", "state": state})
             return 3
+        if undecided:
+            # M-108: neither pass nor fail. The known-good release runs again (it was proven before this switch, the hub's 5xx says nothing against it); the unproven one is not kept, and nothing
+            # more is switched until the owner has looked: the hold file IS the escalation record to the Betriebsleiter.
+            record = {"kind": "doctor_indeterminate", "escalate_to": "betriebsleiter", "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "attempted": ver, "known_good": prev,
+                      "reason": failure, "state": f"node runs the known-good release {prev}; no further switch until `forge-node-release clear-hold`"}
+            held = self._write_hold(record)
+            self.say({"switched": None, "attempted": ver, "failure": failure, "restored": prev, "restored_doctor": "indeterminate", "state": "INDETERMINATE", "escalation": record,
+                      "hold": self.hold_path if held is None else f"NOT WRITTEN ({held}): the escalation is this output only - tell the Betriebsleiter"})
+            return 5
         self.say({"switched": None, "attempted": ver, "failure": failure, "restored": prev, "restored_doctor": "ok"})
         return 1
 
@@ -526,13 +597,13 @@ def run_process(argv, stdin, timeout_s):
 
 def main(argv, sw: Switcher) -> int:
     cmds = {"status": lambda a: sw.show_status(), "check": lambda a: sw.cmd_check(a[0]), "switch": lambda a: sw.cmd_switch(a[-1], a[0] == "--one-way"), "install-first": lambda a: sw.cmd_install_first(a[0]),
-            "self-update": lambda a: sw.cmd_self_update(a[0])}
-    ok_len = (1 if argv[0] == "status" else 3 if argv[:2] == ["switch", "--one-way"] else 2) if argv else 0
+            "self-update": lambda a: sw.cmd_self_update(a[0]), "clear-hold": lambda a: sw.cmd_clear_hold()}
+    ok_len = (1 if argv[0] in ("status", "clear-hold") else 3 if argv[:2] == ["switch", "--one-way"] else 2) if argv else 0
     if not argv or argv[0] not in cmds or len(argv) != ok_len:
-        sys.stderr.write("usage: forge-node-release status | check|switch|install-first|self-update <version> | switch --one-way <version>\n")
+        sys.stderr.write("usage: forge-node-release status | check|switch|install-first|self-update <version> | switch --one-way <version> | clear-hold\n")
         return 2
     try:
-        if argv[0] in ("switch", "install-first", "self-update"):
+        if argv[0] in ("switch", "install-first", "self-update", "clear-hold"):
             with sw.locked():
                 return cmds[argv[0]](argv[1:])
         return cmds[argv[0]](argv[1:])
@@ -557,7 +628,7 @@ def production() -> int:
         sys.stderr.write("no runuser\n")
         return 2
     sw = Switcher(base="/opt/forge-node", root="/opt/forge-node", ledger="/var/lib/forge-node-priv/ledger.sqlite", signers="/etc/forge-node/allowed_signers",
-                  policy_dir="/etc/forge-node/policy", node_env="/etc/forge-node/node.env", local_stop="/etc/forge-node/LOCAL_STOP",
+                  policy_dir="/etc/forge-node/policy", node_env="/etc/forge-node/node.env", local_stop="/etc/forge-node/LOCAL_STOP", hold_path="/etc/forge-node/RELEASE_HOLD",
                   lock_path="/run/forge-node-release.lock", trust_anchor="/", ssh_keygen=ssh_keygen, runuser=runuser, run=run_process, self_path="/usr/local/sbin/forge-node-release", owner_uid=0, out=sys.stdout)
     return main(sys.argv[1:], sw)
 

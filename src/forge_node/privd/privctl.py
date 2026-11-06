@@ -11,9 +11,10 @@ import stat
 import sys
 
 from ..audit import fsproof
-from ..audit.spec import AuditCorrupt, AuditDown, AuditNotInitialised
+from ..audit.spec import CURRENT_NAME, AuditCorrupt, AuditDown, AuditNotInitialised
 from . import resolver
 from .client import PrivClient, PrivUnavailable
+from .ledger import LedgerError
 
 MAX_BLOB = 256 * 1024
 
@@ -68,10 +69,27 @@ class Ctl:
             if not proof["ok"]:
                 self.emit(res)
                 raise CtlError(f"{name} log: the filesystem does not support the seal protocol (see fs_proof)")
+        res["ledger"] = self._ledger_for_install(admins)                               # M-109: the install creates the ledger; before the logs, so a ledger that cannot be made leaves no half-installed node
         for name, admin in admins:
             res[name]["generation"] = admin.init()
         self.emit(res)
         return 0
+
+    def _ledger_for_install(self, admins) -> dict:
+        """Fresh node (no log has a CURRENT yet): create the ledger (idempotent for a partly done earlier install). Node that was installed (a log exists): the ledger MUST be there and
+        initialised - a missing or schema-less one is damage, not a fresh start, and `audit-init` is not the way to hide it (M-109, fail closed)."""
+        from .ledger import Ledger
+        installed = any(os.path.lexists(os.path.join(a.spec.dir, CURRENT_NAME)) for _, a in admins)
+        existed = os.path.lexists(self.ledger_path)
+        try:
+            led = Ledger(self.ledger_path, create=not installed)
+        except LedgerError as e:
+            raise CtlError(f"the node is installed (a log exists) but its ledger is unusable: {e}") from e
+        try:
+            schema = led._c.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            led.close()
+        return {"path": self.ledger_path, "created": not existed, "state_schema": schema}
 
     def cmd_audit_verify(self) -> int:
         require_root(self.euid)
@@ -151,7 +169,7 @@ class Ctl:
         """Re-enable an op whose circuit opened - only by an acknowledgement here, never by the failing caller."""
         require_root(self.euid)
         from .ledger import Ledger
-        led = Ledger(self.ledger_path)
+        led = Ledger(self.ledger_path)                                          # an existing, initialised ledger or a refusal (M-109): never creates one
         try:
             ok = led.circuit_ack(op, who)
         finally:
@@ -171,6 +189,6 @@ def main(argv: list[str], ctl: Ctl) -> int:
         return 2
     try:
         return cmds[argv[0]](argv[1:])
-    except (CtlError, PrivUnavailable, AuditDown, AuditCorrupt, OSError, ValueError, IndexError) as e:
+    except (CtlError, PrivUnavailable, AuditDown, AuditCorrupt, LedgerError, OSError, ValueError, IndexError) as e:
         sys.stderr.write(f"privctl {argv[0]}: {type(e).__name__}: {e}\n")
         return 1

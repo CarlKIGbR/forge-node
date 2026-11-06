@@ -19,7 +19,7 @@ from . import resolver
 from .client import PrivClient
 from .core import Context, Paths
 from .gate import flush_pending_policy_audit, record_release_switch
-from .ledger import Ledger
+from .ledger import Ledger, LedgerError
 from .lease import LeaseStore
 from .optable import build_optable
 from .policy_full import BUILTIN_PROTECTED_PATHS, BUILTIN_PROTECTED_UNITS
@@ -110,7 +110,7 @@ def run_privd() -> int:
         return 2
     try:
         ctx = build_context(node)
-    except (RunnerError, KeyError, OSError, AuditDown, AuditCorrupt) as e:
+    except (RunnerError, KeyError, OSError, AuditDown, AuditCorrupt, LedgerError) as e:
         sys.stderr.write(f"cannot start: {type(e).__name__}: {e}\n")
         return 2
     recover_all(ctx)

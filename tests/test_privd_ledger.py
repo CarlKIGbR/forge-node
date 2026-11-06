@@ -389,7 +389,7 @@ def test_concurrent_duplicate_delivery_second_gets_in_progress_single_worker(pri
 
 
 def test_ledger_atomic_claim_single_execution_under_concurrent_delivery(tmp_path):
-    led = Ledger(str(tmp_path / "l.sqlite"))
+    led = Ledger(str(tmp_path / "l.sqlite"), create=True)
     kinds = []
     lock = threading.Lock()
 
@@ -471,7 +471,7 @@ def test_effect_lock_serializes_workers_of_the_same_effect_key(privd_env, tmp_pa
 
 
 def test_rate_clock_rollback_does_not_refund_events(tmp_path):
-    led = Ledger(str(tmp_path / "l.sqlite"))
+    led = Ledger(str(tmp_path / "l.sqlite"), create=True)
     t = 1_000_000.0
     assert led.rate_take("b", [(2, 600)], t, None) and led.rate_take("b", [(2, 600)], t + 1, None)
     assert not led.rate_take("b", [(2, 600)], t + 2, None)
@@ -484,7 +484,7 @@ def test_ledger_schema_version_and_window(tmp_path):
     import sqlite3
     from forge_node.privd.ledger import STATE_SCHEMA, SchemaTooNew
     p = str(tmp_path / "l.sqlite")
-    Ledger(p).close()
+    Ledger(p, create=True).close()
     c = sqlite3.connect(p)
     assert c.execute("PRAGMA user_version").fetchone()[0] == STATE_SCHEMA
     c.execute(f"PRAGMA user_version={STATE_SCHEMA + 1}")

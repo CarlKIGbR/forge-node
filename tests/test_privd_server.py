@@ -283,7 +283,7 @@ def test_privctl_audit_init_proves_the_filesystem_and_refuses_without_creating_a
     specs = make_specs(realfs)
     adm = (AuditAdmin(specs["priv"], NODE, lambda: __import__("privd_helpers").NOW), AuditAdmin(specs["agent"], NODE, lambda: __import__("privd_helpers").NOW))
     out = io.StringIO()
-    ctl = privctl.Ctl(euid=0, client=None, state_setup=lambda: None, admin_factory=lambda: adm, ledger_path="", local_stop="", systemctl_provider=None, systemctl_text_provider=None, protected_units=(),
+    ctl = privctl.Ctl(euid=0, client=None, state_setup=lambda: None, admin_factory=lambda: adm, ledger_path=str(tmp_path / "ledger.sqlite"), local_stop="", systemctl_provider=None, systemctl_text_provider=None, protected_units=(),
                       protected_paths=(), run_systemctl=None, clock=lambda: None, out=out)
     assert privctl.main(["audit-init"], ctl) == 0
     doc = json.loads(out.getvalue())

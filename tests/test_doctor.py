@@ -154,7 +154,7 @@ def test_each_failure_mode_is_reported_and_none_is_swallowed(served, tmp_path, m
     # hub
     d, _ = doctor(served, tmp_path)
     d.policy_check()
-    for exc, want in ((PinError("x"), "fail"), (HubUnreachable("down"), "fail"), (HubError(403, "unregistered"), "warn"), (HubError(500, "boom"), "fail")):
+    for exc, want in ((PinError("x"), "fail"), (HubUnreachable("down"), "fail"), (HubError(403, "unregistered"), "warn"), (HubError(500, "boom"), "indeterminate"), (HubError(404, "nope"), "fail")):
         FakeHub.behaviour = exc
         assert d.hub_check()["status"] == want, exc
     # privd unreachable / policy disagreement
@@ -256,11 +256,15 @@ def test_doctor_main_accepts_only_the_after_switch_flag(monkeypatch, capsys):
 def test_after_a_switch_a_hub_that_answers_but_is_refused_still_fails_and_so_does_a_broken_policy(served, tmp_path, monkeypatch):
     """Round 2: every hub failure was downgraded after a switch - a release that breaks the agent's TLS client (wrong pin handling, 5xx) would have passed. Only unreachability is environmental."""
     monkeypatch.setattr(D, "HubClient", FakeHub)
-    for behaviour in (PinError("not pinned"), HubError(500, "boom")):
+    for behaviour in (PinError("not pinned"), HubError(404, "nope")):
         FakeHub.behaviour = behaviour
         d, _ = doctor(served, tmp_path, after_switch=True)
         res = by_name(d.run())
         assert res["hub"]["status"] == "fail" and "hub" in d._failed, behaviour
+    FakeHub.behaviour = HubError(500, "boom")                                                   # M-108: a 5xx is neither pass nor fail - not downgraded to a warning either
+    d, _ = doctor(served, tmp_path, after_switch=True)
+    res = by_name(d.run())
+    assert res["hub"]["status"] == "indeterminate" and d._failed == [] and d._indeterminate == ["hub"]
     FakeHub.behaviour = HubUnreachable("no route")
     d, _ = doctor(served, tmp_path, after_switch=True)
     assert by_name(d.run())["hub"]["status"] == "warn"                                           # the environmental one
@@ -283,11 +287,13 @@ def test_doctor_main_exits_with_the_verdict_the_switcher_depends_on(monkeypatch,
     import sys as _sys
     class FakeDoctor:
         failed = []
+        undecided = []
         seen = {}
 
         def __init__(self, **kw):
             FakeDoctor.seen = kw
             self._failed = list(FakeDoctor.failed)
+            self._indeterminate = list(FakeDoctor.undecided)
 
         def run(self):
             return []

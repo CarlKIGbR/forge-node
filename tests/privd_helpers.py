@@ -80,7 +80,7 @@ class PrivdEnv:
         if not attach:
             self.priv_log.init()
             self.agent_log.init()
-        self.ledger = Ledger(self.paths.ledger)
+        self.ledger = Ledger(self.paths.ledger, create=True)
         self.backend = backend_cls(f"{base}/units")
         os.environ["PYTHONPATH"] = SRC + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
         os.environ.update({"FN_TEST_SRC": SRC, "FN_TEST_POLICY_DIR": self.paths.policy_dir, "FN_TEST_SIGNERS": self.paths.allowed_signers, "FN_TEST_SSH_KEYGEN": shutil.which("ssh-keygen"),
