@@ -128,23 +128,34 @@ def test_verify_detects_deleted_middle_record_even_with_trigger_bypass(hub, adm)
 
 
 def test_concurrent_overlapping_batches_store_each_record_once(hub, hubdb, adm, hubcfg, gate, clock):      # Hub-Seite von test_concurrent_appends_unique_seq_and_unbroken_chain
+    """M-112 (flake, root cause): the old batches recs[10:] and recs[20:35] start at seq 11 / 21. Whichever thread takes the per-chain advisory lock first decides: a
+    batch that starts beyond head+1 is, correctly, an `audit_gap` and quarantines the node - so the test failed whenever such a batch won the lock before any prefix
+    batch (observed ~1 in 6 runs). The product is right; the test's precondition was not. Now the chain is seeded with seq 1..5 first, so EVERY batch starts at
+    seq <= head+1 whatever the lock order is (validity no longer depends on the scheduler), the batches still overlap one another in different ways, and all threads
+    start together (barrier). Each of the 35 remaining records must be stored by exactly one of the 8 deliveries."""
     from forge_node.hub.core import Hub, Signer
 
     recs = _chain(n=40)
+    assert hub.ingest_audit("g2", {"source": "priv", "records": recs[:5]})["stored"] == 5
     results, errs = [], []
+    batches = [recs[:25], recs[5:], recs[:40], recs[5:35]]               # starts at seq 1 / 6 / 1 / 6, head >= 5 at any time
+    start = threading.Barrier(len(batches) * 2)
 
     def worker(batch):
         h = Hub(hubcfg, hubdb, Signer(gate["priv"], gate["id"]), clock=clock)
         try:
+            start.wait(10)
             results.append(h.ingest_audit("g2", {"source": "priv", "records": batch}))
         except Exception as e:  # noqa: BLE001
             errs.append(e)
 
-    batches = [recs[:25], recs[10:], recs[:40], recs[20:35]]
     ts = [threading.Thread(target=worker, args=(b,)) for b in batches for _ in range(2)]
     [t.start() for t in ts]
     [t.join(30) for t in ts]
+    assert not any(t.is_alive() for t in ts)
     assert not errs, errs
+    assert len(results) == 8 and all(r["ok"] for r in results), results
+    assert sum(r["stored"] for r in results) == 35, results                # each record stored by exactly one delivery
     assert adm.execute("SELECT count(*) AS n, max(seq) AS m FROM node.audit WHERE source='priv'").fetchone() == {"n": 40, "m": 40}
     assert not _q(adm)["quarantine"] and hub.verify_chains("g2") == []
 

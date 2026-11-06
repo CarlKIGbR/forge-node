@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests ohne Installation auf dem Host: Wegwerf-Postgres (--network none, nur Unix-Socket in einem Temp-Verzeichnis) + Test-Container mit dem Repo (read-only) und dem
 # ssh-keygen des Hosts (samt Loader/Bibliotheken als Shim, weil das Test-Image kein OpenSSH enthaelt). Beides wird am Ende entfernt. Nichts wird auf dem Host installiert.
-#   scripts/run-tests.sh [pytest-Argumente]
+#   scripts/run-tests.sh [pytest-Argumente]      (FN_REPEAT=n: n aufeinanderfolgende pytest-Prozesse im selben Container, Abbruch beim ersten Fehler - Flake-Nachweis)
 # Umgebung: FN_TEST_IMAGE (Default forge-core/tests:local, Python 3.12 + pytest + psycopg), FN_PG_IMAGE (Default: IMG_PGVECTOR aus forge-core/images.lock).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,5 +35,5 @@ docker run -d --name "$PGNAME" --network none -e POSTGRES_HOST_AUTH_METHOD=trust
 for _ in $(seq 1 60); do docker exec "$PGNAME" pg_isready -q -U postgres 2>/dev/null && break; sleep 0.5; done
 docker exec "$PGNAME" pg_isready -q -U postgres || { echo "Postgres kam nicht hoch" >&2; exit 1; }
 docker run --rm --network none --cap-add LINUX_IMMUTABLE --tmpfs /tmp:rw,exec,mode=1777 -v "$HERE:/w:ro" -v "$SOCK:/pgsock" -v "$FSDIR:/realfs" -v "$SHIM:/shim:ro" -w /w \
-  -e FN_REAL_FS=/realfs -e PATH="/shim/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin" -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/w/scripts -e FN_COV="${FN_COV:-}" -e FORGE_NODE_TEST_DSN="host=/pgsock user=postgres dbname=postgres" \
-  --entrypoint python3 "$IMG" -m pytest "$@"
+  -e FN_REAL_FS=/realfs -e PATH="/shim/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin" -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/w/scripts -e FN_COV="${FN_COV:-}" -e FN_REPEAT="${FN_REPEAT:-1}" -e FORGE_NODE_TEST_DSN="host=/pgsock user=postgres dbname=postgres" \
+  --entrypoint sh "$IMG" -c 'n=$FN_REPEAT; i=0; while [ "$i" -lt "$n" ]; do i=$((i+1)); python3 -m pytest "$@" || { echo "FN_REPEAT: run $i of $n FAILED"; exit 1; }; done; [ "$n" -gt 1 ] && echo "FN_REPEAT: $n of $n consecutive runs passed"; exit 0' sh "$@"
