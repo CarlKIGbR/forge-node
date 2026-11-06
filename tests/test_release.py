@@ -237,7 +237,7 @@ def test_release_switch_moves_agent_ops_units_together(env):
     env.make_ledger()
     env.calls.clear()
     assert sw.cmd_switch("0.3.1", False) == 0
-    seq = [(c[1], c[2:]) for c in env.calls if c[0] == "/usr/bin/systemctl"]
+    seq = [(c[1], c[2:]) for c in env.calls if c[0] == "/usr/bin/systemctl" and c[1] != "is-active"]     # (is-active only asks what was running, for the refusal path)
     assert seq[0] == ("stop", list(UNITS_STOP))                                              # quiesce first: EVERYTHING that can create a ledger row, then the ledger is read
     assert [c for c in seq if c[0] == "stop"] == [seq[0]]
     assert seq[-1] == ("start", ["forge-node-privd.socket", "forge-node-agent.service", "forge-node-audit-rotate.timer"])
@@ -1294,8 +1294,7 @@ def test_a_dead_stdout_after_a_good_switch_does_not_roll_it_back(env):
     env.switcher().cmd_install_first("0.3.0")
     sw = env.switcher(out=Dead())
     env.calls.clear()
-    with pytest.raises(BrokenPipeError):
-        sw.cmd_switch("0.3.1", False)
+    assert sw.cmd_switch("0.3.1", False) == 0                                                 # N4: the report is best effort, the verdict (and the exit status) is not
     assert os.readlink(env.base / "current") == "releases/0.3.1"
     assert len([c for c in env.calls if "doctor" in c]) == 1                                 # no second doctor = no rollback
 

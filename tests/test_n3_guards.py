@@ -63,16 +63,19 @@ def test_g27_every_privd_request_handler_is_counted_and_passes_gate_on_every_pat
 
 
 def test_g27_every_privctl_command_passes_require_root_first():
-    rep = check_entry_points(PRIVD, verbs=("cmd",), guarded=("require_root",), expected_count=9, exempt={}, guard_params=GUARD_PARAMS, effect_calls=EFFECTS)
+    rep = check_entry_points(PRIVD, verbs=("cmd",), guarded=("require_root",), expected_count=10, exempt={}, guard_params=GUARD_PARAMS, effect_calls=EFFECTS)
     assert rep.ok, rep.render()
     assert sorted(e.name for e in rep.entry_points) == sorted(f"cmd_{n}" for n in ("audit_init", "audit_verify", "audit_rotate", "audit_purge", "policy_apply", "status", "lockdown", "unit_closure",
-                                                                                   "circuit_ack"))
+                                                                                   "circuit_ack", "selftest_bypass"))
+
+
+CLEAR_HOLD_EXEMPT = {"release.switcher.Switcher.cmd_clear_hold": "removes the hold file only: it moves no release, starts no unit and reads no ledger (N4, M-108)"}
 
 
 def test_g27_every_switcher_command_passes_verify_release_first():
-    rep = check_entry_points(RELEASE, verbs=("cmd",), guarded=("verify_release",), expected_count=4, exempt={}, guard_params=GUARD_PARAMS, effect_calls=EFFECTS)
+    rep = check_entry_points(RELEASE, verbs=("cmd",), guarded=("verify_release",), expected_count=5, exempt=CLEAR_HOLD_EXEMPT, guard_params=GUARD_PARAMS, effect_calls=EFFECTS)
     assert rep.ok, rep.render()
-    assert sorted(e.name for e in rep.entry_points) == ["cmd_check", "cmd_install_first", "cmd_self_update", "cmd_switch"]
+    assert sorted(e.name for e in rep.entry_points) == ["cmd_check", "cmd_clear_hold", "cmd_install_first", "cmd_self_update", "cmd_switch"]
 
 
 def test_g27_no_optional_parameter_can_switch_a_check_off_anywhere_in_privd_the_agent_link_or_the_audit_writer():
@@ -284,7 +287,7 @@ def test_g27_behavioural_privctl_commands_refuse_non_root_without_side_effect(ri
     e = rig
     from test_privd_server import make_ctl
     ctl, out, calls = make_ctl(e, euid=1001)
-    rep = check_entry_points(PRIVD, verbs=("cmd",), guarded=("require_root",), expected_count=9, exempt={}, guard_params=GUARD_PARAMS, effect_calls=EFFECTS)
+    rep = check_entry_points(PRIVD, verbs=("cmd",), guarded=("require_root",), expected_count=10, exempt={}, guard_params=GUARD_PARAMS, effect_calls=EFFECTS)
 
     def call(fn):
         def f(**_):
@@ -296,7 +299,7 @@ def test_g27_behavioural_privctl_commands_refuse_non_root_without_side_effect(ri
     ok_ctl, _, _ = make_ctl(e, euid=0)
     names = {"audit_init": lambda c: c.cmd_audit_init(), "audit_verify": lambda c: c.cmd_audit_verify(), "audit_rotate": lambda c: c.cmd_audit_rotate("both"), "audit_purge": lambda c: c.cmd_audit_purge(1, 1),
              "policy_apply": lambda c: c.cmd_policy_apply("/nonexistent", "/nonexistent"), "status": lambda c: c.cmd_status(), "lockdown": lambda c: c.cmd_lockdown(),
-             "unit_closure": lambda c: c.cmd_unit_closure("a.service", "start"), "circuit_ack": lambda c: c.cmd_circuit_ack("selftest.noop", "me")}
+             "unit_closure": lambda c: c.cmd_unit_closure("a.service", "start"), "circuit_ack": lambda c: c.cmd_circuit_ack("selftest.noop", "me"), "selftest_bypass": lambda c: c.cmd_selftest_bypass("/nonexistent")}
     cases = {}
     for n, fn in names.items():
         def make(fn=fn):
@@ -332,7 +335,7 @@ def test_g27_behavioural_switcher_commands_reject_unverifiable_releases_without_
     swa = a.switcher()
     swa.cmd_install_first("0.3.0")
     a.make_ledger()
-    rep = check_entry_points(RELEASE, verbs=("cmd",), guarded=("verify_release",), expected_count=4, exempt={}, guard_params=GUARD_PARAMS, effect_calls=EFFECTS)
+    rep = check_entry_points(RELEASE, verbs=("cmd",), guarded=("verify_release",), expected_count=5, exempt=CLEAR_HOLD_EXEMPT, guard_params=GUARD_PARAMS, effect_calls=EFFECTS)
 
     def changes(env):
         calls = sum(1 for c in env.calls if not c[0].endswith("ssh-keygen"))              # ssh-keygen verifications do not count

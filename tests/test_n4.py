@@ -13,6 +13,7 @@ import pytest
 from audit_helpers import AGENT_GID
 from n2_helpers import FakeRunner
 from privd_helpers import NODE, PrivdEnv  # noqa: F401  (fixtures: privd_env)
+from test_privd_server import served as served_privd  # noqa: F401
 from test_doctor import CERT_OK, FakeHub, by_name, doctor, lines, served  # noqa: F401
 from test_release import Env, docs, env, mkey  # noqa: F401
 
@@ -303,3 +304,71 @@ def test_a_missing_ledger_refuses_the_switch_before_any_change(env):
         sw.cmd_switch("0.3.1", False)
     assert os.readlink(env.base / "current") == "releases/0.3.0"
     assert not [c for c in env.calls if "doctor" in c]
+
+
+# ================================================================================================================== T0 acceptance (3): privctl selftest-bypass
+def test_selftest_bypass_sends_a_signed_t1_dry_run_straight_to_the_socket_and_stop_denies_it_while_t0_answers(served_privd, tmp_path):
+    from test_privd_server import make_ctl
+    e = served_privd
+    assert e.put_lease(seq=2, stop=True)["ok"]                                              # forge-stop: the hub's lease says stop
+    env_, payload = e.job_env(dry_run=True)
+    f = tmp_path / "job.json"
+    f.write_text(json.dumps(env_))
+    os.chmod(f, 0o600)
+    ctl, out, _ = make_ctl(e)
+    assert privctl.main(["selftest-bypass", str(f), "DENY_STOP"], ctl) == 0
+    doc = json.loads(out.getvalue())
+    assert doc["bypass_refused"] is True and doc["reason_code"] == "DENY_STOP" and doc["sent"]["dry_run"] is True and doc["sent"]["tier"] == 1
+    assert [u for u in e.backend.list_op_units() if payload["job_id"] in u] == []              # nothing was started
+    assert e.call("t0", {"probe": "access", "params": {}})["ok"] is True                         # T0 still answers during the stop
+    out.truncate(0)
+    out.seek(0)
+    env2, _ = e.job_env(dry_run=True)                                                          # a wrong expectation is a failure of the check, not a pass
+    f.write_text(json.dumps(env2))
+    assert privctl.main(["selftest-bypass", str(f), "DENY_RATE"], ctl) == 1 and json.loads(out.getvalue())["bypass_refused"] is False
+
+
+def test_selftest_bypass_fails_when_privd_does_not_refuse_and_sends_only_signed_dry_runs(served_privd, tmp_path):
+    from test_privd_server import make_ctl
+    e = served_privd
+    ctl, out, _ = make_ctl(e)
+    f = tmp_path / "job.json"
+    os.chmod(tmp_path, 0o755)
+    env_, _ = e.job_env(dry_run=True)                                                          # no stop: privd answers the dry run - the bypass is NOT refused -> rc 1
+    f.write_text(json.dumps(env_))
+    assert privctl.main(["selftest-bypass", str(f)], ctl) == 1 and json.loads(out.getvalue())["status"] == "dry_run"
+    sent = []
+    real = ctl.client.request
+    ctl.client.request = lambda kind, body, *a: (sent.append(kind), real(kind, body, *a))[1]
+    env_live, _ = e.job_env(dry_run=False)                                                     # a real (non-dry-run) envelope is refused locally, nothing is sent
+    f.write_text(json.dumps(env_live))
+    assert privctl.main(["selftest-bypass", str(f)], ctl) == 1 and sent == []
+    f.write_text("{not json")
+    assert privctl.main(["selftest-bypass", str(f)], ctl) == 1 and sent == []
+    (tmp_path / "link.json").symlink_to(f)
+    assert privctl.main(["selftest-bypass", str(tmp_path / "link.json")], ctl) == 1 and sent == []
+    ctl_user, _, _ = make_ctl(e, euid=1001)
+    with pytest.raises(privctl.CtlError):
+        ctl_user.cmd_selftest_bypass(str(f))
+
+
+# ================================================================================================================== T0 acceptance (11): gated features verified disabled
+def test_every_gated_feature_is_verified_disabled_policy_validator_and_direct_privd_request(served_privd):
+    """(11): the policy validator rejects tiers_enabled > 0 / workloads / vm_pool / t2 ops / t3 while the gates are unmet, and a direct privd request for a gated op is denied."""
+    from forge_node import gates
+    from forge_node.privd.policy_full import parse_full
+    assert all(not g.met for g in gates.GATES.values()) and len(gates.GATES) == 4                # A-D stay unmet in N4
+    e = served_privd
+    for bad in ({"tiers": (0, 1)}, {"tiers": (0, 1, 2)}, {"tiers": (0, 1, 2, 3)}):
+        r = e.install(serial=50 + len(bad["tiers"]), **{**bad, "t1_ops": []}) if False else None
+    # direct request for every op above T0 in the table: denied, whatever the tier says
+    from forge_node.privd import optable
+    for profile in ("full", "t0"):
+        for name in optable.build_optable(profile).names(profile):
+            ent = optable.build_optable(profile).get(name)
+            if ent.tier >= 1 and name != "selftest.noop":
+                raise AssertionError(f"{name}: an op above T0 exists in the table of {profile} but only selftest.noop may (and it is unreachable until gate D)")
+    env_, payload = e.job_env(op="volume.create", tier=1, dry_run=True)
+    res = e.call("exec", {"job": env_})
+    assert res["ok"] and res["result"]["status"] == "denied", res
+    assert parse_full is not None

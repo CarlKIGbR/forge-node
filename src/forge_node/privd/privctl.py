@@ -165,6 +165,25 @@ class Ctl:
                    "F": sorted(r.F), "C": sorted(r.C), "S": sorted(r.S), "X": sorted(r.X)})
         return 1 if r.denied else 0
 
+    def cmd_selftest_bypass(self, envelope_path: str, expect: str | None = None) -> int:
+        """T0 acceptance (3), N4: send ONE hub-signed T1/T2 DRY-RUN job envelope straight to the privd socket, bypassing the agent and the hub, and report whether privd refused it. Exit 0 only when
+        privd answered with a `denied` result (and, if `expect` is given, with exactly that reason code, e.g. DENY_STOP); anything else - a dry-run result, an execution, no answer - is 1: the bypass
+        was NOT refused. It sends nothing but a dry-run envelope (checked here, and signed by the hub, so it cannot be altered), and it adds no capability: it is the request any root process can make."""
+        require_root(self.euid)
+        try:
+            env = json.loads(read_nofollow(envelope_path, MAX_BLOB))
+            payload = json.loads(env["payload"])
+        except (ValueError, KeyError, TypeError) as e:
+            raise CtlError(f"{envelope_path}: not a signed job envelope ({type(e).__name__})") from e
+        if not isinstance(payload, dict) or payload.get("typ") != "job" or payload.get("dry_run") is not True or payload.get("tier") not in (1, 2, 3):
+            raise CtlError("selftest-bypass sends signed DRY-RUN jobs of tier 1-3 only")
+        r = self.client.request("exec", {"job": env})
+        res = r.get("result") if r.get("ok") else None
+        refused = bool(res) and res.get("status") == "denied" and (expect is None or res.get("reason_code") == expect)
+        self.emit({"sent": {"job_id": payload.get("job_id"), "op": payload.get("op"), "tier": payload.get("tier"), "dry_run": True}, "expected": expect,
+                   "reason_code": (res or {}).get("reason_code"), "status": (res or {}).get("status"), "bypass_refused": refused, "reply_ok": r.get("ok")})
+        return 0 if refused else 1
+
     def cmd_circuit_ack(self, op: str, who: str) -> int:
         """Re-enable an op whose circuit opened - only by an acknowledgement here, never by the failing caller."""
         require_root(self.euid)
@@ -182,7 +201,7 @@ def main(argv: list[str], ctl: Ctl) -> int:
     """argv[0] = subcommand. Returns the exit code; errors are printed, never raised past here."""
     cmds = {"audit-init": lambda a: ctl.cmd_audit_init(), "audit-verify": lambda a: ctl.cmd_audit_verify(), "status": lambda a: ctl.cmd_status(), "lockdown": lambda a: ctl.cmd_lockdown(),
             "audit-rotate": lambda a: ctl.cmd_audit_rotate(a[0] if a else "both"), "policy-apply": lambda a: ctl.cmd_policy_apply(a[0], a[1]),
-            "unit-closure": lambda a: ctl.cmd_unit_closure(a[0], a[1]), "circuit-ack": lambda a: ctl.cmd_circuit_ack(a[0], a[1]),
+            "unit-closure": lambda a: ctl.cmd_unit_closure(a[0], a[1]), "circuit-ack": lambda a: ctl.cmd_circuit_ack(a[0], a[1]), "selftest-bypass": lambda a: ctl.cmd_selftest_bypass(a[0], a[1] if len(a) > 1 else None),
             "audit-purge": lambda a: ctl.cmd_audit_purge(int(a[0]), int(a[1]))}
     if not argv or argv[0] not in cmds:
         sys.stderr.write("usage: privctl " + "|".join(sorted(cmds)) + " ...\n")

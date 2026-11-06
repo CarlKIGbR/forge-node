@@ -36,6 +36,7 @@ PRINCIPAL = "owner@forge"
 NAMESPACE = "forge-node-release"
 NONTERMINAL = ("received", "started", "effect_done", "reconciling", "indeterminate")      # `indeterminate` IS here (round 3): reconcile assigns it exactly when the worker could NOT be confirmed dead, the effect lock is held from outside its cgroup, or the settle hook failed - a live worker may exist; the owner resolves the row with `privctl resolve` first
 PROFILES = ("full", "t0")
+DOCTOR_TIMEOUT_S = 1800                 # worst case of doctor: 14 paced selfchecks, 4 hub attempts with backoff, each selfcheck bounded by its own 150 s (N4, B10: it was 900)
 UNITS_START = ("forge-node-privd.socket", "forge-node-agent.service", "forge-node-audit-rotate.timer")
 UNITS_STOP = ("forge-node-agent.service", "forge-node-audit-rotate.timer", "forge-node-audit-rotate.service", "forge-node-privd.socket", "forge-node-privd.service")
 ENV_LINE = re.compile(r"^(FORGE_NODE_[A-Z0-9_]{1,48})=(?:\"([A-Za-z0-9._:/@+ -]{0,256})\"|'([A-Za-z0-9._:/@+ -]{0,256})'|([A-Za-z0-9._:/@+-]{0,256}))\Z")
@@ -43,6 +44,10 @@ ENV_LINE = re.compile(r"^(FORGE_NODE_[A-Z0-9_]{1,48})=(?:\"([A-Za-z0-9._:/@+ -]{
 
 class SwitchError(Exception):
     pass
+
+
+class LockedDown(SwitchError):
+    """LOCAL_STOP (`privctl lockdown`, pause) appeared while the switch was running: nothing may be started any more (N4, B7)."""
 
 
 class Refused(SwitchError):
@@ -310,7 +315,11 @@ class Switcher:
         self._systemctl("daemon-reload")
 
     def say(self, doc: dict) -> None:
-        self.out.write(json.dumps(doc, sort_keys=True, indent=1) + "\n")
+        """A dead stdout (dropped ssh session) must change neither the verdict nor the exit status: the report is best effort, the state of the node is not."""
+        try:
+            self.out.write(json.dumps(doc, sort_keys=True, indent=1) + "\n")
+        except OSError:
+            pass
 
     # --------------------------------------------------------------------------------------------------------------------- commands
     def show_status(self) -> int:
@@ -352,28 +361,58 @@ class Switcher:
         self.say({"installed": ver, "profile": m["profile"], "started": False})
         return 0
 
+    def _lockdown(self) -> bool:
+        return os.path.lexists(self.local_stop)
+
+    def _active_units(self) -> list[str]:
+        """The units of UNITS_START that are active (or may be: an answer that is not an explicit 'inactive/failed/unknown' counts as active)."""
+        up = []
+        for u in UNITS_START:
+            try:
+                rc, out, _ = self.run(["/usr/bin/systemctl", "is-active", u], None, 30)
+                state = out.decode("utf-8", "replace").strip()
+            except OSError:
+                rc, state = 1, ""
+            if state not in ("inactive", "failed", "unknown"):
+                up.append(u)
+        return up
+
+    def _stop_all(self) -> None:
+        """Stop agent, timer, rotation service, privd socket and service. A node left quiet by `_safe_stop` has its units DISABLED (links removed), so `stop` of an unloaded unit fails: that is
+        'already stopped', not a refusal - but only when every unit explicitly says inactive/failed/unknown (an empty or odd answer stays a refusal)."""
+        try:
+            self._systemctl("stop", *UNITS_STOP)
+        except SwitchError:
+            for u in UNITS_STOP:
+                rc, out, _ = self.run(["/usr/bin/systemctl", "is-active", u], None, 30)
+                if out.decode("utf-8", "replace").strip() not in ("inactive", "failed", "unknown"):
+                    raise
+
     def _quiesce_and_check_ledger(self, *, restart_on_refusal: bool) -> None:
         """Stop everything that can create or change a ledger row (agent, rotation timer and service, privd socket and service), THEN read the ledger (G28: the observation that decides
         the switch is made after the last thing that could change it has stopped). Open rows - or a stop that did not work - : refuse. `restart_on_refusal` is True only BEFORE the first change
-        (start everything again: nothing was changed); on the way back `current` points at the release that just failed, so nothing is started - the caller leaves a quiet node."""
+        (start again what was running before - and only that: a node left quiet by an earlier failure stays quiet); on the way back `current` points at the release that just failed, so nothing is started - the caller leaves a quiet node."""
+        was_active = self._active_units() if restart_on_refusal else []
         try:
-            self._systemctl("stop", *UNITS_STOP)
+            self._stop_all()
             _, n = self.ledger_schema_and_open()
         except SwitchError as e:
             if restart_on_refusal:
-                self._best_effort_start()
+                self._best_effort_start(was_active)
             if isinstance(e, Refused):
                 raise
-            raise Refused(f"the node could not be quiesced ({e})" + ("; everything was started again, nothing was changed" if restart_on_refusal else "")) from e
+            raise Refused(f"the node could not be quiesced ({e})" + ("; what was running was started again, nothing was changed" if restart_on_refusal else "")) from e
         if n:
             if restart_on_refusal:
-                self._best_effort_start()
-            raise Refused(f"{n} ledger row(s) are not terminal (received/started/effect_done/reconciling/indeterminate): a switch (or rollback) while an op is in flight would orphan its worker")
+                self._best_effort_start(was_active)
+            raise Refused(f"{n} ledger row(s) are not terminal (received/started/effect_done/reconciling/indeterminate; an `indeterminate` row is resolved by root with the privd `reconcile` request carrying `resolve` - there is no privctl wrapper for it yet): a switch (or rollback) while an op is in flight would orphan its worker")
 
-    def _best_effort_start(self) -> None:
+    def _best_effort_start(self, units) -> None:
+        if not units or self._lockdown():
+            return
         try:
-            self._systemctl("start", *UNITS_START)
-        except SwitchError:
+            self._systemctl("start", *units)
+        except (SwitchError, OSError):
             pass
 
     def _activate(self, ver: str, m: dict) -> None:
@@ -383,10 +422,14 @@ class Switcher:
             self._repoint(self.previous_link, os.path.join("releases", prev))
         self._repoint(self.current_link, os.path.join("releases", ver))
         self._link_units(m)
+        if self._lockdown():
+            raise LockedDown(f"{self.local_stop} appeared during the switch")
         self._systemctl("start", UNITS_START[0])
 
     def _start_rest(self) -> None:
         """The release passed doctor: enable (idempotent; a STOPPED node had its units disabled) and start the agent and the rotation timer."""
+        if self._lockdown():                                     # B7: `privctl lockdown` ran while doctor was running - the switch must not undo it
+            raise LockedDown(f"{self.local_stop} appeared during the switch")
         self._systemctl("enable", *UNITS_START)
         self._systemctl("start", *UNITS_START)
 
@@ -452,7 +495,7 @@ class Switcher:
         """-> ("ok" | "failed" | "indeterminate", why). INDETERMINATE needs BOTH exit status 4 and doctor's own verdict line: any other non-zero status (a crash, a timeout = 124) is a failure."""
         argv = [self.runuser, "-u", "forgenode", "--", "/usr/bin/env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C", *env,
                 "/usr/bin/python3", "-I", f"{self.root}/current/forge-node.pyz", "doctor", "--after-switch"]
-        rc, out, err = self.run(argv, None, 900)
+        rc, out, err = self.run(argv, None, DOCTOR_TIMEOUT_S)
         text = (out + err).decode("utf-8", "replace")
         if rc == 0:
             return "ok", ""
@@ -468,7 +511,7 @@ class Switcher:
         for args in (("stop", *UNITS_STOP), ("disable", *UNITS_START)):
             try:
                 self._systemctl(*args)
-            except SwitchError as e:
+            except (SwitchError, OSError) as e:
                 failed.append(f"{args[0]}: {e}")
         return failed
 
@@ -534,7 +577,8 @@ class Switcher:
                     pass
         except (SwitchError, OSError) as e:
             not_quiet = self._safe_stop()
-            state = (f"STOPPED and disabled: nothing is running; current -> {self.current()}; fix, then 'switch' (it enables the units again) or 'check' a release" if not not_quiet else
+            state = (f"LOCKDOWN ({self.local_stop} appeared during the switch): nothing was started, everything is stopped and disabled; current -> {self.current()}; remove LOCAL_STOP deliberately, then 'switch'" if isinstance(e, LockedDown) and not not_quiet else
+                     f"STOPPED and disabled: nothing is running; current -> {self.current()}; fix, then 'switch' (it enables the units again) or 'check' a release" if not not_quiet else
                      f"NOT CONFIRMED STOPPED ({'; '.join(not_quiet)}): units of the release that FAILED may still be running; current -> {self.current()}; stop them by hand before anything else")
             self.say({"switched": None, "attempted": ver, "failure": failure, "restored": None, "restore_error": f"{type(e).__name__}: {e}", "state": state})
             return 3
@@ -588,10 +632,17 @@ class Switcher:
 
 
 def run_process(argv, stdin, timeout_s):
+    """Run in its own session so that a timeout kills the whole process group (runuser -> env -> python), not only the direct child (N4, B10)."""
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}, start_new_session=True)
     try:
-        r = subprocess.run(argv, input=stdin if stdin is not None else b"", capture_output=True, timeout=timeout_s, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}, check=False)
-        return r.returncode, r.stdout, r.stderr
+        out, err = p.communicate(stdin if stdin is not None else b"", timeout=timeout_s)
+        return p.returncode, out, err
     except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.communicate()
         return 124, b"", b"timeout"
 
 

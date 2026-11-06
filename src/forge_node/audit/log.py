@@ -325,9 +325,11 @@ class Appender:
         if t.clean:
             return None
         inserted = False
-        for _ in range(MAX_TERMINATE_TRIES):
+        for attempt in range(MAX_TERMINATE_TRIES + 1):             # one look more than writes: the tail may be terminated by the very last newline we wrote (review finding, off by one)
             if os.pread(self._fd, 1, t.end + t.damaged - 1) == b"\n":
                 break
+            if attempt == MAX_TERMINATE_TRIES:
+                raise AuditDown("the damaged tail could not be terminated: a concurrent writer keeps extending it - retry")
             try:
                 _write_all(self._fd, b"\n")
                 os.fsync(self._fd)
@@ -338,8 +340,6 @@ class Appender:
             t = self._refresh_tail()                               # follows the chain over the bytes that are there now
             if t.clean:
                 return None
-        else:
-            raise AuditDown("the damaged tail could not be terminated: a concurrent writer keeps extending it - retry")
         n = t.damaged - 1 if inserted else t.damaged               # (the last byte is the newline we wrote - or, if a hostile writer ended its own line after it, one we count as ours: the digest covers the rest)
         rec = chain.seal_record({"ts": self._ts(), "node": self.node, "type": "tail_repair", "bytes": n, "inserted_newline": inserted, "sha256": region_digest(self._fd, t.end, n)}, t.seq + 1, t.hash)
         chain.validate_record(rec, self.node, self.spec.source)
