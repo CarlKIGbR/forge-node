@@ -87,7 +87,7 @@ def _verify(data: bytes, sig: str, namespace: str, pub: str, ssh_keygen: str) ->
         raise CliError(f"the new signature does not verify against {pub[:30]}... - is that the owner key whose public half is in allowed_signers?") from e
 
 
-def cmd_build(a) -> int:
+def run_build(a) -> int:
     ssh_keygen = _find_ssh_keygen()
     key = _check_key(Path(a.key).expanduser())
     pub = pub_for(key, Path(a.pub).expanduser() if a.pub else None)
@@ -125,7 +125,7 @@ def cmd_build(a) -> int:
     return 0
 
 
-def cmd_sign(a) -> int:
+def run_sign(a) -> int:
     ssh_keygen = _find_ssh_keygen()
     key = _check_key(Path(a.key).expanduser())
     pub = pub_for(key, Path(a.pub).expanduser() if a.pub else None)
@@ -156,7 +156,7 @@ def parser() -> argparse.ArgumentParser:
     b.add_argument("--pub", help="public key to verify against (default: KEY.pub)")
     b.add_argument("--src", help="directory that contains forge_node/ (default: the tree this program runs from)")
     b.add_argument("--force", action="store_true", help="replace an existing artifact")
-    b.set_defaults(fn=cmd_build)
+    b.set_defaults(fn=run_build)
     s = sub.add_parser("sign", help="sign one file (detached .sig next to it)")
     s.add_argument("file")
     s.add_argument("--key", required=True)
@@ -164,7 +164,7 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--namespace", default=sshsig.NS_RELEASE, choices=(sshsig.NS_RELEASE, sshsig.NS_POLICY, sshsig.NS_APPROVAL))
     s.add_argument("--sig", help="signature file to write (default: FILE.sig)")
     s.add_argument("--force", action="store_true")
-    s.set_defaults(fn=cmd_sign)
+    s.set_defaults(fn=run_sign)
     return p
 
 
