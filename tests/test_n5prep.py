@@ -422,3 +422,59 @@ def test_create_nodehub_role_script_follows_the_forge_core_pattern():
     assert "CREATE SCHEMA IF NOT EXISTS node AUTHORIZATION forge_core" in sh and "gen_secret_file" in sh
     assert not [l for l in sh.splitlines() if "PASSWORD '" in l or "PGPASSWORD" in l]                    # the password reaches psql through stdin (\set), never through argv or env
     assert "docker compose" not in sh.replace("docker compose --profile", "")                           # creates a role and a schema; starts nothing
+
+
+# ======================================================================================================================== 4. the owner's guide
+GUIDE = SRC.parent / "docs" / "reports" / "N5PREP_OWNER_GUIDE.md"
+
+
+def _guide_blocks() -> list[str]:
+    import re
+    return re.findall(r"^```bash\n(.*?)^```$", GUIDE.read_text(), re.S | re.M)
+
+
+def test_every_command_block_of_the_guide_is_valid_shell(tmp_path):
+    blocks = _guide_blocks()
+    assert len(blocks) >= 12
+    for i, b in enumerate(blocks):
+        f = tmp_path / f"b{i}.sh"
+        f.write_text(b)
+        r = subprocess.run(["bash", "-n", str(f)], capture_output=True, text=True)
+        assert r.returncode == 0, (i, r.stderr, b[:200])
+
+
+def test_guide_installs_t0_everywhere_in_the_design_order_without_a_volume():
+    import re
+    g = GUIDE.read_text()
+    assert "PROFILE=t0" in g and "FORGE_ROOT=none" in g and "PROFILE=full" not in g
+    for banned in ("fallocate", "mkfs.ext4", "losetup", "forge-root.img", "systemd-escape", "FORGE_ROOT_BYTES=1", "selftest.noop"):
+        assert banned not in "\n".join(_guide_blocks()), banned                                               # no command of the guide creates a volume or touches op code
+    head = [l for l in g.splitlines() if l.startswith("| | g2")][0]
+    assert [m for m in re.findall(r"\b(g[1-4]) \(", head)] == list(policies.INSTALL_ORDER)                       # table columns = g2, g3, g1, g4
+    row = [l for l in g.splitlines() if l.startswith("| `NID` / `IP`")][0]
+    for nid, ip in (("g2", "192.168.10.4"), ("g3", "192.168.30.3"), ("g1", "192.168.10.3"), ("g4", "192.168.30.4")):
+        assert f"`{nid}` / `{ip}`" in row
+    assert g.index("Teil 3") < g.index("Teil 4") < g.index("Teil 5") < g.index("Teil 7")                       # hub, firewall, hosts, rollback
+    assert "Zustimmung" in g and "g4" in g.split("Teil 8")[1]
+
+
+def test_guide_uses_only_commands_that_exist():
+    import re
+    g = GUIDE.read_text()
+    blocks = "\n".join(_guide_blocks())
+    ctl = set(re.findall(r'"([a-z-]+)": lambda a', (SRC / "forge_node" / "privd" / "privctl.py").read_text()))
+    used = set(re.findall(r"privctl (audit-[a-z]+|status|lockdown|policy-apply|selftest-bypass)\b", blocks))
+    assert used and used <= ctl, used - ctl
+    sw = (SRC / "forge_node" / "release" / "switcher.py").read_text()
+    for sub in set(re.findall(r"forge-node-release (status|check|switch|install-first)\b", g)):
+        assert f'"{sub}"' in sw, sub
+    fw = [l for l in blocks.splitlines() if "forge-docker-user.sh" in l or l.lstrip().startswith("sudo $FW")]
+    assert fw and all("--hub" in l for l in fw if "forge-docker-user.sh" in l or "$FW" in l if not l.startswith("FW=")), fw       # every firewall call is the 8094 set
+    p = rel_cli.parser()
+    ns = p.parse_args(["build", "0.5.0", "t0", "--out", "o", "--key", "k"])
+    assert ns.profile == "t0"
+    line = [l for l in blocks.splitlines() if "forge_node.cli release build" in l][0]
+    assert "$VER t0 --out" in line and "--key" in line
+    sign = [l for l in blocks.splitlines() if "forge_node.cli release sign" in l][0]
+    assert "--namespace forge-node-policy" in sign
+    assert "'t0'" in blocks and "INSERT INTO node.nodes" in blocks and "SET ROLE forge_core" in blocks                      # registration by SQL while Cockpit /nodes does not exist
