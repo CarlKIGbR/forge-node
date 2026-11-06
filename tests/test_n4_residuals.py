@@ -258,3 +258,28 @@ def test_r8_a_dead_stdout_does_not_change_the_verdict_and_an_oserror_in_the_stop
     assert sw2.cmd_switch("0.3.1", False) in (1, 3)                          # no traceback; the rollback path ran to its end with a dead stdout
     env.doctor_ok = True
     assert sw
+
+
+def test_r8_tail_repair_terminates_a_tail_that_a_hostile_writer_extended_three_times(realfs, monkeypatch):
+    """Review finding (audit, MINOR): the repair loop wrote its newline up to MAX_TERMINATE_TRIES times and never looked after the last write, so a tail that WAS terminated by the last
+    newline still raised AuditDown. A hostile uid extending the tail right after each of our first three newlines must not make the repair give up."""
+    from test_audit_review import append_raw, live
+
+    from forge_node.audit import log as auditlog
+    spec = make_specs(os.path.join(realfs, "tr"))["agent"]
+    admin(spec).init()
+    ap = appender(spec)
+    ap.append("t0", {"n": 1})
+    append_raw(live(spec), b"HOSTILE")                                      # unterminated damage at the tail
+    real, injected = auditlog._write_all, [0]
+
+    def write_then_extend(fd, data):
+        real(fd, data)
+        if data == b"\n" and injected[0] < auditlog.MAX_TERMINATE_TRIES - 1:
+            injected[0] += 1
+            append_raw(live(spec), b"H")                                    # the tail is unterminated again
+    monkeypatch.setattr(auditlog, "_write_all", write_then_extend)
+    rec = ap.append("t0", {"n": 2})
+    monkeypatch.undo()
+    assert injected[0] == auditlog.MAX_TERMINATE_TRIES - 1 and rec["type"] == "t0"
+    assert admin(spec).verify() == []

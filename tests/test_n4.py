@@ -353,22 +353,35 @@ def test_selftest_bypass_fails_when_privd_does_not_refuse_and_sends_only_signed_
 
 
 # ================================================================================================================== T0 acceptance (11): gated features verified disabled
-def test_every_gated_feature_is_verified_disabled_policy_validator_and_direct_privd_request(served_privd):
-    """(11): the policy validator rejects tiers_enabled > 0 / workloads / vm_pool / t2 ops / t3 while the gates are unmet, and a direct privd request for a gated op is denied."""
+def test_every_gated_feature_is_verified_disabled_policy_apply_and_direct_privd_request(realfs, owner, gate):
+    """(11), with the PRODUCTION gate table (A-D unmet, as shipped): privd's policy.apply rejects tiers_enabled > 0 with a gated op, workloads_enabled, vm_pool, t2 ops and t3 flags, a T0
+    policy is accepted, and a direct privd request for a gated op is denied."""
+    from privd_helpers import PrivdEnv
+
     from forge_node import gates
-    from forge_node.privd.policy_full import parse_full
-    assert all(not g.met for g in gates.GATES.values()) and len(gates.GATES) == 4                # A-D stay unmet in N4
-    e = served_privd
-    for bad in ({"tiers": (0, 1)}, {"tiers": (0, 1, 2)}, {"tiers": (0, 1, 2, 3)}):
-        r = e.install(serial=50 + len(bad["tiers"]), **{**bad, "t1_ops": []}) if False else None
-    # direct request for every op above T0 in the table: denied, whatever the tier says
-    from forge_node.privd import optable
-    for profile in ("full", "t0"):
-        for name in optable.build_optable(profile).names(profile):
-            ent = optable.build_optable(profile).get(name)
-            if ent.tier >= 1 and name != "selftest.noop":
-                raise AssertionError(f"{name}: an op above T0 exists in the table of {profile} but only selftest.noop may (and it is unreachable until gate D)")
-    env_, payload = e.job_env(op="volume.create", tier=1, dry_run=True)
-    res = e.call("exec", {"job": env_})
-    assert res["ok"] and res["result"]["status"] == "denied", res
-    assert parse_full is not None
+    assert len(gates.GATES) == 4 and all(not g.met for g in gates.GATES.values())
+    e = PrivdEnv(realfs, {"owner": owner, "gate": gate}, gate_set=gates.GATES)
+    try:
+        def apply(serial, **over):
+            return e.install(doc=e.doc(serial=serial, tiers=over.pop("tiers", (0,)), **over))
+        assert apply(1)["ok"] is True                                                           # the T0 policy: accepted
+        bad = {
+            "workloads_enabled": dict(t1={"workloads_enabled": True, "ops": []}),
+            "vm_pool": dict(t1={"workloads_enabled": False, "vm_pool": "forge", "ops": []}),
+            "t1 gated op": dict(tiers=(0, 1), t1_ops=[{"op": "volume.create", "mode": "observe"}]),
+            "t2 op": dict(tiers=(0, 1, 2), t2_ops=[{"op": "unit.restart", "targets": ["forge-x.service"]}]),
+            "t3 manifests": dict(t3={"manifests_enabled": ["unit_action"], "opaque_enabled": False}),
+            "t3 opaque": dict(t3={"manifests_enabled": [], "opaque_enabled": True}),
+        }
+        for n, (what, over) in enumerate(bad.items(), start=2):
+            r = apply(n, **over)
+            assert r["ok"] is False and "gate" in json.dumps(r).lower(), (what, r)
+        assert e.put_lease()["ok"]
+        for op, tier in (("volume.create", 1), ("unit.restart", 2), ("vm.start", 1), ("selftest.noop", 1)):      # a direct request, bypassing agent and hub
+            env_, _ = e.job_env(op=op, tier=tier, dry_run=True)
+            res = e.call("exec", {"job": env_})
+            assert res["ok"] is True and res["result"]["status"] == "denied", (op, res)
+    finally:
+        for log in (e.priv_log, e.agent_log):
+            log.close()
+        e.ledger.close()
