@@ -144,7 +144,9 @@ def test_source_never_generates_keys_or_touches_the_system():
         for bad in ("systemctl", "systemd-run", "chattr", *ever_banned):
             if bad in calls:
                 assert bad in allowed.get(rel, set()) and bad not in ever_banned, (rel, bad)
-    assert sorted(importers) == ["privd/main.py", "privd/units.py", "release/switcher.py", "sshsig.py", "t0/runner.py"]
+    assert sorted(importers) == ["privd/main.py", "privd/units.py", "release/cli.py", "release/switcher.py", "sshsig.py", "t0/runner.py"]      # N5-prep: release/cli.py = the owner's interactive `ssh-keygen -Y sign` (never a key generation)
+    cli_src = (ROOT / "src" / "forge_node" / "release" / "cli.py").read_text()
+    assert "capture_output" not in cli_src.replace("NO capture_output", "") and '"-N"' not in cli_src and "genkey" not in cli_src and "keygen\", \"-t" not in cli_src
     sshsig = (ROOT / "src" / "forge_node" / "sshsig.py").read_text()
     assert sorted(set(re.findall(r'"(-Y|-lf|-q)"', sshsig))) == ["-Y", "-lf", "-q"] and '"sign"' in sshsig and '"verify"' in sshsig
     assert "-N" not in sshsig and "-t\"" not in sshsig and "keygen\", \"-" not in sshsig

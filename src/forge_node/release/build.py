@@ -102,7 +102,7 @@ def build_release(version: str, profile: str, out_dir: Path, *, src_root: Path, 
     for name, text in sorted(unit_texts.items()):
         files[f"units/{name}"] = (text.encode(), 0o644)
     for nid in policies.nodes_for(profile):
-        files[f"policy/policy-{nid}.json"] = (json.dumps(policies.template(nid), indent=1, sort_keys=True).encode() + b"\n", 0o644)
+        files[f"policy/policy-{nid}.json"] = (json.dumps(policies.template(nid, profile), indent=1, sort_keys=True).encode() + b"\n", 0o644)
     manifest = {"fmt": 1, "release": version, "profile": profile, "switcher_api": switcher_api, "state_min": state_window[0], "state_max": state_window[1], "policy_schema": policy_schema,
                 "units": sorted(unit_texts), "files": {k: _sha(v[0]) for k, v in sorted(files.items())}}
     manifest_raw = json.dumps(manifest, indent=1, sort_keys=True).encode() + b"\n"

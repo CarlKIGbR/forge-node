@@ -264,7 +264,7 @@ def parse_full(raw: bytes, *, expect_node: str, file_serial: int, now: datetime,
             if o.op in ops:
                 _bad(f"duplicate op {o.op}")
             ops[o.op] = o
-    if profile == "t0" and (ops or view.tiers_enabled != (0,) or t3.get("manifests_enabled") or t3.get("opaque_enabled")):
+    if profile == "t0" and (ops or view.tiers_enabled != (0,) or wl or t1.get("vm_pool") or t3.get("manifests_enabled") or t3.get("opaque_enabled")):
         _bad("profile t0 enables tier 0 only")
     if ops and not set(o.tier for o in ops.values()) <= set(view.tiers_enabled):
         _bad("an op is configured for a tier that is not in tiers_enabled")

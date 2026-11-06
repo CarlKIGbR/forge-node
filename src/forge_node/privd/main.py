@@ -23,7 +23,7 @@ from .ledger import Ledger, LedgerError
 from .lease import LeaseStore
 from .optable import build_optable
 from .policy_full import BUILTIN_PROTECTED_PATHS, BUILTIN_PROTECTED_UNITS
-from .policy_store import PolicyStore
+from .policy_store import PolicyStore, release_table_ops
 from .privctl import Ctl
 from .privctl import main as ctl_main
 from .reconcile import recover_all
@@ -90,7 +90,7 @@ def build_context(node: str, agent_user: str = "forgenode") -> Context:
     agent_log = AuditAdmin(agent_spec(gid=pw.pw_gid, trust_anchor="/"), node, now)
     backend = SystemdBackend(systemd_run=trusted_binary("systemd-run"), systemctl=trusted_binary("systemctl"), run=run_process, sleep=time.sleep, monotonic=time.monotonic)
     policies = PolicyStore(policy_dir=PATHS.policy_dir, allowed_signers=PATHS.allowed_signers, serial_file=PATHS.serial_file, node=node, owner_uid=0, ssh_keygen=ssh_keygen, clock=now,
-                           gates_map=gates.GATES, table_ops=table.names, devof=devof, protected_devs=protected_devs)
+                           gates_map=gates.GATES, table_ops=release_table_ops(table, PROFILE), devof=devof, protected_devs=protected_devs)
     leases = LeaseStore(path=PATHS.lease_file, ledger=ledger, node=node, ssh_keygen=ssh_keygen, clock=now, owner_uid=0)
     return Context(node=node, paths=PATHS, clock=now, ledger=ledger, priv_log=priv_log, agent_log=agent_log, backend=backend, optable=table, gates=gates.GATES, ssh_keygen=ssh_keygen,
                    owner_uid=0, agent_uid=pw.pw_uid, policies=policies, leases=leases, argv_for=argv_for, version=full_version(), sleep=time.sleep, monotonic=time.monotonic)

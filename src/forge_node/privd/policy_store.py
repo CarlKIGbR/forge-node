@@ -19,6 +19,16 @@ from .policy_full import FullPolicy, parse_full
 MAX_SERIAL = 999_999_999
 
 
+def release_table_ops(table, build_profile: str) -> Callable[[str], frozenset]:
+    """`table_ops` of the production PolicyStore. A `t0` release has no op code at all, so it can only ever run a `t0` policy: a policy that names profile `full` (forge roots, tier 1/2 ops,
+    tiers > 0 once their gates are met) is refused HERE, whatever else it says - the policy's own profile must not be able to talk a T0-only release into a mode its artifact was built without."""
+    def ops(policy_profile: str) -> frozenset:
+        if build_profile == "t0" and policy_profile != "t0":
+            raise PolicyError("DENY_POLICY_INVALID", f"this release is profile t0: a policy for profile {policy_profile!r} is refused")
+        return table.names(policy_profile)
+    return ops
+
+
 def _stat_key(path: str):
     try:
         st = os.stat(path, follow_symlinks=False)

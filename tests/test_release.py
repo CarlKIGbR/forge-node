@@ -169,7 +169,7 @@ def test_the_build_is_reproducible_and_carries_a_signed_manifest_of_every_file(e
     man = a["manifest"]
     assert man["profile"] == "full" and man["switcher_api"] == SWITCHER_API and set(man["units"]) == set(units.all_units())
     assert set(man["files"]) == {"forge-node.pyz", "bin/privctl", "sbin/forge-node-release", *[f"units/{u}" for u in units.all_units()], "policy/policy-g2.json", "policy/policy-g3.json"}
-    assert {k for k in build.build_release("0.3.0", "t0", env.tmp / "t0", src_root=SRC_ROOT, sign=env.sign())["manifest"]["files"] if k.startswith("policy/")} == {"policy/policy-g1.json", "policy/policy-g4.json"}
+    assert {k for k in build.build_release("0.3.0", "t0", env.tmp / "t0", src_root=SRC_ROOT, sign=env.sign())["manifest"]["files"] if k.startswith("policy/")} == {f"policy/policy-{n}.json" for n in ("g1", "g2", "g3", "g4")}
     # the tar's own signature verifies the way 13.C C2 does it
     sig = Path(str(a["tar"]) + ".sig").read_text()
     assert sshsig.verify(Path(a["tar"]).read_bytes(), sig, sshsig.NS_RELEASE, OWNER_PRINCIPAL, env.signers.read_text(), shutil.which("ssh-keygen"))
@@ -513,8 +513,9 @@ def test_policy_templates_are_valid_once_filled_and_invalid_before(nid):
 
 
 def test_t0_templates_have_no_forge_roots_and_g2_g3_values_match_13d():
-    assert "forge_roots" not in policies.template("g1") and "forge_roots" not in policies.template("g4")
-    r2, r3 = policies.template("g2")["forge_roots"][0], policies.template("g3")["forge_roots"][0]
+    for nid in policies.NODES:                                                              # N5-prep: every host installs t0 (no forge root); the 13.D volume values live on in the `full` template for later T1
+        assert "forge_roots" not in policies.template(nid), nid
+    r2, r3 = policies.template("g2", "full")["forge_roots"][0], policies.template("g3", "full")["forge_roots"][0]
     assert (r2["path"], r2["size_bytes"], r2["min_free_bytes"]) == ("/srv/forge/node", 107374182400, 214748364800)
     assert (r3["path"], r3["size_bytes"], r3["min_free_bytes"]) == ("/var/lib/forge-node/data", 53687091200, 161061273600)
     d = (SRC_ROOT.parent / "docs" / "design" / "FORGE_NODE.md").read_text()
