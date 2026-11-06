@@ -1,0 +1,4 @@
+#!/bin/bash
+# STUB psql (the one the stub docker puts first in PATH): logs argv and stdin of every call.
+{ echo "--- psql argv:"; for a in "$@"; do echo "ARG<$a>"; done; echo "--- stdin:"; [ -t 0 ] || cat; } >> /run/stubs/psql.log
+echo "INSERT 0 1"

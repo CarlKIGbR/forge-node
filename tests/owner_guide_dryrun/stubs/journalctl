@@ -1,0 +1,3 @@
+#!/bin/bash
+# STUB
+echo "-- stub journal: no entries (no systemd in the harness) --"

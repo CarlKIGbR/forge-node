@@ -3,13 +3,14 @@
 Stand: N5-prep rework 1 (Branch `n5prep`, noch NICHT gemergt — die Befehle gelten für den gemergten Stand; `<MAIN_SHA>`/`<OPS_SHA>` stehen in der Merge-Meldung). Alle Blöcke sind Copy-and-paste; jeder `bash`-Block wird in den Tests auf Syntax geprüft.
 **Betriebsleiter-Entscheidung:** alle vier Hosts bekommen vorerst das Profil `t0` (nur Lesen): **kein** forge-root-Volume, **kein** Loop-Volume, **kein** `selftest.noop`-Code, Policy `global_mode: observe`, `tiers_enabled: [0]`. Die Schritte „Loop-Volume" (13.C C3) und die Werte `full`/100 GiB/50 GiB entfallen. `full` bleibt für spätere T1-Schritte im Code (`template(nid, "full")`).
 **Regeln:** pro Server eine SSH-Sitzung die ganze Zeit offen lassen (Rollback-Anker). Nie zwischen 02:00 und 05:45 Berlin, nie sonntags vor 06:00. Reihenfolge **g2 → g3 → g1 → g4** mit ≥ 1 Tag Beobachtung dazwischen; g4 (Live-Trading) zuletzt und nur mit deiner ausdrücklichen Zustimmung. Es wird nichts an sshd, sudoers oder Docker geändert (kein Docker-Neustart).
-**Wie die Blöcke funktionieren:** jeder Block läuft in einer Subshell mit `set -euo pipefail`. Scheitert ein Befehl, endet NUR der Block und es erscheint `== FEHLER`; die SSH-Sitzung bleibt offen (kein `set -e` in deiner Login-Shell). Dann **stoppen und die Betriebsleitung informieren** — den Block nicht „reparieren" und nicht Rechte an `secrets/` o. ä. verbiegen. Der Login in einen Server (`ssh -t -i ~/.ssh/sshcarljump01 carl@<IP>`) steht jeweils im Text; ein Server-Block endet mit `== OK`; erst danach `exit`.
+**Wie die Blöcke funktionieren:** jeder Block ist eine Subshell `( set -euo pipefail … )`, danach prüft eine Zeile `rc=$?` und schreibt `== OK` oder `== FEHLER (rc=…)`. Scheitert ein Befehl, endet NUR der Block; die SSH-Sitzung bleibt offen (kein `set -e` in deiner Login-Shell). Wichtig: die Subshell steht **allein** auf ihrer Zeile — in einer `&&`/`||`-Liste würde bash `set -e` darin ignorieren. Dann **stoppen und die Betriebsleitung informieren** — den Block nicht „reparieren" und nicht Rechte an `secrets/` o. ä. verbiegen. Der Login in einen Server (`ssh -t -i ~/.ssh/sshcarljump01 carl@<IP>`) steht jeweils im Text; ein Server-Block endet mit `== OK`; erst danach `exit`.
 Dateien, die `forge`/`forgenode` anlegen, kann `carl` weder lesen noch löschen (Sticky-/tmp, `secrets/` ist `drwx--S--- forge`): Übergaben laufen deshalb immer über `sudo install … /tmp/…` bzw. `sudo rm`.
 
 Reihenfolge der Teile: **Teil 1** (Mac, einmalig) → **Teil 2** (Release bauen) → **Teil 3** (Hub auf g2; GO an die Betriebsleitung) → **Teil 4** (Firewall 8094 + Boot-Kopie) → **Teil 5** (je Host: g2, g3, g1, g4) → **Teil 6** (Prüfung) → **Teil 7** (Rückgängig).
 
 ## Teil 1 — Mac, einmalig: Owner-Schlüssel und CA (13.A)
 Voraussetzungen auf dem Mac: `ssh-keygen` (OpenSSH ≥ 8.1), `openssl`, **Python ≥ 3.12** (`python3 --version`; sonst `brew install python@3.12` und unten `python3.12` statt `python3`).
+<!-- run: mac -->
 ```bash
 (
 set -euo pipefail
@@ -38,12 +39,14 @@ EOF
 openssl ecparam -name prime256v1 -genkey -noout -out ca/ca.key
 openssl req -x509 -new -key ca/ca.key -sha256 -days 1825 -config ca/ca.cnf -out ca/ca.crt
 openssl x509 -in ca/ca.crt -noout -fingerprint -sha256 -dates
-) && echo "== OK" || echo "== FEHLER: STOP"
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK"; else echo "== FEHLER: STOP (rc=$rc)"; fi
 ```
 Sichern (Offline-Kopie, z. B. verschlüsselter USB-Stick): `~/forge-node-owner/owner_ed25519` und `ca/ca.key`. Ohne sie lässt sich nichts mehr signieren; mit ihnen in falschen Händen schon.
 
 ## Teil 2 — Mac: Release bauen und signieren (je Version)
 Das Release wird auf dem Mac aus genau dem gemergten Commit gebaut; der Schlüssel bleibt dort. `release build` signiert zweimal (Manifest, Tarball): **zweimal Passphrase auf dem Mac-Terminal**. (Alternative mit einer Eingabe: `ssh-add ~/forge-node-owner/owner_ed25519`, dann `--key ~/forge-node-owner/owner_ed25519.pub`.) Die Quelle holt `carl` über `/tmp` (das Repo gehört `forge`).
+<!-- run: mac -->
 ```bash
 (
 set -euo pipefail
@@ -59,12 +62,14 @@ cd src-$VER/fn-src
 PYTHONPATH=src python3 -m forge_node.cli release build $VER t0 --out ~/forge-node-owner/release --key ~/forge-node-owner/owner_ed25519
 # Erwartet: tar:/sig:/sha256:/signer: ; "signer: SHA256:..." == Fingerabdruck aus A1; "both signatures verified locally"
 ls -l ~/forge-node-owner/release/
-) && echo "== OK" || echo "== FEHLER: STOP"
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK"; else echo "== FEHLER: STOP (rc=$rc)"; fi
 ```
 Das t0-Release enthält die Policy-Vorlagen für **alle vier** Hosts (`policy/policy-g1…g4.json`, jeweils `profile: t0`, `observe`, `tiers_enabled: [0]`, ohne `forge_roots`).
 
 ## Teil 3 — Hub auf g2 (13.B; einmalig)
 **3.1 Owner: Schlüssel auf g2 erzeugen** (Hub-Server-Schlüssel + Gate-Schlüssel bleiben auf g2; nur die Public-Teile gehen zum Mac). Login: `ssh -t -i ~/.ssh/sshcarljump01 carl@192.168.10.4`, dann auf carlgpu2:
+<!-- run: host -->
 ```bash
 (
 set -euo pipefail
@@ -79,9 +84,11 @@ test "$(sudo stat -c '%a %U:%G' $S/hub.key $S/gate_ed25519 | sort -u)" = "600 fo
 sudo install -m 0644 -o "$(id -un)" $S/hub.csr /tmp/hub.csr
 sudo install -m 0644 -o "$(id -un)" $S/gate_ed25519.pub /tmp/hub_gate_ed25519.pub
 ls -l /tmp/hub.csr /tmp/hub_gate_ed25519.pub
-) && echo "== OK" || echo "== FEHLER: STOP"
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK"; else echo "== FEHLER: STOP (rc=$rc)"; fi
 ```
 **3.2 Mac: Hub-Zertifikat signieren, zurückspielen.**
+<!-- run: mac -->
 ```bash
 (
 set -euo pipefail
@@ -95,45 +102,54 @@ openssl x509 -in issued/hub.crt -noout -subject -enddate; openssl x509 -in issue
 scp -i ~/.ssh/sshcarljump01 issued/hub.crt ca/ca.crt carl@192.168.10.4:/tmp/
 ssh -t -i ~/.ssh/sshcarljump01 carl@192.168.10.4 \
   'sudo install -m 0644 -o forge -g forgebox /tmp/hub.crt /tmp/ca.crt /srv/forge/work/forge-core/secrets/nodehub/ && rm -f /tmp/hub.crt /tmp/ca.crt && sudo ls -l /srv/forge/work/forge-core/secrets/nodehub/'
-) && echo "== OK" || echo "== FEHLER: STOP"
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK"; else echo "== FEHLER: STOP (rc=$rc)"; fi
 ```
 Erwartet in der letzten Ausgabe: `hub.key` und `gate_ed25519` `-rw------- forge forgebox`, `hub.crt`/`ca.crt`/`gate_ed25519.pub` `-rw-r--r-- forge forgebox`.
 **3.3 GO an die Betriebsleitung:** „Hub-Deploy freigeben" (den fertigen GO-Text liefert N5PREP_REPORT.md). Sie baut das Image, legt Rolle und Schema an, migriert und startet NUR den Hub (Port 8094 nur auf 192.168.10.4). Das Ergebnis (`/healthz` ok, Container healthy) abwarten, bevor Teil 4 beginnt.
 
 ## Teil 4 — Firewall 8094 (forge-ops, nach dem Merge; mit 5-Minuten-Timer)
-Der `--hub`-Regelsatz ist von den Edge-Regeln (443/8443) getrennt: 8094 auf 192.168.10.4 nur aus 192.168.10.0/29 und 192.168.30.0/29, nie aus dem VPN, sonst DROP. **Jeder Regel-Aufruf braucht `--hub`.** Zwischen Hub-Start (Teil 3.3) und diesem Teil ist 8094 nur auf der LAN-IP offen und verlangt ein Client-Zertifikat deiner CA (mTLS): das Fenster kurz halten.
+Der `--hub`-Regelsatz ist von den Edge-Regeln (443/8443) getrennt: 8094 auf 192.168.10.4 nur aus 192.168.10.0/29 und 192.168.30.0/29, nie aus dem VPN, sonst DROP. **Jeder Regel-Aufruf braucht `--hub`.** Zwischen Hub-Start (Teil 3.3) und diesem Teil ist 8094 nur auf der LAN-IP offen und verlangt ein Client-Zertifikat deiner CA (mTLS): das Fenster kurz halten. **Restfenster beim Reboot von g2:** Docker startet den Hub (`restart: unless-stopped`) einige Sekunden vor der Unit, die die Hub-Regeln wiederherstellt; scheitert dieser Restore, ist 8094 (nur mTLS davor) offen und die Unit meldet es auf stderr. Darum g2 nach der Installation nur nach Absprache mit der Betriebsleitung neu starten.
 **Boot-Kopie:** beim Reboot führt `forge-docker-user.service` die ROOT-Kopie `/usr/local/sbin/forge-docker-user.sh --restore` aus, nicht das Repo-Script. Ohne Schritt 4.1 käme der Hub-Port nach einem Reboot OHNE Regeln zurück (aus jedem Netz, auch VPN, offen). Darum verweigern `--hub` und `--confirm --hub` ohne identische Boot-Kopie (Exit 1, nichts geändert). Login: `ssh -t -i ~/.ssh/sshcarljump01 carl@192.168.10.4`, dann auf carlgpu2:
 **4.1 Boot-Kopie erneuern (ändert keine Regeln, startet nichts):**
+<!-- run: host -->
 ```bash
 (
 set -euo pipefail
 FW=/srv/forge/work/forge-ops/bin/forge-docker-user.sh
-sudo git -C /srv/forge/work/forge-ops log -1 --format='forge-ops: %H %s'        # == <OPS_SHA> aus der Merge-Meldung
+sudo -u forge git --no-pager -C /srv/forge/work/forge-ops log -1 --format='forge-ops: %H %s'        # == <OPS_SHA> aus der Merge-Meldung
 sudo $FW --dry-run --install-unit               # nur ansehen: install → /usr/local/sbin, 2 Units, daemon-reload, enable (kein Start)
 sudo $FW --install-unit
-sudo cmp $FW /usr/local/sbin/forge-docker-user.sh && echo "Boot-Kopie identisch"
+sudo cmp $FW /usr/local/sbin/forge-docker-user.sh
+echo "Boot-Kopie identisch"
 grep -c -- '--hub' /usr/local/sbin/forge-docker-user.sh
 sudo $FW --dry-run --hub                        # 3 iptables-Zeilen (2x ACCEPT /29, 1x DROP), Timer-Zeile "--remove --hub", "# 0. Boot-Kopie ... ok"
-) && echo "== OK" || echo "== FEHLER: STOP"
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK"; else echo "== FEHLER: STOP (rc=$rc)"; fi
 ```
 **4.2 Anwenden** (der Timer rollt in 300 s zurück, solange du nicht bestätigst):
+<!-- run: host -->
 ```bash
 (
 set -euo pipefail
 sudo /srv/forge/work/forge-ops/bin/forge-docker-user.sh --hub
 sudo iptables -S DOCKER-USER | grep -c forge-nodehub        # 3
-curl -s --cacert /srv/forge/work/forge-core/secrets/nodehub/ca.crt https://192.168.10.4:8094/healthz        # {"ok":true,...}  (Hinweis: dieser Aufruf von g2 aus läuft NICHT durch DOCKER-USER, er beweist die Regel nicht)
-) && echo "== OK: jetzt die Tests unten (aus dem /29 von g3 und von ausserhalb), dann 4.3" || echo "== FEHLER: STOP (Timer rollt zurück)"
+sudo curl -s --cacert /srv/forge/work/forge-core/secrets/nodehub/ca.crt https://192.168.10.4:8094/healthz        # {"ok":true,...}  (`sudo`: `secrets/` ist für carl nicht lesbar. Hinweis: dieser Aufruf von g2 aus läuft NICHT durch DOCKER-USER, er beweist die Regel nicht)
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK: jetzt die Tests unten (aus dem /29 von g3 und von ausserhalb), dann 4.3"; else echo "== FEHLER: STOP (Timer rollt zurück) (rc=$rc)"; fi
 ```
 Tests (andere Sitzung, Mac): aus dem Netz 192.168.30.0/29 muss es gehen, von ausserhalb (VPN 10.200.0.0/29 / ein Gerät dort) nicht.
+<!-- run: mac -->
 ```bash
 (
 set -euo pipefail
-ssh -i ~/.ssh/sshcarljump01 carl@192.168.30.3 'openssl s_client -connect 192.168.10.4:8094 -brief </dev/null 2>&1 | head -3'      # CONNECTION ESTABLISHED
-) && echo "== OK" || echo "== FEHLER: Router-Regel TCP/8094 von 192.168.30.0/29 nötig (Owner) — NICHT bestätigen, der Timer rollt zurück"
+ssh -i ~/.ssh/sshcarljump01 carl@192.168.30.3 'openssl s_client -connect 192.168.10.4:8094 -brief </dev/null 2>&1 | grep -q "CONNECTION ESTABLISHED"'      # Exit 0 nur bei CONNECTION ESTABLISHED
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK"; else echo "== FEHLER: Router-Regel TCP/8094 von 192.168.30.0/29 nötig (Owner) — NICHT bestätigen, der Timer rollt zurück (rc=$rc)"; fi
 # Mac über VPN?  Dann muss dies nach ~5 s mit Timeout/Fehler scheitern:   nc -z -w 5 192.168.10.4 8094; echo "rc=$?"    (rc≠0 erwartet)
 ```
 **4.3 Bestätigen** (innerhalb der 5 Minuten) **und Boot-Nachweis:**
+<!-- run: host -->
 ```bash
 (
 set -euo pipefail
@@ -141,7 +157,8 @@ sudo /srv/forge/work/forge-ops/bin/forge-docker-user.sh --confirm --hub
 sudo iptables -S DOCKER-USER | grep forge-nodehub
 n=$(sudo /usr/local/sbin/forge-docker-user.sh --dry-run --restore | grep -c '^iptables -I.*forge-nodehub' || true)
 [ "$n" = 3 ] && echo "Boot-Pfad (Root-Kopie --restore) legt die 3 Hub-Regeln wieder an" || { echo "BOOT-PFAD OHNE HUB-REGELN - Betriebsleitung"; false; }
-) && echo "== OK" || echo "== FEHLER: STOP"
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK"; else echo "== FEHLER: STOP (rc=$rc)"; fi
 ```
 
 ## Teil 5 — je Host (g2 → g3 → g1 → g4)
@@ -156,6 +173,7 @@ Werte (alle `t0`, kein Volume):
 | Danach warten | 1 Tag | 1 Tag | 1 Tag | — |
 
 **5.1 Mac: `fn.env` für den Host** (Beispiel g2 — für jeden Host nur `NID` und `IP` ändern); der Block endet mit dem Login auf dem Server.
+<!-- run: mac -->
 ```bash
 (
 set -euo pipefail
@@ -172,9 +190,11 @@ EOF
 set -a; . ./fn.env; set +a
 test -f release/forge-node-$VER-$PROFILE.tar.sig
 scp -i ~/.ssh/sshcarljump01 fn.env release/forge-node-$VER-$PROFILE.tar release/forge-node-$VER-$PROFILE.tar.sig allowed_signers carl@$IP:/tmp/
-) && ssh -t -i ~/.ssh/sshcarljump01 carl@$(sed -n 's/^IP=//p' ~/forge-node-owner/fn.env) || echo "== FEHLER: STOP"
+)
+rc=$?; if [ $rc = 0 ]; then ssh -t -i ~/.ssh/sshcarljump01 carl@$(sed -n 's/^IP=//p' ~/forge-node-owner/fn.env); else echo "== FEHLER (rc=$rc): STOP"; fi
 ```
 **5.2 Server, Segment 1** (Sitzung offen lassen): Vorprüfung, Evidenz vorher, Release prüfen, Benutzer/Verzeichnisse, Release-Baum, Node-Schlüssel.
+<!-- run: host -->
 ```bash
 (
 set -euo pipefail
@@ -193,7 +213,7 @@ ls /etc/sudoers.d/ | grep -i forge || echo "kein forge-sudoers (erwartet: für i
 # Evidenz vorher (KMU/Trading dürfen sich durch die Installation nicht ändern); als Datei, damit sie in jeder späteren Shell da ist
 cat > /var/tmp/fn-ev.sh <<'EOT'
 ev() { systemctl list-units 'kmu-*' 'tradebot-*' 'secmpro*' --all --no-legend | awk '{print $1,$3,$4}'; echo "--- docker"; sudo docker ps -a --format '{{.Names}} {{.Image}}' | sort
-       echo "--- git/mtime"; git -C /opt/kmu-ai rev-parse HEAD 2>&1 || true; stat -c '%n %Y' /opt/kmu-ai /srv/models 2>&1 || true; echo "--- listeners"; ss -tlnH | awk '{print $4}' | sort; }
+       echo "--- git/mtime"; if [ -d /opt/kmu-ai ]; then sudo -u "$(stat -c %U /opt/kmu-ai)" git -C /opt/kmu-ai rev-parse HEAD 2>&1 || true; else echo "kein /opt/kmu-ai"; fi; stat -c '%n %Y' /opt/kmu-ai /srv/models 2>&1 || true; echo "--- listeners"; ss -tlnH | awk '{print $4}' | sort; }
 EOT
 . /var/tmp/fn-ev.sh; ev > /var/tmp/fn-ev-before-$NID.txt; wc -l /var/tmp/fn-ev-before-$NID.txt
 
@@ -226,9 +246,11 @@ ls -l /opt/forge-node/current /etc/systemd/system | grep forge-node; sudo ls -l 
 sudo -u forgenode sh -c 'umask 077; openssl ecparam -name prime256v1 -genkey -noout -out /etc/forge-node/pki/node.key'
 sudo -u forgenode sh -c 'umask 022; openssl req -new -key /etc/forge-node/pki/node.key -subj "/CN=forge-node-'"$NID"'" -out /tmp/'"$NID"'.csr'
 ls -l /tmp/$NID.csr
-) && echo "== OK (jetzt: exit)" || echo "== FEHLER: STOP, Sitzung offen lassen"
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK (jetzt: exit)"; else echo "== FEHLER: STOP, Sitzung offen lassen (rc=$rc)"; fi
 ```
 **5.3 Mac: Zertifikat und Policy signieren.**
+<!-- run: mac -->
 ```bash
 (
 set -euo pipefail
@@ -248,9 +270,11 @@ grep -q '"profile": "t0"' policy/policy-$NID.json && grep -q '"global_mode": "ob
 less policy/policy-$NID.json                                      # einmal ganz lesen (q beendet)
 ( cd src-$VER/fn-src && PYTHONPATH=src python3 -m forge_node.cli release sign ~/forge-node-owner/policy/policy-$NID.json --key ~/forge-node-owner/owner_ed25519 --namespace forge-node-policy )
 scp -i ~/.ssh/sshcarljump01 issued/$NID.crt ca/ca.crt policy/policy-$NID.json policy/policy-$NID.json.sig carl@$IP:/tmp/
-) && ssh -t -i ~/.ssh/sshcarljump01 carl@$(sed -n 's/^IP=//p' ~/forge-node-owner/fn.env) || echo "== FEHLER: STOP"
+)
+rc=$?; if [ $rc = 0 ]; then ssh -t -i ~/.ssh/sshcarljump01 carl@$(sed -n 's/^IP=//p' ~/forge-node-owner/fn.env); else echo "== FEHLER (rc=$rc): STOP"; fi
 ```
 **5.4 Server, Segment 2** (neue Shell ⇒ `fn.env` wieder laden). Der Agent wird nur gestartet, wenn `doctor` mit 0 endet.
+<!-- run: host -->
 ```bash
 (
 set -euo pipefail
@@ -268,10 +292,12 @@ sudo systemctl status forge-node-agent.service forge-node-privd.socket --no-page
 rm -f /tmp/forge-node-$VER-$PROFILE.tar /tmp/forge-node-$VER-$PROFILE.tar.sig /tmp/allowed_signers /tmp/$NID.crt /tmp/ca.crt /tmp/policy-$NID.json /tmp/policy-$NID.json.sig
 sudo rm -f /tmp/$NID.csr                                           # gehört forgenode
 rm -f /tmp/fn.env
-) && echo "== OK (jetzt: exit)" || echo "== FEHLER: STOP, Sitzung offen lassen (fn.env bleibt in /tmp)"
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK (jetzt: exit)"; else echo "== FEHLER: STOP, Sitzung offen lassen (fn.env bleibt in /tmp) (rc=$rc)"; fi
 ```
 Solange der Host noch nicht registriert ist (5.5), antwortet der Hub dem Agenten mit 403: im Journal erwartbar. `doctor` prüft hier nur `/healthz` (Pin, TLS) — „hub: ok" beweist die Registrierung NICHT; den Beweis liefert `last_seen` in Teil 6.
 **5.5 Registrierung des Hosts (statt Cockpit /nodes — die Seite existiert noch nicht, sie kommt mit N7).** Der Hub schreibt `status`/`cert_sha256` nie selbst; die Zeile legt der Owner in `node.nodes` an, nachdem er den Fingerabdruck verglichen hat. **Profil `t0`**: es ist in der Tabelle unveränderlich — ein späterer Wechsel auf `full` braucht eine neue Registrierung (neuer Eintrag).
+<!-- run: mac -->
 ```bash
 (
 set -euo pipefail
@@ -281,33 +307,40 @@ printf "%s" "$FP" | grep -Eq '^[0-9a-f]{64}$' || { echo "FINGERABDRUCK UNGUELTIG
 printf "SET ROLE forge_core;\nINSERT INTO node.nodes (node_id, profile, status, cert_sha256) VALUES ('%s','t0','active','%s');\nSELECT node_id, profile, status, left(cert_sha256,12) AS fp FROM node.nodes ORDER BY node_id;\n" "$NID" "$FP" > register-$NID.sql
 cat register-$NID.sql                                              # lesen
 scp -i ~/.ssh/sshcarljump01 register-$NID.sql carl@192.168.10.4:/tmp/
-ssh -t -i ~/.ssh/sshcarljump01 carl@192.168.10.4 "sudo docker exec -i forge-postgres-1 sh -c 'psql -v ON_ERROR_STOP=1 -U \"\$POSTGRES_USER\" -d forge' < /tmp/register-$NID.sql; rm -f /tmp/register-$NID.sql"
+ssh -t -i ~/.ssh/sshcarljump01 carl@192.168.10.4 "sudo docker exec -i forge-postgres-1 sh -c 'psql -v ON_ERROR_STOP=1 -U \"\$POSTGRES_USER\" -d forge' < /tmp/register-$NID.sql && rm -f /tmp/register-$NID.sql"
 # Zertifikat erneuert (alle 90 Tage)?  UPDATE node.nodes SET cert_sha256='<neu>' WHERE node_id='<NID>';  (gleiche Technik)
-) && echo "== OK" || echo "== FEHLER: STOP"
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK"; else echo "== FEHLER: STOP (rc=$rc)"; fi
 ```
 Die Policy ist `global_mode: observe`: es verändert sich nichts, Runde 0 (§14) beginnt.
 
 ## Teil 6 — Prüfung je Host (~2 Minuten nach 5.5)
 Auf dem Host (Login wie in 5.1; `NID` auf den geprüften Host setzen):
+<!-- run: host -->
 ```bash
 (
 set -euo pipefail
 NID=g2                                          # der Host, den du gerade prüfst (g2|g3|g1|g4)
 sudo systemctl is-active forge-node-privd.socket forge-node-agent.service forge-node-audit-rotate.timer      # 3x active
-sudo /opt/forge-node/current/bin/privctl status && sudo /opt/forge-node/current/bin/privctl audit-verify         # Policy-Serial 1, observe; Ketten gültig
-sudo -u forgenode env FORGE_NODE_NODE_ID=$NID /usr/bin/python3 -I /opt/forge-node/current/forge-node.pyz doctor && echo "doctor exit 0"
+sudo /opt/forge-node/current/bin/privctl status                 # Policy-Serial 1, observe
+sudo /opt/forge-node/current/bin/privctl audit-verify           # Ketten gültig
+sudo -u forgenode env FORGE_NODE_NODE_ID=$NID /usr/bin/python3 -I /opt/forge-node/current/forge-node.pyz doctor
+echo "doctor exit 0"
 sudo journalctl -u forge-node-agent.service -n 30 --no-pager                  # keine Fehler-Schleife (403 nur VOR 5.5)
 if ls /etc/sudoers.d/ | grep -qi forge; then echo "forge-sudoers gefunden"; false; fi; echo "kein forge-sudoers (richtig)"
 . /var/tmp/fn-ev.sh; ev > /var/tmp/fn-ev-after-$NID.txt
 diff /var/tmp/fn-ev-before-$NID.txt /var/tmp/fn-ev-after-$NID.txt && echo "EVIDENZ UNVERAENDERT" || echo "Differenz oben einzeln bewerten (Container/mtimes ändern sich auch ohne uns); entscheidend: nichts mit kmu-/tradebot-/secmpro-Bezug, kein neuer Listener ausser 8094 auf g2"
-) && echo "== OK" || echo "== FEHLER: STOP"
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK"; else echo "== FEHLER: STOP (rc=$rc)"; fi
 ```
 Hub-Seite (vom Mac, für JEDEN Host): `last_seen` jünger als 2 Minuten und `policy_serial` 1 beweisen die Registrierung und den laufenden Agenten:
+<!-- run: mac -->
 ```bash
 (
 set -euo pipefail
 ssh -t -i ~/.ssh/sshcarljump01 carl@192.168.10.4 "sudo docker exec -i forge-postgres-1 sh -c 'psql -U \"\$POSTGRES_USER\" -d forge -c \"SELECT node_id, profile, status, policy_serial, now() - last_seen AS seit FROM node.nodes ORDER BY 1\"'"
-) && echo "== OK" || echo "== FEHLER: STOP"
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK"; else echo "== FEHLER: STOP (rc=$rc)"; fi
 ```
 Nach g1/g3/g4 gilt zusätzlich: in der `diff`-Ausgabe darf bei „listeners" nichts Neues stehen (kein neuer Listener).
 
@@ -318,6 +351,7 @@ Nach g1/g3/g4 gilt zusätzlich: in der `diff`-Ausgabe darf bei „listeners" nic
 4. **Host beim Hub widerrufen:** `UPDATE node.nodes SET status='revoked' WHERE node_id='<NID>';` (Technik wie 5.5, `SET ROLE forge_core;` voran).
 5. **Release zurück:** `sudo /usr/local/sbin/forge-node-release status`, dann `check <ALTVER>` und `switch <ALTVER>` (vor dem ersten Wechsel gibt es keine alte Version: dann Stufe 6).
 6. **Host vollständig deinstallieren** (t0: kein Volume, nichts zu behalten außer dem Audit-Archiv). Die Audit-Logs liegen als `<Verz>/<Präfix>.NNNNNN/<Präfix>.NNNNNN.jsonl`, live mit `+a`, versiegelt mit `+a +i`; das priv-Verzeichnis (0750 root:forgenode) kann `carl` nicht auflisten — deshalb `sudo find`. Login auf dem Host, dann:
+<!-- run: host -->
 ```bash
 (
 set -euo pipefail
@@ -341,7 +375,8 @@ if id forgenode >/dev/null 2>&1; then echo "Benutzer forgenode existiert noch"; 
 if systemctl list-unit-files --no-legend 'forge-node-*' | grep -q .; then echo "Units noch da"; false; fi
 . /var/tmp/fn-ev.sh; ev > /var/tmp/fn-ev-after-uninstall-$NID.txt
 diff /var/tmp/fn-ev-before-$NID.txt /var/tmp/fn-ev-after-uninstall-$NID.txt && echo "EVIDENZ UNVERAENDERT" || echo "Differenz einzeln bewerten (vor Tagen aufgenommen; Container/mtimes driften auch ohne uns)"
-) && echo "== OK: deinstalliert" || echo "== FEHLER: unvollständig - Ausgabe an die Betriebsleitung, nichts von Hand 'nachbessern'"
+)
+rc=$?; if [ $rc = 0 ]; then echo "== OK: deinstalliert"; else echo "== FEHLER: unvollständig - Ausgabe an die Betriebsleitung, nichts von Hand 'nachbessern' (rc=$rc)"; fi
 ```
 7. **Hub (nur g2):** Container stoppen/entfernen (`docker compose … rm -sf forge-nodehub`, Betriebsleitung) und `sudo /srv/forge/work/forge-ops/bin/forge-docker-user.sh --remove --hub` (entfernt die Hub-Regeln und die Bestätigungsmarke; die Boot-Kopie bleibt, sie ist rückwärtskompatibel). Das Schema `node` bleibt (enthält das Audit-Archiv der Hub-Seite); löschen nur auf ausdrückliche Anweisung.
 Eine offene Root-SSH-Sitzung ist der Anker: es gibt keine sudoers-Änderung, ein Fehler kann `sudo` nicht aussperren.

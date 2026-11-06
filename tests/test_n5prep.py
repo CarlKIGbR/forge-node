@@ -487,12 +487,23 @@ def _guide_text() -> str:
     return GUIDE.read_text()
 
 
-def test_every_guide_block_is_a_subshell_with_set_e_so_a_failure_stops_the_block_not_the_session():
+def test_every_guide_block_is_a_standalone_subshell_with_set_e_and_an_rc_check():
+    """`( set -e … ) && x` would make bash IGNORE set -e inside the subshell (found by the dry-run harness): the subshell stands alone, the verdict is read from $? on the next line."""
     for i, b in enumerate(_guide_blocks()):
-        lines = b.splitlines()
+        lines = [l for l in b.splitlines() if not l.startswith("#")]
         assert lines[0] == "(" and lines[1] == "set -euo pipefail", (i, lines[:2])
-        tail = [l for l in lines if not l.startswith("#")][-1]
-        assert tail.startswith(") &&"), (i, tail)                                         # FEHLER branch prints; the login shell never gets `set -e`
+        assert lines[-2] == ")" and lines[-1].startswith("rc=$?; if [ $rc = 0 ]; then"), (i, lines[-2:])
+        assert not any(l.startswith(") &&") or l.startswith(") ||") for l in lines), i
+
+
+def test_a_failing_command_really_stops_a_guide_block():
+    """The mechanism itself: with the guide's wrapper a failure ends the block before the next command and reports FEHLER; the `) && …` form that rework 1 used does not."""
+    good = '(\nset -euo pipefail\nfalse\necho NACH_FEHLER\n)\nrc=$?; if [ $rc = 0 ]; then echo "== OK"; else echo "== FEHLER (rc=$rc)"; fi\n'
+    r = subprocess.run(["bash", "-c", good], capture_output=True, text=True)
+    assert "NACH_FEHLER" not in r.stdout and "== FEHLER (rc=1)" in r.stdout and "== OK" not in r.stdout
+    old = '(\nset -euo pipefail\nfalse\necho NACH_FEHLER\n) && echo "== OK" || echo "== FEHLER"\n'
+    r = subprocess.run(["bash", "-c", old], capture_output=True, text=True)
+    assert "NACH_FEHLER" in r.stdout and "== OK" in r.stdout                                          # the trap: set -e is ignored in an && list
 
 
 def test_files_owned_by_other_users_are_never_read_from_secrets_or_removed_by_carl():

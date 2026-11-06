@@ -1,0 +1,6 @@
+#!/bin/bash
+# STUB: "ssh carl@<any host>" is the local user carl (same permissions as on the host: sudo, no forgebox). Options are skipped; no command = interactive login, which the harness replaces by running the host blocks as carl.
+echo "ssh $*" >> /run/stubs/calls.log
+while [ $# -gt 0 ]; do case $1 in -t|-tt|-T|-q) shift;; -i|-o|-p) shift 2;; carl@*) shift; break;; *) shift;; esac; done
+[ $# -eq 0 ] && { echo "(interactive login skipped by the harness)"; exit 0; }
+exec sudo -n -u carl -H bash -c "$1"

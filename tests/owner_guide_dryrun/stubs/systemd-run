@@ -1,0 +1,6 @@
+#!/bin/bash
+# STUB: records the call; a --unit with --on-active gets an "active" timer so that forge-docker-user.sh can verify its rollback timer.
+echo "systemd-run $*" >> /run/stubs/calls.log; mkdir -p /run/stubs/sc/active
+for a in "$@"; do case $a in --unit=*) u=${a#--unit=};; esac; done
+[ -n "${u:-}" ] && touch "/run/stubs/sc/active/$u.timer"
+exit 0

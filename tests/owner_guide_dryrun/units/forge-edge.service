@@ -1,0 +1,16 @@
+[Unit]
+Description=Forge Edge (Caddy + oauth2-proxy) - startet nur hinter der Firewall-Unit
+Requires=forge-docker-user.service docker.service
+After=forge-docker-user.service docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=forge
+Group=forgebox
+WorkingDirectory=/srv/forge/work/forge-edge
+ExecStart=/usr/bin/docker compose -p forge-edge up -d --wait --wait-timeout 90
+ExecStop=/usr/bin/docker compose -p forge-edge stop
+
+[Install]
+WantedBy=multi-user.target

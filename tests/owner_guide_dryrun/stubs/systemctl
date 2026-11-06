@@ -1,0 +1,22 @@
+#!/bin/bash
+# STUB: no systemd in the container. Keeps enable/active state in /run/stubs/sc, performs `link`/`disable` on /etc/systemd/system like systemd does, starts a real privd for forge-node-privd.socket.
+mkdir -p /run/stubs/sc/enabled /run/stubs/sc/active; echo "systemctl $*" >> /run/stubs/calls.log
+now=0; args=()
+for a in "$@"; do case $a in --now) now=1;; --no-pager|--no-legend|--plain|--all|-q|--quiet|--no-ask-password) ;; *) args+=("$a");; esac; done
+cmd=${args[0]:-}; rest=("${args[@]:1}")
+start() { touch "/run/stubs/sc/active/$1"; [ "$1" = forge-node-privd.socket ] && [ ! -e /run/stubs/privd.pid ] && /usr/local/bin/stub-socket-activate; return 0; }
+case $cmd in
+  link) for f in "${rest[@]}"; do ln -sf "$f" "/etc/systemd/system/$(basename "$f")"; done ;;
+  daemon-reload|reset-failed|mask|unmask) ;;
+  enable) for u in "${rest[@]}"; do touch "/run/stubs/sc/enabled/$u"; [ $now = 1 ] && start "$u"; done ;;
+  disable) for u in "${rest[@]}"; do rm -f "/run/stubs/sc/enabled/$u" "/etc/systemd/system/$u"; [ $now = 1 ] && rm -f "/run/stubs/sc/active/$u"; done ;;
+  start) for u in "${rest[@]}"; do start "$u"; done ;;
+  stop) for u in "${rest[@]}"; do rm -f "/run/stubs/sc/active/$u"; done ;;
+  is-active) rc=0; for u in "${rest[@]}"; do if [ -e "/run/stubs/sc/active/$u" ]; then echo active; else echo inactive; rc=3; fi; done; exit $rc ;;
+  list-unit-files) pat=${rest[0]:-*}; for f in /etc/systemd/system/$pat; do [ -e "$f" ] || [ -L "$f" ] || continue; echo "$(basename "$f") enabled enabled"; done; exit 0 ;;
+  list-units) echo "kmu-sicherung-system.service loaded inactive dead"; echo "tradebot-live.service loaded active running" ;;
+  status) for u in "${rest[@]}"; do echo "● $u - stub"; echo "   Active: $([ -e /run/stubs/sc/active/$u ] && echo 'active (running)' || echo inactive)"; done ;;
+  show|cat) ;;
+  *) ;;
+esac
+exit 0

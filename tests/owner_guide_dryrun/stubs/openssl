@@ -1,0 +1,4 @@
+#!/bin/bash
+# STUB wrapper: `openssl s_client` has no hub to talk to; everything else is the real openssl.
+if [ "${1:-}" = s_client ]; then echo "openssl s_client $*" >> /run/stubs/calls.log; echo "CONNECTION ESTABLISHED"; echo "Protocol version: TLSv1.3"; exit 0; fi
+exec /usr/bin/openssl.real "$@"

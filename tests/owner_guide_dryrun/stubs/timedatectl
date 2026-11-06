@@ -1,0 +1,3 @@
+#!/bin/bash
+# STUB
+echo "                Time zone: Europe/Berlin (CET, +0100)"; echo "System clock synchronized: yes"

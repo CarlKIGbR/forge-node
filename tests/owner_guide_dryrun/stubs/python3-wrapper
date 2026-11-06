@@ -1,0 +1,13 @@
+#!/bin/bash
+# STUB wrapper around python3: `forge-node.pyz doctor` needs real systemd (it proves every probe inside its transient unit), so in the harness doctor is replaced by a permission check
+# (runs as forgenode? pyz/key/cert/CA/policy readable for forgenode?) and the verdict from /run/stubs/doctor_rc (default 0). Every other python3 call is the real interpreter.
+n=$#; args=("$@")
+if [ "$n" -ge 2 ] && [ "${args[$((n-1))]}" = doctor ] && [[ "${args[$((n-2))]}" == */forge-node.pyz ]]; then
+  [ "$(id -un)" = forgenode ] || { echo "doctor (harness): must run as forgenode, is $(id -un)" >&2; exit 1; }
+  for f in "${args[$((n-2))]}" /etc/forge-node/pki/node.key /etc/forge-node/pki/node.crt /etc/forge-node/pki/ca.crt; do [ -r "$f" ] || { echo "doctor (harness): $f not readable for forgenode" >&2; exit 1; }; done
+  [ -d /etc/forge-node/policy ] || { echo "doctor (harness): no policy dir" >&2; exit 1; }
+  rc=$(cat /run/stubs/doctor_rc 2>/dev/null || echo 0)
+  echo '{"check": "hub", "detail": "STUBBED doctor (no systemd in the harness)", "status": "ok"}'; echo "{\"doctor\": \"STUB rc=$rc\"}"
+  exit "$rc"
+fi
+exec /usr/bin/python3.12 "$@"

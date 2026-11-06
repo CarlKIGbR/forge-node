@@ -1,0 +1,9 @@
+#!/bin/bash
+# STUB: no Docker daemon. `docker exec -i <c> sh -c SCRIPT` runs SCRIPT with POSTGRES_USER=forge and a logging psql stub; `docker ps` prints a fixed list.
+echo "docker $*" >> /run/stubs/calls.log
+case "$1" in
+  ps) echo "forge-postgres-1 pgvector"; echo "forge-core-forge-planner-1 forge-core/planner" ;;
+  exec) shift; [ "$1" = -i ] && shift; shift; [ "$1" = sh ] && [ "$2" = -c ] && POSTGRES_USER=forge PATH=/usr/local/stub-psql:$PATH sh -c "$3" ;;
+  *) ;;
+esac
+exit 0

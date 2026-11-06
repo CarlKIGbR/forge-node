@@ -1,0 +1,14 @@
+[Unit]
+Description=Forge Edge: DOCKER-USER-Firewall-Regeln wiederherstellen (nur wenn vom Owner bestaetigt)
+Requires=docker.service
+After=docker.service network-online.target
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Root-eigene Kopie (--install-unit): kein vom Benutzer forge beschreibbarer Code im Boot-Pfad
+ExecStart=/usr/local/sbin/forge-docker-user.sh --restore
+
+[Install]
+WantedBy=multi-user.target

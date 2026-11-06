@@ -1,0 +1,18 @@
+#!/bin/bash
+# STUB: rule list in /run/stubs/ipt (one rule spec per line), -C/-D/-I/-S/-n -L behave like the real thing for the rules forge-docker-user.sh manages.
+S=/run/stubs/ipt; touch $S; echo "iptables $*" >> /run/stubs/calls.log
+[ "$1" = -n ] && exit 0
+c=$1; shift; chain=$1; shift
+case $c in
+  -S) echo "-N $chain"; sed "s/^/-A $chain /" $S ;;
+  -C) grep -qxF -- "$*" $S ;;
+  -I) [ "$1" -ge 1 ] 2>/dev/null && shift; printf '%s\n' "$*" >> $S ;;
+  -D) python3 - "$S" "$*" <<'PY'
+import sys
+p, spec = sys.argv[1], sys.argv[2]
+L = open(p).read().splitlines()
+if spec in L: L.remove(spec)
+open(p, "w").write("\n".join(L) + ("\n" if L else ""))
+PY
+  ;;
+esac

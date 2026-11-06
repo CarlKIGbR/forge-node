@@ -1,0 +1,3 @@
+#!/bin/bash
+# STUB: no pager in a non-interactive run
+exec cat "$@"

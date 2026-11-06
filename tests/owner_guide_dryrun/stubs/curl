@@ -1,0 +1,5 @@
+#!/bin/bash
+# STUB: no hub in the harness. Behaves like curl on the points the guide depends on: an unreadable --cacert file is exit 77 (as for the real curl); otherwise the hub's /healthz answer.
+echo "curl $*" >> /run/stubs/calls.log
+while [ $# -gt 0 ]; do case $1 in --cacert) shift; [ -r "$1" ] || { echo "curl: (77) error setting certificate file: $1" >&2; exit 77; } ;; esac; shift; done
+echo '{"hub":"forge-nodehub","ok":true,"protocol":1,"version":"0.1.0"}'

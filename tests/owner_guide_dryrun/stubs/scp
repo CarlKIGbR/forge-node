@@ -1,0 +1,15 @@
+#!/bin/bash
+# STUB: scp to/from carl@<host> = copying as the local user carl (permissions as on the host, files created with carl's umask and the source mode).
+echo "scp $*" >> /run/stubs/calls.log
+a=(); while [ $# -gt 0 ]; do case $1 in -i|-o|-P) shift 2;; -*) shift;; *) a+=("$1"); shift;; esac; done
+dst=${a[-1]}; unset 'a[-1]'
+for src in "${a[@]}"; do
+  if [[ $src == carl@*:* ]]; then
+    p=${src#*:}; d=$dst; [ -d "$d" ] && d=$d/$(basename "$p")
+    sudo -n -u carl cat "$p" > "$d" || exit 1
+  else
+    p=${dst#*:}; case $p in */) p=$p$(basename "$src");; esac
+    mode=$(stat -c %a "$src")
+    sudo -n -u carl bash -c "umask 022; cat > '$p' && chmod $mode '$p'" < "$src" || exit 1
+  fi
+done
