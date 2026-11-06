@@ -1,18 +1,19 @@
 # forge-nodehub-Image (Design 3.1). In Slice N1 wird dieses Image NICHT gebaut und nichts gestartet - der Bau gehoert zum Install (N4, Owner).
 # Basis: das digest-gepinnte forge-core-App-Image (Python 3.12 + psycopg/pool); hinzu kommt nur openssh-client (ssh-keygen -Y fuer Signatur/Pruefung, Design 3.1).
-#   docker build --build-arg BASE_IMAGE=$IMG_FORGE_CORE_APP -t forge-node/hub:build .
+#   docker build --build-arg BASE_IMAGE=forge-core/app:build -t forge-node/hub:build .      (scripts/build-hub.sh; a bare image ID as FROM is resolved as a registry name by BuildKit - the local tag is verified against images.lock first)
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE} AS nodehub
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*
 ARG FORGE_UID=994
 ARG FORGE_GID=981
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HOME=/tmp PYTHONPATH=/app/src FORGE_NODE_MIGRATIONS_DIR=/app/migrations FORGE_NODEHUB_CONTAINER=1
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HOME=/tmp PYTHONPATH=/app/src FORGE_NODE_MIGRATIONS_DIR=/app/node-migrations FORGE_NODEHUB_CONTAINER=1
 WORKDIR /app
 # Only what the hub imports (N3: the node-side packages - agent, privd, audit, release - do not belong into the hub image; tests/test_deploy.py checks the import closure).
 COPY src/forge_node/__init__.py src/forge_node/canon.py src/forge_node/chain.py src/forge_node/gates.py src/forge_node/protocol.py src/forge_node/redact.py src/forge_node/sshsig.py ./src/forge_node/
 COPY src/forge_node/hub ./src/forge_node/hub
 COPY src/forge_node/t0/__init__.py src/forge_node/t0/params.py ./src/forge_node/t0/
-COPY migrations ./migrations
+# NOT ./migrations: the base image already has forge-core's /app/migrations; the node migrator must see only the node's own files (N5-prep rehearsal: both sets were in one directory).
+COPY migrations ./node-migrations
 USER ${FORGE_UID}:${FORGE_GID}
 CMD ["python", "-m", "forge_node.hub"]

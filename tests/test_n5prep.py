@@ -385,3 +385,30 @@ def test_node_migration_with_the_production_migration_role_needs_the_schema_crea
 def test_migration_0001_does_not_create_the_schema_itself():
     sql = "\n".join(l for l in (SRC.parent / "migrations" / "0001_node_schema.sql").read_text().splitlines() if not l.lstrip().startswith("--"))
     assert "CREATE SCHEMA" not in sql.upper()
+
+
+def test_hub_image_keeps_the_node_migrations_apart_from_the_base_images_own():
+    """Rehearsal finding: `COPY migrations ./migrations` on top of forge-core/app put forge-core's 0001_init.sql ... 0020 and 0001_node_schema.sql in one /app/migrations, and the node migrator would have
+    run them all (as forge_core, against the production database)."""
+    df = (SRC.parent / "Dockerfile").read_text()
+    assert "COPY migrations ./node-migrations" in df and "FORGE_NODE_MIGRATIONS_DIR=/app/node-migrations" in df
+    assert not [l for l in df.splitlines() if l.startswith("COPY") and l.rstrip().endswith("./migrations")] and "/app/migrations" not in df.replace("forge-core's /app/migrations", "")
+
+
+def test_the_node_migrator_ignores_files_that_are_not_the_nodes(tmp_path, dsn):
+    import psycopg
+
+    from forge_node.hub import migrate as m
+    for name in ("0001_init.sql", "0002_exec_identity.sql", "0020_guard_required.sql", "notes.sql"):
+        (tmp_path / name).write_text("DROP SCHEMA core CASCADE; SELECT 1/0;")
+    (tmp_path / "0001_node_x.sql").write_text("CREATE TABLE node.n5_probe(i int);")
+    assert m.migrate(dsn, tmp_path) == ["0001_node_x"]
+    with psycopg.connect(dsn) as c:
+        assert c.execute("SELECT to_regclass('node.n5_probe')").fetchone()[0] is not None
+
+
+def test_build_hub_script_checks_the_pinned_base_before_building():
+    sh = (SRC.parent / "scripts" / "build-hub.sh").read_text()
+    assert subprocess.run(["bash", "-n", str(SRC.parent / "scripts" / "build-hub.sh")]).returncode == 0
+    assert "forge-core/app:build" in sh and 'IMG_FORGE_CORE_APP=' in sh and '[ "$ID" = "$PIN" ]' in sh and "docker run" not in sh and "compose" not in sh          # builds a local image, starts nothing
+    assert sh.index('[ "$ID" = "$PIN" ]') < sh.index("docker build")

@@ -6,6 +6,7 @@ from pathlib import Path
 import psycopg
 
 LOCK_ID = 7_340_101
+MIGRATION_GLOB = "[0-9][0-9][0-9][0-9]_node_*.sql"                                    # only the node's own files, even if the directory also holds another project's (forge-core's 0001_init.sql ...)
 SCHEMA_HINT = ("schema node does not exist and the migration role may not create schemas (production's forge_core has CONNECT only): create it once as the database superuser, like core/mem/lg: "
                "CREATE SCHEMA node AUTHORIZATION forge_core;")
 DEFAULT_DIR = Path(__file__).resolve().parents[3] / "migrations"
@@ -17,7 +18,7 @@ class MigrateError(RuntimeError):
 
 def migrate(dsn: str, migrations_dir: Path | None = None, password: str | None = None) -> list[str]:
     d = Path(migrations_dir or os.environ.get("FORGE_NODE_MIGRATIONS_DIR") or DEFAULT_DIR)
-    files = sorted(d.glob("[0-9][0-9][0-9][0-9]_*.sql"))
+    files = sorted(d.glob(MIGRATION_GLOB))
     applied: list[str] = []
     kw = {"autocommit": True}
     if password:
