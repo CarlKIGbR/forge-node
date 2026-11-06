@@ -334,3 +334,54 @@ def test_policy_apply_on_a_t0_privd_refuses_above_t0_end_to_end(privd_env):
     r = env.install(serial=9, profile="t0", mode="observe", tiers=(0,))
     assert r["ok"] is True, r
     assert store.installed_serial() == 9
+
+
+# ======================================================================================================================== 3. hub deploy readiness: the migration role of production
+@pytest.fixture
+def prod_like_db():
+    """A database whose migration role is what production's forge_core is: it may CONNECT and nothing else on the database (no CREATE, so no CREATE SCHEMA, not even IF NOT EXISTS)."""
+    import uuid
+
+    import psycopg
+
+    from conftest import TEST_DSN, _conninfo
+    if not TEST_DSN:
+        pytest.skip("no database")
+    tag = uuid.uuid4().hex[:8]
+    db, role = f"fn_prod_{tag}", f"fn_mig_{tag}"
+    admin = _conninfo("postgres")
+    with psycopg.connect(admin, autocommit=True) as c:
+        c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='forge_nodehub') THEN CREATE ROLE forge_nodehub LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE; END IF; END $$")
+        c.execute(f'CREATE ROLE "{role}" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE')
+        c.execute(f'CREATE DATABASE "{db}"')
+        c.execute(f'REVOKE ALL ON DATABASE "{db}" FROM PUBLIC')
+        c.execute(f'GRANT CONNECT ON DATABASE "{db}" TO "{role}"')
+    su = _conninfo(db)
+    yield {"su": su, "mig": su.replace("user=postgres", f"user={role}"), "role": role}
+    with psycopg.connect(admin, autocommit=True) as c:
+        c.execute(f'DROP DATABASE IF EXISTS "{db}" WITH (FORCE)')
+        c.execute(f'DROP ROLE IF EXISTS "{role}"')
+
+
+def test_node_migration_with_the_production_migration_role_needs_the_schema_created_once_by_the_superuser(prod_like_db, monkeypatch, capsys):
+    import psycopg
+
+    from forge_node.hub import migrate as m
+    assert "user=" + prod_like_db["role"] in prod_like_db["mig"]
+    with pytest.raises(m.MigrateError) as e:                                            # the schema is missing and this role cannot create schemas: a clear instruction, not a stack trace
+        m.migrate(prod_like_db["mig"])
+    assert "CREATE SCHEMA node AUTHORIZATION forge_core" in str(e.value)
+    monkeypatch.setenv("FORGE_NODEHUB_MIGRATE_DSN", prod_like_db["mig"])
+    assert m.main() == 3 and "node migration:" in capsys.readouterr().err
+    with psycopg.connect(prod_like_db["su"], autocommit=True) as c:                    # create_db_role.sh does this for core/mem/lg; the hub GO does it for node
+        c.execute(f'CREATE SCHEMA node AUTHORIZATION "{prod_like_db["role"]}"')
+    assert m.migrate(prod_like_db["mig"]) == ["0001_node_schema"]                       # base: `CREATE SCHEMA IF NOT EXISTS node` fails here with 'permission denied for database'
+    assert m.migrate(prod_like_db["mig"]) == []
+    with psycopg.connect(prod_like_db["su"]) as c:
+        assert c.execute("SELECT count(DISTINCT tableowner) FROM pg_tables WHERE schemaname='node'").fetchone()[0] == 1
+        assert c.execute("SELECT tableowner = %s FROM pg_tables WHERE schemaname='node' AND tablename='nodes'", (prod_like_db["role"],)).fetchone()[0]
+
+
+def test_migration_0001_does_not_create_the_schema_itself():
+    sql = "\n".join(l for l in (SRC.parent / "migrations" / "0001_node_schema.sql").read_text().splitlines() if not l.lstrip().startswith("--"))
+    assert "CREATE SCHEMA" not in sql.upper()

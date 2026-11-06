@@ -6,7 +6,13 @@ from pathlib import Path
 import psycopg
 
 LOCK_ID = 7_340_101
+SCHEMA_HINT = ("schema node does not exist and the migration role may not create schemas (production's forge_core has CONNECT only): create it once as the database superuser, like core/mem/lg: "
+               "CREATE SCHEMA node AUTHORIZATION forge_core;")
 DEFAULT_DIR = Path(__file__).resolve().parents[3] / "migrations"
+
+
+class MigrateError(RuntimeError):
+    pass
 
 
 def migrate(dsn: str, migrations_dir: Path | None = None, password: str | None = None) -> list[str]:
@@ -19,7 +25,11 @@ def migrate(dsn: str, migrations_dir: Path | None = None, password: str | None =
     with psycopg.connect(dsn, **kw) as conn:
         conn.execute("SELECT pg_advisory_lock(%s)", (LOCK_ID,))
         try:
-            conn.execute("CREATE SCHEMA IF NOT EXISTS node")
+            if conn.execute("SELECT 1 FROM pg_namespace WHERE nspname = 'node'").fetchone() is None:                 # NOT `CREATE SCHEMA IF NOT EXISTS`: PostgreSQL checks CREATE on the database before it looks for the schema
+                try:
+                    conn.execute("CREATE SCHEMA node")
+                except psycopg.errors.InsufficientPrivilege as e:
+                    raise MigrateError(SCHEMA_HINT) from e
             conn.execute("CREATE TABLE IF NOT EXISTS node.schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
             done = {r[0] for r in conn.execute("SELECT version FROM node.schema_migrations")}
             for f in files:
@@ -40,7 +50,11 @@ def main() -> int:
         print("FORGE_NODEHUB_MIGRATE_DSN is required", file=sys.stderr)
         return 2
     pwf = os.environ.get("FORGE_NODEHUB_MIGRATE_PASSWORD_FILE")
-    applied = migrate(dsn, password=Path(pwf).read_text().rstrip("\r\n") if pwf else None)
+    try:
+        applied = migrate(dsn, password=Path(pwf).read_text().rstrip("\r\n") if pwf else None)
+    except MigrateError as e:
+        print(f"node migration: {e}", file=sys.stderr)
+        return 3
     print("node migrations applied:", ", ".join(applied) if applied else "none (up to date)", flush=True)
     return 0
 

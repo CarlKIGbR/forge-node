@@ -3,7 +3,7 @@
 --           alerts (Ausgang fuer node_alert; die Weiterleitung ins Postfach core.escalations kommt mit N7).
 -- Rolle forge_nodehub: nur die Rechte unten (rollen-geschuetzt wie core 0010/0012); scripts/sql/nodehub_role.sql legt sie an, scripts/sql/nodehub_grants.sql traegt dieselben Grants.
 -- Eigentuemer aller Objekte ist die migrierende Rolle, NICHT forge_nodehub: die Hub-Rolle kann Trigger weder abschalten noch Tabellen aendern.
-CREATE SCHEMA IF NOT EXISTS node;
+-- Das Schema `node` legt hub/migrate.py an (oder der DB-Superuser: CREATE SCHEMA node AUTHORIZATION forge_core). Kein CREATE SCHEMA IF NOT EXISTS hier: PostgreSQL prueft CREATE auf der Datenbank zuerst, die Produktionsrolle forge_core hat nur CONNECT.
 
 -- ---------------------------------------------------------------------------------------------------------------------------------------------
 -- Generische Trigger-Funktionen (gelten auch fuer Eigentuemer und Superuser; nur session_replication_role=replica / DISABLE TRIGGER umgeht sie)

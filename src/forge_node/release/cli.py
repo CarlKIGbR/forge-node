@@ -63,7 +63,8 @@ def interactive_sign(data: bytes, key: Path, namespace: str, ssh_keygen: str, wh
         os.chmod(d, 0o700)
         f = Path(d) / "msg"
         f.write_bytes(data)
-        sys.stderr.write(f"signing {what} (namespace {namespace}) with {key} - enter the key's passphrase when asked\n")
+        how = "ssh-agent signs" if key.name.endswith(".pub") else "enter the key's passphrase when asked"
+        sys.stderr.write(f"signing {what} (namespace {namespace}) with {key} - {how}\n")
         sys.stderr.flush()
         try:
             rc = subprocess.run([ssh_keygen, "-Y", "sign", "-f", str(key), "-n", namespace, str(f)], check=False).returncode      # inherits stdin/stdout/stderr/env: NO capture_output
