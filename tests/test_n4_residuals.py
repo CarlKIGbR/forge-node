@@ -163,9 +163,19 @@ def test_b7_a_lockdown_that_appears_while_the_way_back_is_taken_also_wins(env):
 def test_b10_a_timeout_kills_the_whole_process_group_not_only_the_direct_child(tmp_path):
     pidfile = tmp_path / "grandchild.pid"
     script = f"sleep 300 & echo $! > {pidfile}; wait"
-    t0 = time.time()
-    rc, out, err = switcher.run_process(["/bin/sh", "-c", script], None, 1)
-    assert rc == 124 and time.time() - t0 < 20, "returned only when the grandchild's end of the pipes closed: the group was not killed"
+    import threading
+    res = []
+    th = threading.Thread(target=lambda: res.append(switcher.run_process(["/bin/sh", "-c", script], None, 1)), daemon=True)
+    th.start()
+    th.join(20)
+    if th.is_alive():                                                         # (a child-only kill leaves the grandchild holding the pipes: run_process would return after 300 s)
+        try:
+            os.kill(int(pidfile.read_text()), signal.SIGKILL)
+        except (ProcessLookupError, ValueError, FileNotFoundError):
+            pass
+        pytest.fail("run_process did not return after its timeout: the process group was not killed")
+    rc, out, err = res[0]
+    assert rc == 124
     gpid = int(pidfile.read_text())
     deadline = time.time() + 5
     while time.time() < deadline:
