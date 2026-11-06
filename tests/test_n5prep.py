@@ -412,3 +412,13 @@ def test_build_hub_script_checks_the_pinned_base_before_building():
     assert subprocess.run(["bash", "-n", str(SRC.parent / "scripts" / "build-hub.sh")]).returncode == 0
     assert "forge-core/app:build" in sh and 'IMG_FORGE_CORE_APP=' in sh and '[ "$ID" = "$PIN" ]' in sh and "docker run" not in sh and "compose" not in sh          # builds a local image, starts nothing
     assert sh.index('[ "$ID" = "$PIN" ]') < sh.index("docker build")
+
+
+def test_create_nodehub_role_script_follows_the_forge_core_pattern():
+    p = SRC.parent / "scripts" / "create_nodehub_role.sh"
+    sh = p.read_text()
+    assert subprocess.run(["bash", "-n", str(p)]).returncode == 0 and os.access(p, os.X_OK)
+    assert "secrets/nodehub_db_password" in sh and "chmod 600" in sh and "umask 077" in sh
+    assert "CREATE SCHEMA IF NOT EXISTS node AUTHORIZATION forge_core" in sh and "gen_secret_file" in sh
+    assert not [l for l in sh.splitlines() if "PASSWORD '" in l or "PGPASSWORD" in l]                    # the password reaches psql through stdin (\set), never through argv or env
+    assert "docker compose" not in sh.replace("docker compose --profile", "")                           # creates a role and a schema; starts nothing
