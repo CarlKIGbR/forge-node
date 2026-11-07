@@ -5,14 +5,14 @@ Not part of this GO (abort if tempted): firewall/iptables/ufw (the owner first r
 Needs (exact), all under /srv/forge/work/forge-core unless absolute:
  owner-made, verified in P1:  secrets/nodehub/hub.key (0600 forge:forgebox) · hub.crt (0644) · ca.crt (0644) · gate_ed25519 (0600) · gate_ed25519.pub (0644)   [hub.csr may remain]
  made by this GO:             secrets/nodehub_db_password (0600, create_nodehub_role.sh) · data/nodehub/policy and data/nodehub/release (0750 forge) · images.lock line IMG_FORGE_NODEHUB + regenerated .env
- already there:               secrets/db_password (forge_core, used by nodehub-migrate) · /srv/forge/post/control (kill-switch dir, mounted rw) · network forge-core_forge_core · forge-postgres-1 · image forge-core/app:build (== IMG_FORGE_CORE_APP)
+ already there:               secrets/db_password (forge_core, used by nodehub-migrate) · /srv/forge/post/control (kill-switch dir, mounted rw) · network forge_core · forge-postgres-1 · image forge-core/app:build (== IMG_FORGE_CORE_APP)
  database:                    role forge_nodehub (LOGIN, CONNECT only + the grants of migration 0001) · schema `node` OWNED BY forge_core, created here by the superuser: forge_core has CONNECT only and cannot create schemas
  listener:                    host 192.168.10.4:8094/tcp only (compose publish `host_ip: 192.168.10.4`), container user 994:981, read_only, cap_drop ALL
 
 P (read-only preflight; any miss => abort and report, change nothing)
  P1 files: `ls -l secrets/nodehub`; `openssl verify -CAfile secrets/nodehub/ca.crt secrets/nodehub/hub.crt`; SAN is IP:192.168.10.4 and EKU serverAuth (`openssl x509 -in ... -noout -ext subjectAltName,extendedKeyUsage`); key matches cert
     (`diff <(openssl x509 -in secrets/nodehub/hub.crt -pubkey -noout) <(openssl pkey -in secrets/nodehub/hub.key -pubout)`); `ssh-keygen -y -f secrets/nodehub/gate_ed25519 | cut -d' ' -f1,2` == `cut -d' ' -f1,2 secrets/nodehub/gate_ed25519.pub`; not_after of hub.crt > 300 days.
- P2 state: `ss -tlnH | grep -c ':8094 '` = 0; `docker ps -a --format '{{.Names}}' | grep -ci nodehub` = 0; `docker network inspect forge-core_forge_core`; `docker inspect -f '{{.State.Health.Status}}' forge-postgres-1` = healthy;
+ P2 state: `ss -tlnH | grep -c ':8094 '` = 0; `docker ps -a --format '{{.Names}}' | grep -ci nodehub` = 0; `docker network inspect forge_core`; `docker inspect -f '{{.State.Health.Status}}' forge-postgres-1` = healthy;
     `[ "$(docker image inspect -f '{{.Id}}' forge-core/app:build)" = "$(sed -n 's/^IMG_FORGE_CORE_APP=//p' images.lock)" ]`; `docker ps --format '{{.Names}} {{.CreatedAt}}' | sort > /tmp/nodehub-before.txt`.
 S (steps, in this order)
  1 Backup: `pg_dump -Fc` of database forge via forge-postgres-1 to /srv/forge/work/backups/pre-nodehub_<ts>.dump (same recipe as pre-g1stack); report size and TOC line count.

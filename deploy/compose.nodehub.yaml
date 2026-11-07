@@ -19,7 +19,7 @@ secrets:
   nodehub_db_password: {file: ./secrets/nodehub_db_password}
 
 networks:
-  forge_core: {external: true, name: forge-core_forge_core}
+  forge_core: {external: true, name: forge_core}
 
 services:
   nodehub-migrate:

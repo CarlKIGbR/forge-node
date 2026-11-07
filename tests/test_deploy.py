@@ -204,3 +204,14 @@ def test_design_n1_list_names_existing_tests():
     missing = sorted(in_n1 - defined)
     assert not missing, missing
     assert len(in_n1) >= 70 and named >= in_n1
+
+
+def test_overlay_external_network_name_equals_the_one_forge_core_declares():
+    core = Path("/srv/forge/work/forge-core/compose.yaml")
+    if not core.is_file():
+        pytest.skip("forge-core is not mounted in this environment")
+    declared = yaml.safe_load(core.read_text())["networks"]["forge_core"]
+    assert declared.get("external") is True
+    overlay = COMPOSE["networks"]["forge_core"]
+    assert overlay["external"] is True
+    assert overlay.get("name", "forge_core") == declared.get("name", "forge_core")
