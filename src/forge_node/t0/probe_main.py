@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from .. import canon
 from . import wire
 from .env import Env
-from .fsread import Fs, ProtectedSet
+from .fsread import ProtectedSet
+from .needs import PROBE_NEEDS, declared_fs
 from .policy import PolicyError, load_installed
 from .runner import ReadOnlyRunner, trusted_binary
 
@@ -23,9 +24,9 @@ def main(argv, stdin, stdout, *, node_id: str, policy_dir: str, allowed_signers:
     except PolicyError as e:
         stdout.write(canon.canonical_text({"ok": False, "code": e.code, "detail": e.detail[:200]}) + "\n")
         return 1
-    env = Env(Fs(ProtectedSet.from_policy(view.protected_paths), fs_root), ReadOnlyRunner(), clock, view)
+    env = Env(declared_fs(argv[-1], ProtectedSet.from_policy(view.protected_paths), fs_root), ReadOnlyRunner(), clock, view)          # the probe's Fs is generated from its declaration (needs.py)
     if selfcheck_mode:
-        from .selfcheck import PROBE_NEEDS, probe_selfcheck
+        from .selfcheck import probe_selfcheck
         if argv[1] not in PROBE_NEEDS:
             stdout.write(canon.canonical_text({"ok": False, "code": "DENY_OP_UNKNOWN", "detail": "unknown probe"}) + "\n")
             return 2

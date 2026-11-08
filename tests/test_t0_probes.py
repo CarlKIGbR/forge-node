@@ -13,8 +13,16 @@ from forge_node.t0.runner import Run
 
 from n2_helpers import FakeRunner, NOW, make_env, policy_doc, view
 
+import probe_decl_guard
+
 H1 = "a" * 40
 CID = "c" * 64
+
+
+@pytest.fixture(autouse=True)
+def _every_probe_runs_under_its_declaration(monkeypatch):
+    """probefix: all probe tests below also prove that the probe reads nothing its declaration (t0/needs.py) does not name."""
+    probe_decl_guard.install(monkeypatch)
 
 
 def env_with(tmp_path, runner=None, t0=None, files=None, now=NOW, **kw):

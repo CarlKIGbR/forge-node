@@ -219,7 +219,7 @@ class Doctor:
                 continue
             sc = r["selfcheck"]
             data = ((sc.get("detail") or {}).get("data") or {})
-            out.append(check(t, "ok" if sc["ok"] else "fail", "side-effect-free selfcheck inside the real unit passed" if sc["ok"] else f"denied inside the real unit: {data.get('missing') or data}", rc=sc.get("rc")))
+            out.append(check(t, "ok" if sc["ok"] else "fail", "side-effect-free selfcheck inside the real unit passed" if sc["ok"] else f"selfcheck failed inside the real unit [path: reason; not_allowed/not_declared = forge-node path rules, too_large = read limit, unreadable = kernel/unit]: {data.get('missing') or data}", rc=sc.get("rc")))
         return out
 
     def run(self) -> list[dict]:

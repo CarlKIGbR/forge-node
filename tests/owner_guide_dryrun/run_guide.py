@@ -12,6 +12,7 @@ import sys
 import time
 
 GUIDE = "/src/node/docs/reports/N5PREP_OWNER_GUIDE.md"
+UPGRADE = "/src/node/docs/reports/PROBEFIX_OWNER_UPGRADE.md"
 STUBBED = [
     "systemd: systemctl/systemd-run/journalctl/timedatectl are stubs (state in /run/stubs; `link`/`disable` really create/remove /etc/systemd/system links; privd.socket really starts the release's privd)",
     "forge-node doctor (needs systemd transient units): permission check as forgenode + injected verdict; agent/rotate timer are not started",
@@ -113,9 +114,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="g2", choices=["g2", "g3", "g1", "g4"])
     ap.add_argument("--doctor-rc", type=int, default=0)
+    ap.add_argument("--upgrade", action="store_true", help="g2 state after a failed 5.4 doctor (needs --doctor-rc N != 0), then the blocks of PROBEFIX_OWNER_UPGRADE.md with a passing doctor")
     a = ap.parse_args()
     ips = {"g2": "192.168.10.4", "g3": "192.168.30.3", "g1": "192.168.10.3", "g4": "192.168.30.4"}
     sha = setup(ips[a.host])
+    global VER
+    VER = "0.5.0" if a.upgrade else "0.5.1"
     open("/run/stubs/doctor_rc", "w").write(str(a.doctor_rc))
     os.chmod("/run/stubs/doctor_rc", 0o644)
     text = open(GUIDE).read()
@@ -128,6 +132,8 @@ def main() -> int:
     nid = a.host
     for n, (actor, script) in enumerate(bl):
         script = script.replace("<MAIN_SHA>", sha)
+        if a.upgrade:
+            script = script.replace("0.5.1", "0.5.0")                         # g2's real history: the first install was 0.5.0, the guide now names the fixed 0.5.1
         if a.host != "g2":                                                    # "für jeden Host nur NID und IP ändern"
             script = script.replace("NID=g2\nIP=192.168.10.4\n", f"NID={nid}\nIP={ips[nid]}\n").replace("NID=g2  ", f"NID={nid}  ")
         title = next((l for l in script.splitlines() if l.strip() and not l.startswith(("(", "set -"))), "")[:60]
@@ -149,11 +155,69 @@ def main() -> int:
             break
         if status == "FAIL":
             break
+    if a.upgrade and not failures:
+        failures += run_upgrade(sha, nid, results)
     print("\nSTUBBED in this harness:")
     for s in STUBBED:
         print("  - " + s)
     print(f"\nRESULT host={nid}: {'FAIL' if failures else 'PASS'} ({sum(1 for r in results if r[3] == 'PASS')}/{len(results)} blocks)")
     return 1 if failures else 0
+
+
+def run_upgrade(sha: str, nid: str, results: list) -> list:
+    """The real g2 state after the failed first doctor (agent never started), then the upgrade doc: build 0.5.1, check, `switch` (REAL switcher against the stub systemd and the stub doctor, which now passes)."""
+    assert a_doctor_rc() != 0, "--upgrade starts from a failed 5.4 doctor"
+    pre = open("/run/stubs/calls.log").read()
+    assert "enable --now forge-node-agent.service" not in pre
+    open("/run/stubs/doctor_rc", "w").write("0")
+    text = open(UPGRADE).read()
+    bl = blocks(text)
+    total_bash = len(re.findall(r"^```bash\n", text, re.M))
+    if len(bl) != total_bash:
+        print(f"FAIL: upgrade doc: {total_bash - len(bl)} bash block(s) without a marker")
+        return [-1]
+    failures = []
+    for n, (actor, script) in enumerate(bl):
+        script = script.replace("<FIX_SHA>", sha)
+        title = "upgrade U%d: " % (n + 1) + next((l for l in script.splitlines() if l.strip() and not l.startswith(("(", "set -", "cat >"))), "")[:50]
+        rc, out = run_block(100 + n, actor, script, timeout=400)
+        ok = rc == 0 and "== FEHLER" not in out and "== OK" in out
+        err = upgrade_post_check(n, sha)
+        status = "PASS" if ok and not err else "FAIL"
+        results.append((100 + n, actor, title, status))
+        print(f"[U{n + 1}] {actor:4s} {status}  {title}")
+        if status == "FAIL":
+            failures.append(100 + n)
+            print("----- output -----\n" + out[-3000:] + ("\n----- post-check: " + err if err else "") + "\n------------------")
+            break
+    return failures
+
+
+def a_doctor_rc() -> int:
+    return int(open("/run/stubs/doctor_rc").read() or 0) if os.path.exists("/run/stubs/doctor_rc") else 0
+
+
+def upgrade_post_check(n: int, sha: str):
+    M = "/home/owner/forge-node-owner"
+    try:
+        if n == 0:
+            assert os.path.exists(f"{M}/release/forge-node-0.5.1-t0.tar.sig") and os.path.exists(f"{M}/release/forge-node-0.5.0-t0.tar.sig")
+            assert not os.path.exists("/tmp/fn-src.tar") and os.path.exists("/tmp/forge-node-0.5.1-t0.tar")
+        elif n == 1:
+            assert os.path.isdir("/opt/forge-node/releases/0.5.1") and os.readlink("/opt/forge-node/current").endswith("0.5.0"), "check must not move current"
+        elif n == 2:
+            assert os.readlink("/opt/forge-node/current").endswith("releases/0.5.1") and os.readlink("/opt/forge-node/previous").endswith("releases/0.5.0")
+            calls = open("/run/stubs/calls.log").read()
+            assert "enable forge-node-privd.socket forge-node-agent.service forge-node-audit-rotate.timer" in calls, "switch must enable+start the agent after a passing doctor"
+            assert os.path.exists("/run/stubs/sc/active/forge-node-agent.service")
+        elif n == 3:
+            assert not os.path.exists("/tmp/forge-node-0.5.1-t0.tar") and not os.path.exists("/tmp/fn.env")
+    except (AssertionError, OSError) as e:
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+VER = "0.5.1"
 
 
 def post_check(n: int, nid: str, ip: str):
@@ -168,7 +232,7 @@ def post_check(n: int, nid: str, ip: str):
         if n == 0:
             assert own(f"{M}/owner_ed25519")[2] == 0o600 and os.path.exists(f"{M}/allowed_signers") and os.path.exists(f"{M}/ca/ca.crt")
         elif n == 1:
-            assert os.path.exists(f"{M}/release/forge-node-0.5.0-t0.tar.sig")
+            assert os.path.exists(f"{M}/release/forge-node-{VER}-t0.tar.sig")
             assert not os.path.exists("/tmp/fn-src.tar"), "forge's /tmp/fn-src.tar left behind"
         elif n == 2:
             assert own("/tmp/hub.csr")[0] == "carl" and own(f"{S}/hub.key")[:2] == ("forge", "forgebox") and own(f"{S}/hub.key")[2] == 0o600

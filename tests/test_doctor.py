@@ -229,6 +229,27 @@ def test_doctor_paces_every_selfcheck_so_that_the_real_set_of_14_requests_never_
     assert [r["check"] for r in d2.run() if "DENY_RATE" in r["detail"]]
 
 
+def test_no_probe_selfcheck_fails_on_a_declared_path_on_the_real_kernel(served_all_probes, tmp_path, monkeypatch):
+    """probefix: carlgpu2 failed probe:net and probe:container_net with 'denied inside the real unit: [path]'. Here every probe's selfcheck runs as a real process against the real /proc and
+    /etc of this machine (commands may be missing in the test image - that is the runner's business, not a path). No check may fail on a path, and the failing detail names a reason."""
+    e = served_all_probes
+    monkeypatch.setattr(D, "HubClient", FakeHub)
+    FakeHub.behaviour = None
+    d, out = doctor(e, tmp_path, sleep=lambda s: e.clock.advance(seconds=s))
+    probes_ = {r["check"]: r for r in d.run() if r["check"].startswith("probe:")}
+    assert set(probes_) == {f"probe:{p}" for p in hardening.RO_PROBES}
+    for name, r in probes_.items():
+        assert "DENY_RATE" not in r["detail"], r
+        for path in ("/proc/net/dev", "/proc/self/net/dev", "/etc/group", "/etc/passwd"):
+            assert path not in r["detail"], (name, r)                                             # (24189d3: probe:container_net 'denied ... /proc/self/net/dev')
+    for name, r in probes_.items():
+        if r["status"] != "ok":
+            assert "selfcheck failed inside the real unit" in r["detail"], r
+            if "unattended-upgrades" in r["detail"]:                                              # root:adm 0750 on the real host: only the host may say no here
+                assert name == "probe:uulog" and r["detail"].rstrip("]'\" ").endswith(": unreadable"), r
+    assert probes_["probe:container_net"]["status"] == "ok" or "docker_" in probes_["probe:container_net"]["detail"]
+
+
 def test_after_a_switch_only_what_a_release_can_break_fails_the_doctor(served, tmp_path, monkeypatch):
     """The switcher rolls a release back when doctor fails. A hub outage, an unsynchronised clock or an old certificate are not the release's fault."""
     FakeHub.behaviour = D.HubUnreachable("no route")

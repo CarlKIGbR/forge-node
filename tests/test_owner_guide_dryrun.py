@@ -49,3 +49,39 @@ def test_owner_guide_runs_end_to_end_with_the_g4_values():
 def test_a_failing_doctor_stops_block_5_4_before_the_agent_is_enabled():
     rc, out = _run("--doctor-rc", "1")                      # the harness inverts its expectation for block 5.4: FEHLER, "Agent wird NICHT gestartet", agent unit never enabled
     assert rc == 0 and "[11] host PASS" in out and "RESULT host=g2: PASS (12/12 blocks)" in out, out[-3000:]
+
+
+# ---------------------------------------------------------------------------------------------------------------- probefix: the 0.5.0 -> 0.5.1 upgrade of g2
+UPGRADE = ROOT / "docs" / "reports" / "PROBEFIX_OWNER_UPGRADE.md"
+
+
+def _upgrade_blocks():
+    return re.findall(r"<!-- run: (mac|host) -->\n```bash\n(.*?)^```$", UPGRADE.read_text(), re.S | re.M)
+
+
+def test_upgrade_doc_blocks_are_marked_valid_shell_and_the_mac_blocks_are_zsh_safe(tmp_path):
+    """Runs everywhere. M-168: the Mac's interactive zsh does not take `#` comments, so a pasted Mac block must be a heredoc that WRITES a script and a `bash script` line - no comment and no
+    `set -e`/subshell outside the heredoc. The script bodies and every host block must pass `bash -n`."""
+    text = UPGRADE.read_text()
+    blocks = _upgrade_blocks()
+    assert len(blocks) == len(re.findall(r"^```bash\n", text, re.M)) == 4
+    for i, (actor, b) in enumerate(blocks):
+        f = tmp_path / f"b{i}.sh"
+        f.write_text(b)
+        assert subprocess.run(["bash", "-n", str(f)], capture_output=True, text=True).returncode == 0, (i, b[:200])
+        if actor == "mac":
+            m = re.fullmatch(r"cat > (\S+) <<'FNEOF'\n(.*?)^FNEOF\nbash \1\nrc=\$\?; if .*\n", b, re.S | re.M)
+            assert m, "a Mac block is: cat > script <<'FNEOF' ... FNEOF / bash script / rc line"
+            assert not re.search(r"^\s*#", b[: m.start(2)] + b[m.end(2):], re.M)          # nothing zsh could mistake for a command outside the heredoc
+            (tmp_path / f"s{i}.sh").write_text(m.group(2))
+            assert subprocess.run(["bash", "-n", str(tmp_path / f"s{i}.sh")], capture_output=True, text=True).returncode == 0
+        else:
+            assert b.startswith("(\nset -euo pipefail\n") and "\n)\nrc=$?; if [ $rc = 0 ]" in b          # standalone subshell, rc check on its own line (guide rework 2)
+    assert "forge-node-release switch $VER" in text and "privctl policy-apply" not in "\n".join(b for _, b in blocks)       # one upgrade command; the installed policy (serial 1) stays
+
+
+@needs_docker
+def test_upgrade_of_g2_after_the_failed_first_doctor_runs_end_to_end():
+    """The real g2 state (0.5.0 installed, privd socket + policy, agent never started, doctor failed), then U1..U4 with the REAL switcher (stub systemd + stub doctor, listed in the output)."""
+    rc, out = _run("--doctor-rc", "1", "--upgrade")
+    assert rc == 0 and "[U4] host PASS" in out and "RESULT host=g2: PASS (16/16 blocks)" in out, out[-3000:]

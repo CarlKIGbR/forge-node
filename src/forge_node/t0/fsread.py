@@ -115,7 +115,7 @@ class Fs:
         logical = norm_abs(logical)
         if not any(rx.match(logical) for rx in READ_ALLOW):
             raise FsError("not_allowed", logical)
-        real = self.resolve_dir(logical)
+        real = self._realpath(logical)
         if logical.startswith("/sys/"):
             if not real.startswith("/sys/"):
                 raise FsError("escape", logical)
@@ -167,6 +167,9 @@ class Fs:
 
     # ----------------------------------------------------------------------------------------------------------------- metadata
     def resolve_dir(self, logical: str) -> str:
+        return self._realpath(logical)
+
+    def _realpath(self, logical: str) -> str:
         """Logical realpath of a policy-named directory/file, computed on the (relocated) tree and checked to stay below the root. Symlinks ARE followed here (policy paths such as
         /etc/letsencrypt/live/x -> ../../archive/x are legitimate) - the result, not the name, is what the protected set and later reads see."""
         logical = norm_abs(logical)
@@ -237,3 +240,41 @@ class Fs:
             return os.read(fd, limit).decode("utf-8", "replace")
         finally:
             os.close(fd)
+
+
+class DeclaredFs(Fs):
+    """The `Fs` of ONE probe, generated from its declaration (needs.PROBE_NEEDS): content reads only for the declared `reads` patterns (on top of the global allowlist and protected set),
+    metadata methods only for the declared `meta` names. Anything else is FsError 'not_declared' - the probe cannot quietly start reading a file the table does not name."""
+
+    def __init__(self, protected: ProtectedSet, root: str, reads, meta):
+        super().__init__(protected, root)
+        self._declared_reads, self._declared_meta = tuple(reads), frozenset(meta)
+
+    def _resolve_for_read(self, logical: str) -> str:
+        if not any(rx.match(norm_abs(logical)) for rx in self._declared_reads):
+            raise FsError("not_declared", logical)
+        return super()._resolve_for_read(logical)
+
+    def _need(self, name: str):
+        if name not in self._declared_meta:
+            raise FsError("not_declared", name)
+
+    def resolve_dir(self, logical):
+        self._need("resolve_dir")
+        return super().resolve_dir(logical)
+
+    def stat_meta(self, logical_real):
+        self._need("stat_meta")
+        return super().stat_meta(logical_real)
+
+    def list_meta(self, logical_real, max_entries=2000):
+        self._need("list_meta")
+        return super().list_meta(logical_real, max_entries)
+
+    def read_exception(self, logical, allowed_names, limit=64 * 1024):
+        self._need("read_exception")
+        return super().read_exception(logical, allowed_names, limit)
+
+    def read_user_file(self, logical, limit=256 * 1024):
+        self._need("read_user_file")
+        return super().read_user_file(logical, limit)

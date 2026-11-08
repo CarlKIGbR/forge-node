@@ -1,6 +1,6 @@
 # forge-node T0 — Installationsanleitung für den Owner (alle vier Hosts, Profil `t0`)
 
-Stand: N5-prep rework 1 (Branch `n5prep`, noch NICHT gemergt — die Befehle gelten für den gemergten Stand; `<MAIN_SHA>`/`<OPS_SHA>` stehen in der Merge-Meldung). Alle Blöcke sind Copy-and-paste; jeder `bash`-Block wird in den Tests auf Syntax geprüft.
+Stand: N5-prep rework 1 + probefix (Version 0.5.1) (Branch `n5prep`, noch NICHT gemergt — die Befehle gelten für den gemergten Stand; `<MAIN_SHA>`/`<OPS_SHA>` stehen in der Merge-Meldung). Alle Blöcke sind Copy-and-paste; jeder `bash`-Block wird in den Tests auf Syntax geprüft.
 **Betriebsleiter-Entscheidung:** alle vier Hosts bekommen vorerst das Profil `t0` (nur Lesen): **kein** forge-root-Volume, **kein** Loop-Volume, **kein** `selftest.noop`-Code, Policy `global_mode: observe`, `tiers_enabled: [0]`. Die Schritte „Loop-Volume" (13.C C3) und die Werte `full`/100 GiB/50 GiB entfallen. `full` bleibt für spätere T1-Schritte im Code (`template(nid, "full")`).
 **Regeln:** pro Server eine SSH-Sitzung die ganze Zeit offen lassen (Rollback-Anker). Nie zwischen 02:00 und 05:45 Berlin, nie sonntags vor 06:00. Reihenfolge **g2 → g3 → g1 → g4** mit ≥ 1 Tag Beobachtung dazwischen; g4 (Live-Trading) zuletzt und nur mit deiner ausdrücklichen Zustimmung. Es wird nichts an sshd, sudoers oder Docker geändert (kein Docker-Neustart).
 **Wie die Blöcke funktionieren:** jeder Block ist eine Subshell `( set -euo pipefail … )`, danach prüft eine Zeile `rc=$?` und schreibt `== OK` oder `== FEHLER (rc=…)`. Scheitert ein Befehl, endet NUR der Block; die SSH-Sitzung bleibt offen (kein `set -e` in deiner Login-Shell). Wichtig: die Subshell steht **allein** auf ihrer Zeile — in einer `&&`/`||`-Liste würde bash `set -e` darin ignorieren. Dann **stoppen und die Betriebsleitung informieren** — den Block nicht „reparieren" und nicht Rechte an `secrets/` o. ä. verbiegen. Der Login in einen Server (`ssh -t -i ~/.ssh/sshcarljump01 carl@<IP>`) steht jeweils im Text; ein Server-Block endet mit `== OK`; erst danach `exit`.
@@ -50,7 +50,7 @@ Das Release wird auf dem Mac aus genau dem gemergten Commit gebaut; der Schlüss
 ```bash
 (
 set -euo pipefail
-VER=0.5.0                              # Versionsname dieses Releases
+VER=0.5.1                              # Versionsname dieses Releases (0.5.0 hatte den doctor-Fehler probe:net/container_net: nicht mehr verwenden)
 SHA='<MAIN_SHA>'                       # ersetzen: Commit aus der Merge-Meldung (40 Hex)
 printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "SHA FEHLT"; false; }
 cd ~/forge-node-owner
@@ -181,7 +181,7 @@ cd ~/forge-node-owner
 cat > fn.env <<EOF
 NID=g2
 IP=192.168.10.4
-VER=0.5.0
+VER=0.5.1
 PROFILE=t0
 FORGE_ROOT=none
 FORGE_ROOT_BYTES=0
@@ -295,6 +295,7 @@ rm -f /tmp/fn.env
 )
 rc=$?; if [ $rc = 0 ]; then echo "== OK (jetzt: exit)"; else echo "== FEHLER: STOP, Sitzung offen lassen (fn.env bleibt in /tmp) (rc=$rc)"; fi
 ```
+**Scheitert `doctor` hier (Exit 1) und nennt `probe:net`/`probe:container_net`: Das Release ist 0.5.0 (Selbstprüfungs-Fehler, nur g2 betroffen) — weiter mit `docs/reports/PROBEFIX_OWNER_UPGRADE.md` (Upgrade auf 0.5.1), nicht reparieren.**
 Solange der Host noch nicht registriert ist (5.5), antwortet der Hub dem Agenten mit 403: im Journal erwartbar. `doctor` prüft hier nur `/healthz` (Pin, TLS) — „hub: ok" beweist die Registrierung NICHT; den Beweis liefert `last_seen` in Teil 6.
 **5.5 Registrierung des Hosts (statt Cockpit /nodes — die Seite existiert noch nicht, sie kommt mit N7).** Der Hub schreibt `status`/`cert_sha256` nie selbst; die Zeile legt der Owner in `node.nodes` an, nachdem er den Fingerabdruck verglichen hat. **Profil `t0`**: es ist in der Tabelle unveränderlich — ein späterer Wechsel auf `full` braucht eine neue Registrierung (neuer Eintrag).
 <!-- run: mac -->

@@ -9,6 +9,7 @@ import shutil
 from . import confined, parse
 from .env import Env, failed, ok, run_failure, run_slots, unavailable
 from .fsread import FsError, norm_abs, under
+from .needs import UULOG_LIMIT
 
 HEAVY_PROBES = frozenset({"models", "git"})
 PROBE_NAMES = ("net", "firewall", "containers", "container_net", "vms", "certs", "git", "access", "models", "journal", "activity", "uulog")
@@ -511,7 +512,7 @@ def _probe_uulog(params: dict, env: Env) -> dict:
     parsed outcome of the last run - timestamp, result class, the origins the run reported - never log lines."""
     _no_params(params)
     try:
-        text = env.fs.read_text("/var/log/unattended-upgrades/unattended-upgrades.log", 256 * 1024)
+        text = env.fs.read_text("/var/log/unattended-upgrades/unattended-upgrades.log", UULOG_LIMIT)
     except FsError as e:
         return {"uulog": failed(e.code)}
     return {"uulog": ok(**parse.uu_log(text))}
