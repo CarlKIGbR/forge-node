@@ -56,3 +56,12 @@ read /proc/1867849/net/dev 1048576 OK
 * Test trees (`FN_TEST_FS_ROOT`) have small fake files; a 1024-byte limit only bites on a real /proc with many interfaces.
 * The owner-guide dry run stubs `doctor` ("permission check as forgenode + injected verdict", run_guide.py:17) — it executes the guide blocks, not the probes.
 * The design's "validation inside the real unit" was therefore only ever exercised with the test double (LocalProcessBackend), never on a real kernel with a real /proc.
+
+## Fix (0.5.1) — see PROBEFIX_REPORT.md
+
+* `src/forge_node/t0/needs.py`: the ONE declaration per probe (commands, optional commands, `Read(path, limit)` entries, allowed `Fs` metadata methods).
+* The probe's `Fs` is generated from it (`fsread.DeclaredFs`, built by `needs.declared_fs` in `probe_main`): an undeclared content read or metadata call is `FsError not_declared`.
+* `selfcheck.probe_selfcheck` opens every declared read exactly as the probe does (same limit) and reports `path: reason`; doctor prints that instead of the generic "denied inside the real unit".
+* `net` declares no file (it runs `ss -p`), `container_net` declares `/proc/<digits>/net/dev` (selfcheck: this process's own); caps, unit properties and the global `READ_ALLOW` are unchanged.
+* Tests: `tests/test_probe_reads.py` (real-kernel reads, big-file limit, undeclared refusal, static scan of probes.py), `probe_decl_guard` (every existing probe test runs under its declaration),
+  `test_doctor::test_no_probe_selfcheck_fails_on_a_declared_path_on_the_real_kernel` (real privd + real probe processes).
