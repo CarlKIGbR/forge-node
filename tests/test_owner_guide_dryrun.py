@@ -64,12 +64,12 @@ def test_upgrade_doc_blocks_are_marked_valid_shell_and_the_mac_blocks_are_zsh_sa
     `set -e`/subshell outside the heredoc. The script bodies and every host block must pass `bash -n`."""
     text = UPGRADE.read_text()
     blocks = _upgrade_blocks()
-    assert len(blocks) == len(re.findall(r"^```bash\n", text, re.M)) == 4
+    assert len(blocks) == len(re.findall(r"^```bash\n", text, re.M)) == 5
     for i, (actor, b) in enumerate(blocks):
         f = tmp_path / f"b{i}.sh"
         f.write_text(b)
         assert subprocess.run(["bash", "-n", str(f)], capture_output=True, text=True).returncode == 0, (i, b[:200])
-        if actor == "mac":
+        if actor == "mac" or b.startswith("cat > "):                  # a host block may be a script too (U4: ~/fn-cn-check.sh)
             m = re.fullmatch(r"cat > (\S+) <<'FNEOF'\n(.*?)^FNEOF\nbash \1\nrc=\$\?; if .*\n", b, re.S | re.M)
             assert m, "a Mac block is: cat > script <<'FNEOF' ... FNEOF / bash script / rc line"
             assert not re.search(r"^\s*#", b[: m.start(2)] + b[m.end(2):], re.M)          # nothing zsh could mistake for a command outside the heredoc
@@ -77,11 +77,15 @@ def test_upgrade_doc_blocks_are_marked_valid_shell_and_the_mac_blocks_are_zsh_sa
             assert subprocess.run(["bash", "-n", str(tmp_path / f"s{i}.sh")], capture_output=True, text=True).returncode == 0
         else:
             assert b.startswith("(\nset -euo pipefail\n") and "\n)\nrc=$?; if [ $rc = 0 ]" in b          # standalone subshell, rc check on its own line (guide rework 2)
+    for i, (actor, b) in enumerate(blocks):                                                    # m-2/m-3: no `cmp && echo` guard, no pipe into head under pipefail
+        assert not re.search(r"^cmp [^|\n]*&& echo", b, re.M) and not re.search(r"systemctl[^\n]*\|\s*head", b), i
+    assert "if ! cmp -s /tmp/pol-050.json /tmp/pol-051.json; then" in text and "exit 1; fi" in text
+    assert not re.search(r"systemctl[^\n]*\|\s*head", GUIDE.read_text())
     assert "forge-node-release switch $VER" in text and "privctl policy-apply" not in "\n".join(b for _, b in blocks)       # one upgrade command; the installed policy (serial 1) stays
 
 
 @needs_docker
 def test_upgrade_of_g2_after_the_failed_first_doctor_runs_end_to_end():
-    """The real g2 state (0.5.0 installed, privd socket + policy, agent never started, doctor failed), then U1..U4 with the REAL switcher (stub systemd + stub doctor, listed in the output)."""
+    """The real g2 state (0.5.0 installed, privd socket + policy, agent never started, doctor failed), then U1..U5 with the REAL switcher (stub systemd + stub doctor, listed in the output)."""
     rc, out = _run("--doctor-rc", "1", "--upgrade")
-    assert rc == 0 and "[U4] host PASS" in out and "RESULT host=g2: PASS (16/16 blocks)" in out, out[-3000:]
+    assert rc == 0 and "[U5] host PASS" in out and "RESULT host=g2: PASS (17/17 blocks)" in out, out[-3000:]

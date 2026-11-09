@@ -137,6 +137,18 @@ def test_container_net_probe_reads_proc_net_dev_per_container(tmp_path):
         run_probe("container_net", {"x": 1}, env)
 
 
+def test_container_net_probe_with_a_realistic_sized_proc_net_dev(tmp_path):
+    """m-5: a docker host's /proc/<pid>/net/dev has dozens of veth/br lines (7.6 KB on carlgpu2, 24189d3 refused > 1 KB). 70 interfaces through the probe's real read path and limit."""
+    rows = "".join(f"{('veth%07x' % i):>13}: {1000 + i} {i} 0 0 0 0 0 0 {2000 + i} {i} 0 0 0 0 0 0\n" for i in range(70))
+    text = "Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n" \
+           "    lo: 9 1 0 0 0 0 0 0 9 1 0 0 0 0 0 0\n" + rows
+    assert text.count("\n") >= 60 and len(text) > 3 * 1024          # the old 1024-byte limit would refuse it
+    r = FakeRunner({"docker_ps_ids": CID + "\n", "docker_inspect": inspect_line(pid=777) + "\n"})
+    env = env_with(tmp_path, r, files={"/proc/777/net/dev": text})
+    got = run_probe("container_net", {}, env)["container_net"]["containers"]
+    assert got == {CID[:12]: {"rx_bytes": sum(1000 + i for i in range(70)), "tx_bytes": sum(2000 + i for i in range(70))}}
+
+
 def test_log_path_outside_docker_dir_is_not_statted(tmp_path):
     line = inspect_line(logpath="/etc/shadow")
     r = FakeRunner({"docker_ps_ids": CID + "\n", "docker_inspect": line + "\n"})

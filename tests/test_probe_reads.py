@@ -2,13 +2,15 @@
 Regression for the carlgpu2 install: `doctor` failed probe:net and probe:container_net with 'denied inside the real unit' although no unit denied anything - forge-node's own selfcheck
 read /proc/net/dev with a 1024-byte limit (7644 bytes on a docker host) and asked for /proc/self/net/dev, which its own allowlist never contained."""
 import ast
+import io
+import json
 import os
 import re
 from pathlib import Path
 
 import pytest
 
-from forge_node.t0 import hardening, needs, probes, runner, selfcheck
+from forge_node.t0 import hardening, needs, probe_main, probes, runner, selfcheck
 from forge_node.t0.env import Env
 from forge_node.t0.fsread import DeclaredFs, Fs, FsError, ProtectedSet
 
@@ -135,3 +137,54 @@ def test_probes_py_reads_nothing_its_probe_does_not_declare(name):
                 assert any(r.regex.match(t.replace("{pid}", "1234")) for r in n.reads), f"{name}/{fn} line {c.lineno}: fs.{m}({t!r}) is not declared"
             else:
                 assert m in n.meta, f"{name}/{fn} line {c.lineno}: fs.{m} is not declared"
+
+
+# ------------------------------------------------------------------------------------------------------------------------ the unit entry's wiring (m-1)
+def _drive_main(tmp_path, owner, argv, stdin="{}\n"):
+    """probe_main.main exactly as the unit starts it (relocated paths): signed policy in a temp dir, `fs_root` = a tree that really contains /proc/meminfo and /etc/passwd."""
+    from n2_helpers import NOW, install_policy, policy_doc, signers_text
+    pol = tmp_path / "policy"
+    install_policy(pol, policy_doc(), owner["priv"])
+    signers = tmp_path / "allowed_signers"
+    signers.write_text(signers_text(owner["pub"]))
+    os.chmod(signers, 0o644)
+    for f in ("proc/meminfo", "etc/passwd"):
+        (tmp_path / f).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / f).write_text("MemTotal: 1 kB\n")
+    out = io.StringIO()
+    rc = probe_main.main(argv, io.StringIO(stdin), out, node_id="g2", policy_dir=str(pol), allowed_signers=str(signers), fs_root=str(tmp_path), owner_uid=os.getuid(), now=lambda: NOW, ssh_keygen="ssh-keygen")
+    return rc, json.loads(out.getvalue())
+
+
+def _reads(env):
+    """What the probe code under test does: one declared read (/etc/passwd), one undeclared (/proc/meminfo, which a plain Fs WOULD allow), one metadata call the probe did not declare."""
+    res = {}
+    for key, call in (("declared", lambda: env.fs.read_text("/etc/passwd")), ("undeclared", lambda: env.fs.read_text("/proc/meminfo")), ("meta", lambda: env.fs.stat_meta("/etc"))):
+        try:
+            call()
+            res[key] = "read"
+        except FsError as e:
+            res[key] = e.code
+    return res
+
+
+def test_probe_main_hands_the_probe_its_declared_fs_in_normal_mode(tmp_path, owner, monkeypatch):
+    """Wiring proof (m-1): a probe that reads something its declaration does not name gets `not_declared` through the unit entry. Fails if probe_main builds a plain `Fs(...)`."""
+    monkeypatch.setattr(probes, "_probe_access", lambda params, env: _reads(env))
+    rc, r = _drive_main(tmp_path, owner, ["access"])
+    assert rc == 0 and r["ok"] is True, r
+    assert r["data"] == {"declared": "read", "undeclared": "not_declared", "meta": "not_declared"}, r
+
+
+def test_probe_main_hands_the_probe_its_declared_fs_in_selfcheck_mode(tmp_path, owner, monkeypatch):
+    monkeypatch.setattr(selfcheck, "probe_selfcheck", lambda name, env: _reads(env))
+    rc, r = _drive_main(tmp_path, owner, ["--selfcheck", "access"])
+    assert rc == 0 and r["ok"] is True, r
+    assert r["data"]["declared"] == "read" and r["data"]["undeclared"] == "not_declared", r
+
+
+def test_probe_main_gives_each_probe_only_its_own_declaration(tmp_path, owner, monkeypatch):
+    """Same code, other probe: `vms` declares no read at all, so even /etc/passwd (which `access` may read) is refused."""
+    monkeypatch.setattr(probes, "_probe_vms", lambda params, env: _reads(env))
+    rc, r = _drive_main(tmp_path, owner, ["vms"])
+    assert rc == 0 and r["data"]["declared"] == "not_declared" and r["data"]["undeclared"] == "not_declared", r

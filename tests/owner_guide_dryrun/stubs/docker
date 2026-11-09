@@ -1,8 +1,13 @@
 #!/bin/bash
 # STUB: no Docker daemon. `docker exec -i <c> sh -c SCRIPT` runs SCRIPT with POSTGRES_USER=forge and a logging psql stub; `docker ps` prints a fixed list.
 echo "docker $*" >> /run/stubs/calls.log
+cnpid() { f=/run/stubs/cn.pid; { [ -s "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; } || { setsid sleep 3600 >/dev/null 2>&1 & echo $! > "$f"; }; cat "$f"; }          # stands in for a container's init (the container dies with the harness)
 case "$1" in
-  ps) echo "forge-postgres-1 pgvector"; echo "forge-core-forge-planner-1 forge-core/planner" ;;
+  ps) case " $* " in
+        *" -q "*) printf 'ab%.0s' $(seq 1 32); echo ;;                                   # forge-node's probe runner (`docker ps -a -q --no-trunc`): one container
+        *) echo "forge-postgres-1 pgvector"; echo "forge-core-forge-planner-1 forge-core/planner" ;;
+      esac ;;
+  inspect) c=$(printf 'ab%.0s' $(seq 1 32)); printf '"%s"\t"/stub"\t"sha256:%s"\t"stub:1"\t"running"\t0\t"2026-11-01T00:00:00Z"\t%s\t"/var/lib/docker/containers/x/x-json.log"\tnull\tnull\t[]\n' "$c" "$c" "$(cnpid)" ;;   # State.Pid = a real, long-lived process of this container: its /proc/<pid>/net/dev is real
   exec) shift; [ "$1" = -i ] && shift; shift; [ "$1" = sh ] && [ "$2" = -c ] && POSTGRES_USER=forge PATH=/usr/local/stub-psql:$PATH sh -c "$3" ;;
   *) ;;
 esac

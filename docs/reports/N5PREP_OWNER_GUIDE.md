@@ -288,14 +288,14 @@ rc=0; sudo -u forgenode env FORGE_NODE_NODE_ID=$NID /usr/bin/python3 -I /opt/for
 echo "doctor exit: $rc"                                            # 0 = OK, 1 = FEHLER, 4 = Hub antwortete 5xx (warten, nochmal)
 [ "$rc" = 0 ] || { echo "doctor != 0: Agent wird NICHT gestartet"; false; }
 sudo systemctl enable --now forge-node-agent.service forge-node-audit-rotate.timer
-sudo systemctl status forge-node-agent.service forge-node-privd.socket --no-pager | head -12
+sudo systemctl --no-pager --lines=8 status forge-node-agent.service forge-node-privd.socket || true          # nur Anzeige; kein Pipe (pipefail + head => rc 141)
 rm -f /tmp/forge-node-$VER-$PROFILE.tar /tmp/forge-node-$VER-$PROFILE.tar.sig /tmp/allowed_signers /tmp/$NID.crt /tmp/ca.crt /tmp/policy-$NID.json /tmp/policy-$NID.json.sig
 sudo rm -f /tmp/$NID.csr                                           # gehört forgenode
 rm -f /tmp/fn.env
 )
 rc=$?; if [ $rc = 0 ]; then echo "== OK (jetzt: exit)"; else echo "== FEHLER: STOP, Sitzung offen lassen (fn.env bleibt in /tmp) (rc=$rc)"; fi
 ```
-**Scheitert `doctor` hier (Exit 1) und nennt `probe:net`/`probe:container_net`: Das Release ist 0.5.0 (Selbstprüfungs-Fehler, nur g2 betroffen) — weiter mit `docs/reports/PROBEFIX_OWNER_UPGRADE.md` (Upgrade auf 0.5.1), nicht reparieren.**
+**Scheitert `doctor` hier (Exit 1) und nennt `probe:net`/`probe:container_net`: Ist das installierte Release 0.5.0 (nur g2, erste Installation; Selbstprüfungs-Fehler), weiter mit `docs/reports/PROBEFIX_OWNER_UPGRADE.md` (Upgrade auf 0.5.1), nicht reparieren. Bei g3/g1/g4 ist `VER=0.5.1` (das Release enthält den Fix): derselbe doctor-Fehler ist dort NICHT erwartet — stoppen, die JSON-Ausgabe der Betriebsleitung geben, nichts reparieren.**
 Solange der Host noch nicht registriert ist (5.5), antwortet der Hub dem Agenten mit 403: im Journal erwartbar. `doctor` prüft hier nur `/healthz` (Pin, TLS) — „hub: ok" beweist die Registrierung NICHT; den Beweis liefert `last_seen` in Teil 6.
 **5.5 Registrierung des Hosts (statt Cockpit /nodes — die Seite existiert noch nicht, sie kommt mit N7).** Der Hub schreibt `status`/`cert_sha256` nie selbst; die Zeile legt der Owner in `node.nodes` an, nachdem er den Fingerabdruck verglichen hat. **Profil `t0`**: es ist in der Tabelle unveränderlich — ein späterer Wechsel auf `full` braucht eine neue Registrierung (neuer Eintrag).
 <!-- run: mac -->

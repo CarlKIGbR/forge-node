@@ -29,7 +29,8 @@ ls -l release/
 # Kontrolle: die Policy-Vorlage von g2 ist in 0.5.0 und 0.5.1 identisch => kein policy-apply
 tar -xOf release/forge-node-0.5.0-t0.tar forge-node-0.5.0/policy/policy-g2.json > /tmp/pol-050.json
 tar -xOf release/forge-node-$VER-t0.tar forge-node-$VER/policy/policy-g2.json > /tmp/pol-051.json
-cmp /tmp/pol-050.json /tmp/pol-051.json && echo "POLICY IDENTISCH (kein policy-apply noetig)"
+if ! cmp -s /tmp/pol-050.json /tmp/pol-051.json; then echo "STOP: Policy weicht ab (Vergleich: diff /tmp/pol-050.json /tmp/pol-051.json) - nichts hochladen, Betriebsleitung fragen"; exit 1; fi
+echo "POLICY IDENTISCH (kein policy-apply noetig)"
 rm -f /tmp/pol-050.json /tmp/pol-051.json
 test -f release/forge-node-$VER-t0.tar.sig
 scp -i ~/.ssh/sshcarljump01 release/forge-node-$VER-t0.tar release/forge-node-$VER-t0.tar.sig carl@192.168.10.4:/tmp/
@@ -75,7 +76,32 @@ sudo /opt/forge-node/current/bin/privctl status                    # policy seri
 rc=$?; if [ $rc = 0 ]; then echo "== OK"; else echo "== FEHLER: STOP (rc=$rc) - JSON oben der Betriebsleitung geben, nichts reparieren"; fi
 ```
 
-## U4 — g2: doctor einmal von Hand (Beleg) und aufräumen
+## U4 — g2: ein echtes `container_net`-Ergebnis prüfen (nicht leer)
+`doctor` beweist nur die **Selbstprüfung** (die deklarierten Befehle/Pfade lassen sich in der echten Unit öffnen; sie liest `/proc/<eigene pid>/net/dev`), **nicht**, dass Zähler eines echten Containers beobachtet wurden. Dieser Block führt die Probe `container_net` einmal wirklich aus (als root, **ausserhalb** der `ro-probe`-Unit, mit der installierten Policy; nur lesend, ändert nichts) und verlangt mindestens einen Container mit Zählern. Läuft auf g2 tatsächlich kein Container, endet der Block mit FEHLER: dann `sudo docker ps` mitschicken (leer ist dann richtig), nichts reparieren.
+<!-- run: host -->
+```bash
+cat > ~/fn-cn-check.sh <<'FNEOF'
+set -euo pipefail
+trap 'rm -f ~/fn-cn-check.sh' EXIT
+NID=g2
+sudo -v
+echo '{}' | sudo env FORGE_NODE_NODE_ID=$NID /usr/bin/python3 -I /opt/forge-node/current/forge-node.pyz probe container_net > /var/tmp/fn-container-net.json
+cat /var/tmp/fn-container-net.json
+python3 -I -c '
+import json, sys
+r = json.loads(open(sys.argv[1]).readline())
+cn = (r.get("data") or {}).get("container_net") or {}
+n = len(cn.get("containers") or {})
+print("ok=%s status=%s: %d Container mit Zaehlern" % (r.get("ok"), cn.get("status"), n))
+sys.exit(0 if r.get("ok") is True and cn.get("status") == "ok" and n > 0 else 1)
+' /var/tmp/fn-container-net.json
+FNEOF
+bash ~/fn-cn-check.sh
+rc=$?; if [ $rc = 0 ]; then echo "== OK"; else echo "== FEHLER: STOP (rc=$rc) - Ausgabe oben der Betriebsleitung geben, nichts reparieren"; fi
+```
+Erwartet: eine JSON-Zeile mit `"status":"ok"` und mindestens einer Container-Id (12 Hex) mit `rx_bytes`/`tx_bytes`, danach `ok=True status=ok: N Container mit Zaehlern`. **Bekannte Lücke:** derselbe Weg *durch privd in der echten Unit* (T0-Anfrage des Agenten) braucht ein vom Hub signiertes Lease und ist erst nach der Registrierung (U6 / Hauptanleitung 5.5 und Teil 6) möglich; dort zeigt der erste T0-Lauf des Agenten (Hub, `container_net` nicht leer) den Rest. Ein leeres Ergebnis hier wäre ein Fehler im Probe-Code oder in der Policy-Deklaration, nicht in der Sandbox.
+
+## U5 — g2: doctor einmal von Hand (Beleg) und aufräumen
 <!-- run: host -->
 ```bash
 (
@@ -85,7 +111,7 @@ rc=0; sudo -u forgenode env FORGE_NODE_NODE_ID=$NID /usr/bin/python3 -I /opt/for
 echo "doctor exit: $rc"                                            # 0 = OK
 [ "$rc" = 0 ]
 grep -E '"check": "probe:(net|container_net)"' /var/tmp/fn-doctor-0.5.1.txt        # beide "status": "ok"
-sudo systemctl status forge-node-agent.service forge-node-privd.socket --no-pager | head -12
+sudo systemctl --no-pager --lines=8 status forge-node-agent.service forge-node-privd.socket || true          # nur Anzeige; kein Pipe (pipefail + head => rc 141)
 rm -f /tmp/forge-node-0.5.0-t0.tar /tmp/forge-node-0.5.0-t0.tar.sig /tmp/forge-node-0.5.1-t0.tar /tmp/forge-node-0.5.1-t0.tar.sig /tmp/allowed_signers /tmp/$NID.crt /tmp/ca.crt /tmp/policy-$NID.json /tmp/policy-$NID.json.sig /tmp/fn.env
 sudo rm -f /tmp/$NID.csr
 )
@@ -93,5 +119,5 @@ rc=$?; if [ $rc = 0 ]; then echo "== OK (jetzt: exit)"; else echo "== FEHLER: ST
 ```
 Das manuelle `doctor` darf nur nach dem `switch` laufen (der Agent läuft dann bereits; `doctor` ändert nichts). Solange der Host noch nicht registriert ist, antwortet der Hub dem Agenten mit 403 — im Journal erwartbar.
 
-## U5 — weiter wie in der Hauptanleitung
+## U6 — weiter wie in der Hauptanleitung
 **5.5 Registrierung** (Mac-Block `register-g2.sql`, unverändert; `~/forge-node-owner/fn.env` und `issued/g2.crt` aus 5.1/5.3 existieren bereits), danach **Teil 6** (Prüfung, `last_seen` < 2 min, `policy_serial` 1). Rollback bleibt Teil 7 der Hauptanleitung (ein `switch 0.5.0` würde 0.5.0 wieder in Betrieb nehmen, dessen doctor scheitert: nicht tun).

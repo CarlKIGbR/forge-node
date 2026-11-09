@@ -165,8 +165,8 @@ def _probe_containers(params: dict, env: Env) -> dict:
 
 
 def _probe_container_net(params: dict, env: Env) -> dict:
-    """Per container network byte counters, read from /proc/<pid>/net/dev of the container's init process. Needs CAP_SYS_PTRACE (other users' /proc entries), so it is its own
-    probe: the plain `containers` inventory does not get that capability."""
+    """Per container network byte counters, read from /proc/<pid>/net/dev of the container's init process. No capability needed (/proc/<pid>/net/dev is world-readable, hidepid=0; hardening.RO_PROBES gives this probe no caps),
+    but it stays its own probe: it needs `docker inspect` for the pids and its declared /proc read, which the plain `containers` inventory does not get."""
     _no_params(params)
     rows, err, _ = _containers(env)
     if err:

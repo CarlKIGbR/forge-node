@@ -16,7 +16,7 @@ UPGRADE = "/src/node/docs/reports/PROBEFIX_OWNER_UPGRADE.md"
 STUBBED = [
     "systemd: systemctl/systemd-run/journalctl/timedatectl are stubs (state in /run/stubs; `link`/`disable` really create/remove /etc/systemd/system links; privd.socket really starts the release's privd)",
     "forge-node doctor (needs systemd transient units): permission check as forgenode + injected verdict; agent/rotate timer are not started",
-    "Docker daemon and Postgres: `docker ps` canned, `docker exec … sh -c` runs the script with a logging psql stub",
+    "Docker daemon and Postgres: `docker ps` canned, `docker ps -q`/`inspect` = one fake container whose State.Pid is a sleeping process of the harness netns (dummy0 interface), `docker exec … sh -c` runs the script with a logging psql stub",
     "iptables (state file; -C/-D/-I/-S semantics), curl and openssl s_client (no hub; curl keeps the real exit 77 for an unreadable --cacert)",
     "ssh/scp: 'carl@<any host>' is the local user carl (same sudo/no-forgebox permissions); the interactive login is replaced by running host blocks as carl",
     "pager (less = cat); sudo password prompts are not simulated (carl has !authenticate)",
@@ -46,6 +46,7 @@ install -d -m 2700 -o forge -g forgebox /srv/forge/work/forge-core /srv/forge/wo
 chmod 0755 /srv/forge/work/forge-core
 install -d -m 0755 -o forge -g forgebox /srv/forge/work/forge-edge /srv/forge/work/forge-edge/systemd
 cp /opt/harness-units/* /srv/forge/work/forge-edge/systemd/; chown -R forge:forgebox /srv/forge/work/forge-edge
+ip link add dummy0 type dummy              # a container's init has a non-loopback interface; this netns (--network none) only has lo (see stubs/docker: State.Pid is a process in THIS netns)
 install -d -m 0755 -o kmuai -g kmuai /opt/kmu-ai /srv/models
 runuser -u kmuai -- git -C /opt/kmu-ai init -q && runuser -u kmuai -- git -C /opt/kmu-ai -c user.name=k -c user.email=k@k commit -q --allow-empty -m kmu
 """)
@@ -179,7 +180,7 @@ def run_upgrade(sha: str, nid: str, results: list) -> list:
     failures = []
     for n, (actor, script) in enumerate(bl):
         script = script.replace("<FIX_SHA>", sha)
-        title = "upgrade U%d: " % (n + 1) + next((l for l in script.splitlines() if l.strip() and not l.startswith(("(", "set -", "cat >"))), "")[:50]
+        title = "upgrade U%d: " % (n + 1) + next((l for l in script.splitlines() if l.strip() and not l.startswith(("(", "set -", "cat >", "trap "))), "")[:50]
         rc, out = run_block(100 + n, actor, script, timeout=400)
         ok = rc == 0 and "== FEHLER" not in out and "== OK" in out
         err = upgrade_post_check(n, sha)
@@ -211,6 +212,11 @@ def upgrade_post_check(n: int, sha: str):
             assert "enable forge-node-privd.socket forge-node-agent.service forge-node-audit-rotate.timer" in calls, "switch must enable+start the agent after a passing doctor"
             assert os.path.exists("/run/stubs/sc/active/forge-node-agent.service")
         elif n == 3:
+            import json
+            r = json.loads(open("/var/tmp/fn-container-net.json").readline())
+            assert r["ok"] is True and r["data"]["container_net"]["status"] == "ok" and r["data"]["container_net"]["containers"], r          # the REAL probe code, run as root against the docker stub's one container
+            assert not os.path.exists(os.path.expanduser("~carl/fn-cn-check.sh")), "check script left behind"
+        elif n == 4:
             assert not os.path.exists("/tmp/forge-node-0.5.1-t0.tar") and not os.path.exists("/tmp/fn.env")
     except (AssertionError, OSError) as e:
         return f"{type(e).__name__}: {e}"
